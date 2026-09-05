@@ -59,7 +59,7 @@ pub fn PartitionPlan::start_offset(self : PartitionPlan) -> Int64 {
 pub(all) struct ExchangeRoute {
   source_partition : Int
   target_partition : Int
-} derive(Debug, Eq, Compare, Hash)
+} derive(Debug, Eq, Compare, Hash, ToJson, FromJson)
 
 ///|
 pub fn ExchangeRoute::new(

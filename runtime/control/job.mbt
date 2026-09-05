@@ -108,6 +108,21 @@ pub fn JobPartition::failure_reason(self : JobPartition) -> String? {
 }
 
 ///|
+fn JobPartition::copy(self : JobPartition) -> JobPartition {
+  {
+    partition: self.partition,
+    worker_id: self.worker_id,
+    epoch: self.epoch,
+    start_offset: self.start_offset,
+    next_offset: self.next_offset,
+    persisted_offset: self.persisted_offset,
+    applied_offset: self.applied_offset,
+    phase: self.phase,
+    failure_reason: self.failure_reason,
+  }
+}
+
+///|
 /// Durable data view of a Job lifecycle. The static topology is repeated here
 /// so a store can restore a Job without relying on an external plan registry.
 pub(all) struct JobSnapshot {
@@ -245,7 +260,7 @@ pub fn JobState::partition(self : JobState, partition : Int) -> JobPartition? {
 pub fn JobState::snapshot(self : JobState) -> JobSnapshot {
   let workers = self.spec.workers().to_owned()
   let routes = self.spec.routes().to_owned()
-  let partitions = self.partitions()
+  let partitions = self.partitions().map(partition => partition.copy())
   {
     version: 1,
     job_id: self.spec.job_id(),
@@ -317,7 +332,7 @@ pub fn JobState::from_snapshot(
       raise JobError::AssignmentConflict(value.partition)
     }
     validate_snapshot_partition(spec, value)
-    state.partitions[value.partition] = value
+    state.partitions[value.partition] = value.copy()
   }
   if seen.length() != snapshot.partition_count {
     raise JobError::MalformedSnapshot

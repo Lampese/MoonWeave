@@ -110,6 +110,16 @@ pub(all) suberror FrameIoError {
   Handler(String)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror JobStoreError {
+  EmptyPath
+  InvalidJournalOffset(Int64)
+  Malformed
+  UnsupportedVersion(Int)
+  Io(String)
+  Job(@control.JobError)
+  Wal(WalError)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror OutboxError {
   InvalidCapacity(Int)
   Closed(String)
@@ -296,6 +306,38 @@ pub fn IngressRouter::register_outbox(Self, Int, ExchangeOutbox) -> Unit raise S
 pub async fn IngressRouter::route(Self, @protocol.EventRecord) -> RoutedIngress raise SourceLogError
 pub fn IngressRouter::supervisor_work(Self, Int, String, maximum_batch_events? : Int, probe? : @protocol.Probe) -> SupervisorWork raise SourceLogError
 pub fn IngressRouter::supervisor_works(Self, String, maximum_batch_events? : Int) -> Array[SupervisorWork] raise SourceLogError
+
+type JobJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct JobStore {
+  state : @control.JobState
+  journal_path : String
+  checkpoint_path : String
+  journal : Wal
+  write_lock : @moonbitlang/async.Mutex
+  mut journal_offset : Int64
+}
+pub async fn JobStore::assign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
+pub async fn JobStore::cancel(Self) -> Unit raise JobStoreError
+pub async fn JobStore::checkpoint(Self) -> Unit raise JobStoreError
+pub fn JobStore::checkpoint_path(Self) -> String
+pub fn JobStore::close(Self) -> Unit
+pub async fn JobStore::drain(Self) -> Unit raise JobStoreError
+pub async fn JobStore::fail(Self, String) -> Unit raise JobStoreError
+pub async fn JobStore::fail_partition(Self, Int, String, Int, String) -> Unit raise JobStoreError
+pub fn JobStore::job_id(Self) -> String
+pub fn JobStore::journal_offset(Self) -> Int64
+pub fn JobStore::journal_path(Self) -> String
+pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String) -> Self raise JobStoreError
+pub fn JobStore::phase(Self) -> @control.JobPhase
+pub async fn JobStore::reassign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
+pub async fn JobStore::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobStoreError
+pub async fn JobStore::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobStoreError
+pub fn JobStore::snapshot(Self) -> @control.JobSnapshot
+pub async fn JobStore::start(Self) -> Unit raise JobStoreError
+pub async fn JobStore::stop_partition(Self, Int, String, Int, Int) -> Unit raise JobStoreError
+
+type JobStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct LivenessPolicy {
   heartbeat_timeout_ms : Int64

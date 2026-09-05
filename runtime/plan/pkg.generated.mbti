@@ -3,6 +3,7 @@ package "moonweave/moonweave/runtime/plan"
 
 import {
   "moonbitlang/core/debug",
+  "moonbitlang/core/json",
   "moonweave/moonweave/protocol",
 }
 
@@ -25,7 +26,7 @@ pub(all) suberror PlanError {
 pub(all) struct ExchangeRoute {
   source_partition : Int
   target_partition : Int
-} derive(Compare, Eq, Hash, @debug.Debug)
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
 pub fn ExchangeRoute::new(Int, Int) -> Self raise PlanError
 pub fn ExchangeRoute::source_partition(Self) -> Int
 pub fn ExchangeRoute::target_partition(Self) -> Int
