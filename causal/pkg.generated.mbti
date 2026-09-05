@@ -46,6 +46,7 @@ pub fn[T] CausalLog::frontier(Self[T]) -> Frontier
 pub fn[T] CausalLog::frontier_covers(Self[T], Frontier, Frontier) -> Bool
 pub fn[T] CausalLog::new(maximum_pending? : Int) -> Self[T] raise CausalError
 pub fn[T] CausalLog::pending_count(Self[T]) -> Int
+pub fn[T] CausalLog::pending_events(Self[T]) -> Array[Event[T]]
 pub fn[T] CausalLog::pending_ids(Self[T]) -> Array[EventId]
 pub fn[T : Eq] CausalLog::submit(Self[T], Event[T]) -> Admission[T] raise CausalError
 

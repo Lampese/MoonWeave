@@ -14,6 +14,11 @@ pub fn State::new() -> State {
 }
 
 ///|
+pub fn State::copy(self : State) -> State {
+  { edges: self.edges.copy(), closure: self.closure.copy(), }
+}
+
+///|
 pub fn State::edge_count(self : State) -> Int {
   self.edges.length()
 }

@@ -99,6 +99,19 @@ pub fn Query::new(
 }
 
 ///|
+pub fn Query::copy(self : Query) -> Query {
+  {
+    query_id: self.query_id,
+    source: self.source,
+    target: self.target,
+    reason: self.reason,
+    matched: self.matched,
+    obligations: self.obligations.copy(),
+    open: self.open.copy(),
+  }
+}
+
+///|
 pub fn Query::query_id(self : Query) -> String {
   self.query_id
 }

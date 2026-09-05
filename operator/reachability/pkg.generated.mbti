@@ -49,6 +49,7 @@ pub fn Edge::from_json(Json) -> Self raise ReachabilityError
 pub fn Edge::new(String, String) -> Self raise ReachabilityError
 pub fn Edge::source(Self) -> String
 pub fn Edge::target(Self) -> String
+pub fn Edge::to_json(Self) -> Json
 
 pub(all) struct EdgePayload {
   source : String
@@ -66,11 +67,14 @@ pub struct Engine {
 pub fn Engine::apply(Self, @causal.Event[Edge]) -> Array[Reachable] raise @causal.CausalError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[Reachable] raise EngineError
 pub fn Engine::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCertificate raise QueryError
+pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
+pub fn Engine::events(Self) -> Array[@causal.Event[Edge]]
 pub fn Engine::facts(Self) -> Array[Reachable]
 pub fn Engine::frontier(Self) -> @causal.Frontier
 pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
 pub fn Engine::pending_count(Self) -> Int
+pub fn Engine::pending_events(Self) -> Array[@causal.Event[Edge]]
 pub fn Engine::query(Self) -> Query?
 pub fn Engine::set_query(Self, Query) -> Unit
 pub fn Engine::verify_certificate(Self, ResultCertificate) -> Bool
@@ -86,6 +90,7 @@ pub struct Query {
 }
 pub fn Query::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCertificate raise QueryError
 pub fn Query::close_partition(Self, Int) -> Bool
+pub fn Query::copy(Self) -> Self
 pub fn Query::matched(Self) -> Bool
 pub fn Query::new(String, String, String, ArrayView[Int], reason? : String) -> Self raise QueryError
 pub fn Query::obligations(Self) -> Array[CoordinationObligation]
@@ -104,7 +109,7 @@ pub(all) enum QueryStatus {
 pub struct Reachable {
   source : String
   target : String
-} derive(Compare, Eq, Hash, @debug.Debug)
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
 pub fn Reachable::new(String, String) -> Self
 pub fn Reachable::source(Self) -> String
 pub fn Reachable::target(Self) -> String
@@ -132,6 +137,7 @@ pub struct State {
   closure : @set.Set[(String, String)]
 }
 pub fn State::apply(Self, Edge) -> Array[Reachable]
+pub fn State::copy(Self) -> Self
 pub fn State::edge_count(Self) -> Int
 pub fn State::edges(Self) -> Array[Edge]
 pub fn State::fact_count(Self) -> Int

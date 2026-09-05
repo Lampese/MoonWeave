@@ -33,6 +33,11 @@ pub fn Edge::target(self : Edge) -> String {
 }
 
 ///|
+pub fn Edge::to_json(self : Edge) -> Json {
+  @json.to_json(EdgePayload::{ source: self.source, target: self.target, })
+}
+
+///|
 /// JSON shape used by the first protocol workload. Keeping this adapter next
 /// to the operator makes the wire format explicit without coupling the
 /// protocol package to a particular operator.
@@ -69,7 +74,7 @@ pub fn Edge::from_json(value : Json) -> Edge raise ReachabilityError {
 pub struct Reachable {
   source : String
   target : String
-} derive(Debug, Eq, Compare, Hash)
+} derive(Debug, Eq, Compare, Hash, ToJson, FromJson)
 
 ///|
 pub fn Reachable::new(source : String, target : String) -> Reachable {

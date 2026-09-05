@@ -78,7 +78,7 @@ pub fn SecurityEvent::to_json(self : SecurityEvent) -> Json {
 ///|
 pub(all) struct SecurityAlert {
   user_id : String
-} derive(Debug, Eq, ToJson, FromJson)
+} derive(Debug, Eq, Compare, ToJson, FromJson)
 
 ///|
 pub fn SecurityAlert::user_id(self : SecurityAlert) -> String {
@@ -94,6 +94,16 @@ pub struct SecurityState {
 ///|
 pub fn SecurityState::new() -> SecurityState {
   { stages: Map([]), alerts: Set([]), }
+}
+
+///|
+pub fn SecurityState::copy(self : SecurityState) -> SecurityState {
+  let stages : Map[String, Set[SecurityEventKind]] = Map([])
+  for item in self.stages.to_array() {
+    let (user_id, kinds) = item
+    stages[user_id] = kinds.copy()
+  }
+  { stages, alerts: self.alerts.copy(), }
 }
 
 ///|
@@ -144,6 +154,11 @@ pub fn Engine::new(
 }
 
 ///|
+pub fn Engine::copy(self : Engine) -> Engine {
+  { log: self.log.copy(), state: self.state.copy(), }
+}
+
+///|
 pub fn Engine::event_count(self : Engine) -> Int {
   self.log.admitted_count()
 }
@@ -151,6 +166,25 @@ pub fn Engine::event_count(self : Engine) -> Int {
 ///|
 pub fn Engine::pending_count(self : Engine) -> Int {
   self.log.pending_count()
+}
+
+///|
+pub fn Engine::frontier(self : Engine) -> @causal.Frontier {
+  self.log.frontier()
+}
+
+///|
+/// Return the complete causal admission state for a pure application
+/// checkpoint. The result includes admitted and dependency-pending events.
+pub fn Engine::events(self : Engine) -> Array[@causal.Event[SecurityEvent]] {
+  self.log.events()
+}
+
+///|
+pub fn Engine::pending_events(
+  self : Engine,
+) -> Array[@causal.Event[SecurityEvent]] {
+  self.log.pending_events()
 }
 
 ///|

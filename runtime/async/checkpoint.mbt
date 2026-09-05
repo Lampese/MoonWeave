@@ -19,6 +19,7 @@ pub(all) struct Checkpoint {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
+  operator_state : Json?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -30,6 +31,7 @@ pub fn Checkpoint::new(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset? : Int64 = 0L,
+  operator_state? : Json,
 ) -> Checkpoint raise CheckpointError {
   if partition < 0 ||
     epoch < 0 ||
@@ -50,6 +52,7 @@ pub fn Checkpoint::new(
     persisted_offset,
     applied_offset,
     frontier_digest,
+    operator_state,
   }
 }
 
@@ -94,6 +97,11 @@ pub fn Checkpoint::frontier_digest(self : Checkpoint) -> String {
 }
 
 ///|
+pub fn Checkpoint::operator_state(self : Checkpoint) -> Json? {
+  self.operator_state
+}
+
+///|
 fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
   if self.version != 1 {
     raise CheckpointError::Malformed
@@ -106,6 +114,7 @@ fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
     self.applied_offset,
     self.frontier_digest,
     delta_wal_offset=self.delta_wal_offset,
+    operator_state?=self.operator_state,
   )
 }
 

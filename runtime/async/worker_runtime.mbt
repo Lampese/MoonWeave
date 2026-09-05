@@ -326,6 +326,7 @@ async fn save_checkpoint(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset : Int64,
+  operator_state? : Json,
 ) -> Unit raise FrameIoError {
   match checkpoint_path {
     None => ()
@@ -338,6 +339,7 @@ async fn save_checkpoint(
         applied_offset,
         frontier_digest,
         delta_wal_offset~,
+        operator_state?,
       ) catch {
         error => raise FrameIoError::Checkpoint(error)
       }
@@ -485,9 +487,9 @@ async fn send_worker_delta_ack(
 }
 
 ///|
-/// Run one worker connection with durable input admission and idempotent
-/// replay. The callback is the pure operator/application boundary.
-pub async fn run_worker(
+/// Internal Worker implementation with an optional post-handshake assignment
+/// validator used by the typed Task adapter.
+async fn run_worker_impl(
   connection : @socket.Tcp,
   cluster_id : String,
   coordinator_id : String,
@@ -503,6 +505,9 @@ pub async fn run_worker(
   heartbeat_interval_ms? : Int = 0,
   delta_handler? : (@protocol.DeltaBatch) -> Unit raise,
   delta_wal_path? : String,
+  assignment_validator? : (@protocol.Assignment) -> Unit raise FrameIoError,
+  state_restore? : (Json, Int64) -> Unit raise FrameIoError,
+  state_snapshot? : () -> Json raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -548,6 +553,10 @@ pub async fn run_worker(
   guard session.state().assignment() is Some(assignment) else {
     raise FrameIoError::MissingAssignment
   }
+  match assignment_validator {
+    None => ()
+    Some(validator) => validator(assignment)
+  }
   let causal_log : @causal.CausalLog[Json] = @causal.CausalLog::new() catch {
     error => raise FrameIoError::Handler(@debug.to_string(error))
   }
@@ -584,13 +593,46 @@ pub async fn run_worker(
         delta_records, restored_offset,
       )
   }
-  let replayed_batches = replay_wal_batches(wal_batches, handler)
+  let mut primary_replay_start = 0
+  let mut delta_replay_start = 0
+  match (checkpoint, state_restore) {
+    (Some(saved), Some(restore)) =>
+      match saved.operator_state() {
+        None => ()
+        Some(state) => {
+          restore(state, saved.persisted_offset())
+          primary_replay_start = replay.record_count_before(saved.wal_offset()) catch {
+            _ =>
+              raise FrameIoError::Handler("checkpoint is not on a WAL boundary")
+          }
+          delta_replay_start = match delta_replay {
+            None => 0
+            Some(delta_replay_value) =>
+              delta_replay_value.record_count_before(saved.delta_wal_offset()) catch {
+                _ =>
+                  raise FrameIoError::Handler(
+                    "checkpoint is not on a Delta WAL boundary",
+                  )
+              }
+          }
+        }
+      }
+    _ => ()
+  }
+  let replayed_batches = replay_wal_batches(
+    wal_batches[primary_replay_start:].to_owned(),
+    handler,
+  )
   let replayed_deltas = if delta_records.is_empty() {
     0
   } else {
     match delta_handler {
       None => raise FrameIoError::Handler("delta handler is not configured")
-      Some(callback) => replay_wal_deltas(delta_records, callback)
+      Some(callback) =>
+        replay_wal_deltas(
+          delta_records[delta_replay_start:].to_owned(),
+          callback,
+        )
     }
   }
   session.restore_progress(restored_offset, restored_offset, restored_offset) catch {
@@ -604,6 +646,10 @@ pub async fn run_worker(
     restored_offset,
     recovered_frontier_digest,
     delta_wal_offset,
+    operator_state?=match state_snapshot {
+      None => None
+      Some(snapshot) => Some(snapshot())
+    },
   )
   let resume_message = @protocol.Resume::new(
     assignment.partition(),
@@ -811,6 +857,10 @@ pub async fn run_worker(
               Some(value) => value.write_offset()
               None => 0L
             },
+            operator_state?=match state_snapshot {
+              None => None
+              Some(snapshot) => Some(snapshot())
+            },
           )
           send_worker_credit(
             connection,
@@ -884,6 +934,10 @@ pub async fn run_worker(
               Some(value) => value.write_offset()
               None => 0L
             },
+            operator_state?=match state_snapshot {
+              None => None
+              Some(snapshot) => Some(snapshot())
+            },
           )
         }
         send_worker_delta_ack(
@@ -924,4 +978,43 @@ pub async fn run_worker(
     persisted_offset: session.last_persisted_offset(),
     applied_offset: session.last_applied_offset(),
   }
+}
+
+///|
+/// Run one worker connection with durable input admission and idempotent
+/// replay. The callback is the pure operator/application boundary.
+pub async fn run_worker(
+  connection : @socket.Tcp,
+  cluster_id : String,
+  coordinator_id : String,
+  worker_id : String,
+  incarnation : String,
+  capabilities : Array[String],
+  wal_path : String,
+  handler : (@protocol.EventBatch) -> Unit raise,
+  checkpoint_path? : String,
+  maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  initial_credit_events? : Int64 = 128L,
+  initial_credit_bytes? : Int64 = 4L * 1024L * 1024L,
+  heartbeat_interval_ms? : Int = 0,
+  delta_handler? : (@protocol.DeltaBatch) -> Unit raise,
+  delta_wal_path? : String,
+) -> WorkerRunSummary raise FrameIoError {
+  run_worker_impl(
+    connection,
+    cluster_id,
+    coordinator_id,
+    worker_id,
+    incarnation,
+    capabilities,
+    wal_path,
+    handler,
+    checkpoint_path?,
+    maximum_frame_bytes~,
+    initial_credit_events~,
+    initial_credit_bytes~,
+    heartbeat_interval_ms~,
+    delta_handler?,
+    delta_wal_path?,
+  )
 }

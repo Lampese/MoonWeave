@@ -1,0 +1,157 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/task"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/reachability",
+  "moonweave/moonweave/operator/security",
+  "moonweave/moonweave/protocol",
+  "moonweave/moonweave/runtime/plan",
+}
+
+// Values
+
+// Errors
+pub(all) suberror TaskError {
+  EmptyTaskId
+  EmptyOperatorId
+  UnknownOperator(String)
+  InvalidPartition(Int)
+  PartitionMismatch(expected~ : Int, actual~ : Int)
+  InvalidEpoch(Int)
+  InvalidOffset(Int64)
+  PendingEvents(Int)
+  WrongPhase(expected~ : TaskPhase, actual~ : TaskPhase)
+  InvalidTransition
+  Reachability(@reachability.EngineError)
+  Security(@security.SecurityError)
+  Causal(@causal.CausalError)
+  Protocol(@protocol.ProtocolError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) enum OperatorKind {
+  Reachability
+  SecurityChain
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn OperatorKind::from_id(String) -> Self raise TaskError
+
+pub struct Task {
+  task_id : String
+  operator_id : String
+  operator : OperatorKind
+  partition : Int
+  epoch : Int
+  start_offset : Int64
+  mut phase : TaskPhase
+  mut offset : Int64
+  mut frontier : @causal.Frontier
+  mut emitted_outputs : Int
+  mut reachability : @reachability.Engine?
+  mut security : @security.Engine?
+}
+pub fn Task::drain(Self) -> Unit raise TaskError
+pub fn Task::epoch(Self) -> Int
+pub fn Task::event_count(Self) -> Int
+pub fn Task::fail(Self) -> Unit
+pub fn Task::from_assignment(String, String, OperatorKind, @protocol.AssignmentSpec) -> Self raise TaskError
+pub fn Task::from_spec(TaskSpec) -> Self raise TaskError
+pub fn Task::frontier(Self) -> @causal.Frontier
+pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64) -> Self raise TaskError
+pub fn Task::offset(Self) -> Int64
+pub fn Task::operator(Self) -> OperatorKind
+pub fn Task::operator_id(Self) -> String
+pub fn Task::outputs(Self) -> Array[TaskOutput]
+pub fn Task::partition(Self) -> Int
+pub fn Task::pending_count(Self) -> Int
+pub fn Task::phase(Self) -> TaskPhase
+pub fn Task::process(Self, Int64, TaskInput) -> Array[TaskOutput] raise TaskError
+pub fn Task::process_batch(Self, @protocol.EventBatch) -> Array[TaskOutput] raise TaskError
+pub fn Task::process_delta(Self, @protocol.DeltaBatch) -> Array[TaskOutput] raise TaskError
+pub fn Task::progress(Self) -> TaskProgress
+pub fn Task::restore(Self, TaskSnapshot) -> Unit raise TaskError
+pub fn Task::snapshot(Self) -> TaskSnapshot raise TaskError
+pub fn Task::start(Self) -> Unit raise TaskError
+pub fn Task::start_offset(Self) -> Int64
+pub fn Task::stop(Self) -> Unit raise TaskError
+pub fn Task::task_id(Self) -> String
+pub fn Task::validate_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
+
+pub(all) struct TaskInput {
+  event : @protocol.EventRecord
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskInput::event(Self) -> @protocol.EventRecord
+pub fn TaskInput::new(@protocol.EventRecord) -> Self
+
+pub(all) enum TaskOutput {
+  Reachable(@reachability.Reachable)
+  SecurityAlert(@security.SecurityAlert)
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) enum TaskPhase {
+  Created
+  Running
+  Draining
+  Stopped
+  Failed
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct TaskProgress {
+  task_id : String
+  partition : Int
+  epoch : Int
+  offset : Int64
+  phase : TaskPhase
+  frontier_digest : String
+  emitted_outputs : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskProgress::emitted_outputs(Self) -> Int
+pub fn TaskProgress::epoch(Self) -> Int
+pub fn TaskProgress::frontier_digest(Self) -> String
+pub fn TaskProgress::offset(Self) -> Int64
+pub fn TaskProgress::partition(Self) -> Int
+pub fn TaskProgress::phase(Self) -> TaskPhase
+pub fn TaskProgress::task_id(Self) -> String
+
+pub(all) struct TaskSnapshot {
+  task_id : String
+  operator_id : String
+  operator : OperatorKind
+  partition : Int
+  epoch : Int
+  offset : Int64
+  emitted_outputs : Int
+  events : Array[@protocol.EventRecord]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskSnapshot::emitted_outputs(Self) -> Int
+pub fn TaskSnapshot::epoch(Self) -> Int
+pub fn TaskSnapshot::events(Self) -> ArrayView[@protocol.EventRecord]
+pub fn TaskSnapshot::offset(Self) -> Int64
+pub fn TaskSnapshot::operator(Self) -> OperatorKind
+pub fn TaskSnapshot::operator_id(Self) -> String
+pub fn TaskSnapshot::partition(Self) -> Int
+pub fn TaskSnapshot::task_id(Self) -> String
+
+pub(all) struct TaskSpec {
+  job_id : String
+  task_id : String
+  operator_id : String
+  operator : OperatorKind
+  partition : Int
+  epoch : Int
+  start_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskSpec::epoch(Self) -> Int
+pub fn TaskSpec::from_job(@plan.JobSpec, @protocol.AssignmentSpec) -> Self raise TaskError
+pub fn TaskSpec::job_id(Self) -> String
+pub fn TaskSpec::operator(Self) -> OperatorKind
+pub fn TaskSpec::operator_id(Self) -> String
+pub fn TaskSpec::partition(Self) -> Int
+pub fn TaskSpec::start_offset(Self) -> Int64
+pub fn TaskSpec::task_id(Self) -> String
+
+// Type aliases
+
+// Traits

@@ -26,13 +26,17 @@ pub struct Engine {
 pub fn Engine::alerts(Self) -> Array[SecurityAlert]
 pub fn Engine::apply(Self, @causal.Event[SecurityEvent]) -> Array[SecurityAlert] raise SecurityError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[SecurityAlert] raise SecurityError
+pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
+pub fn Engine::events(Self) -> Array[@causal.Event[SecurityEvent]]
+pub fn Engine::frontier(Self) -> @causal.Frontier
 pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
 pub fn Engine::pending_count(Self) -> Int
+pub fn Engine::pending_events(Self) -> Array[@causal.Event[SecurityEvent]]
 
 pub(all) struct SecurityAlert {
   user_id : String
-} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SecurityAlert::user_id(Self) -> String
 
 pub(all) struct SecurityEvent {
@@ -62,6 +66,7 @@ pub struct SecurityState {
 }
 pub fn SecurityState::alerts(Self) -> Array[SecurityAlert]
 pub fn SecurityState::apply(Self, SecurityEvent) -> Array[SecurityAlert]
+pub fn SecurityState::copy(Self) -> Self
 pub fn SecurityState::new() -> Self
 
 // Type aliases

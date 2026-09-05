@@ -28,6 +28,15 @@ pub fn Engine::new(
 }
 
 ///|
+pub fn Engine::copy(self : Engine) -> Engine {
+  {
+    log: self.log.copy(),
+    state: self.state.copy(),
+    query: self.query.map(query => query.copy()),
+  }
+}
+
+///|
 pub fn Engine::set_query(self : Engine, query : Query) -> Unit {
   self.query = Some(query)
 }
@@ -85,6 +94,18 @@ pub fn Engine::facts(self : Engine) -> Array[Reachable] {
 ///|
 pub fn Engine::frontier(self : Engine) -> @causal.Frontier {
   self.log.frontier()
+}
+
+///|
+/// Return the complete causal admission state for a pure application
+/// checkpoint. The result includes admitted and dependency-pending events.
+pub fn Engine::events(self : Engine) -> Array[@causal.Event[Edge]] {
+  self.log.events()
+}
+
+///|
+pub fn Engine::pending_events(self : Engine) -> Array[@causal.Event[Edge]] {
+  self.log.pending_events()
 }
 
 ///|

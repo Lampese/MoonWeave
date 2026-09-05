@@ -2,6 +2,7 @@ import {
   "moonweave/moonweave/causal",
   "moonweave/moonweave/runtime/control",
   "moonweave/moonweave/runtime/plan",
+  "moonweave/moonweave/runtime/task",
   "moonweave/moonweave/protocol",
   "moonbitlang/async",
   "moonbitlang/async/aqueue",
@@ -16,6 +17,8 @@ import {
 import {
   "moonweave/moonweave/causal",
   "moonweave/moonweave/operator/reachability",
+  "moonweave/moonweave/operator/security",
+  "moonweave/moonweave/runtime/task",
   "moonbitlang/async" @async_runtime,
 } for "test"
 

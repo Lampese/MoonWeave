@@ -83,6 +83,16 @@ pub fn[T] CausalLog::events(self : CausalLog[T]) -> Array[Event[T]] {
 }
 
 ///|
+/// Return events which have been received but are still waiting for one or
+/// more causal parents. Snapshot consumers use this alongside `events()` to
+/// preserve the complete admission state across a restart.
+pub fn[T] CausalLog::pending_events(self : CausalLog[T]) -> Array[Event[T]] {
+  let events = self.pending.values().to_array()
+  events.sort_by((left, right) => Compare::compare(left.id(), right.id()))
+  events
+}
+
+///|
 pub fn[T] CausalLog::pending_ids(self : CausalLog[T]) -> Array[EventId] {
   let ids = self.pending.keys().to_array()
   ids.sort()
