@@ -406,6 +406,7 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
     partition: self.partition,
     epoch: self.epoch,
     offset: self.offset,
+    frontier_digest: self.frontier.digest(),
     emitted_outputs: self.emitted_outputs,
     events,
   }
@@ -425,6 +426,7 @@ pub fn Task::restore(
     snapshot.partition() != self.partition ||
     snapshot.epoch() != self.epoch ||
     snapshot.offset() < self.start_offset - 1L ||
+    snapshot.frontier_digest().is_empty() ||
     snapshot.emitted_outputs() < 0 {
     raise TaskError::InvalidTransition
   }
@@ -441,6 +443,9 @@ pub fn Task::restore(
     ignore(restored_outputs)
   }
   candidate.refresh_frontier()
+  if candidate.frontier.digest() != snapshot.frontier_digest() {
+    raise TaskError::InvalidTransition
+  }
   candidate.offset = snapshot.offset()
   candidate.emitted_outputs = snapshot.emitted_outputs()
   self.reachability = candidate.reachability

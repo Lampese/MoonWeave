@@ -9,6 +9,7 @@ pub(all) struct TaskSnapshot {
   partition : Int
   epoch : Int
   offset : Int64
+  frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
 } derive(Debug, Eq, ToJson, FromJson)
@@ -41,6 +42,11 @@ pub fn TaskSnapshot::epoch(self : TaskSnapshot) -> Int {
 ///|
 pub fn TaskSnapshot::offset(self : TaskSnapshot) -> Int64 {
   self.offset
+}
+
+///|
+pub fn TaskSnapshot::frontier_digest(self : TaskSnapshot) -> String {
+  self.frontier_digest
 }
 
 ///|

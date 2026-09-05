@@ -91,13 +91,22 @@ pub async fn run_worker_task(
     }
     emit(outputs[:])
   }
-  let state_restore : (Json, Int64) -> Unit raise FrameIoError = (state, offset) => {
+  let state_restore : (Json, Int64, String) -> Unit raise FrameIoError = (
+    state,
+    offset,
+    frontier_digest,
+  ) => {
     let snapshot : @task.TaskSnapshot = @json.from_json(state) catch {
       _ => raise FrameIoError::Task(@task.TaskError::InvalidTransition)
     }
     if snapshot.offset() != offset {
       raise FrameIoError::Handler(
         "operator snapshot offset does not match the checkpoint",
+      )
+    }
+    if snapshot.frontier_digest() != frontier_digest {
+      raise FrameIoError::Handler(
+        "operator snapshot frontier does not match the checkpoint",
       )
     }
     next_output_sequence = snapshot.emitted_outputs().to_int64()

@@ -506,7 +506,7 @@ async fn run_worker_impl(
   delta_handler? : (@protocol.DeltaBatch) -> Unit raise,
   delta_wal_path? : String,
   assignment_validator? : (@protocol.Assignment) -> Unit raise FrameIoError,
-  state_restore? : (Json, Int64) -> Unit raise FrameIoError,
+  state_restore? : (Json, Int64, String) -> Unit raise FrameIoError,
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
@@ -601,7 +601,7 @@ async fn run_worker_impl(
       match saved.operator_state() {
         None => ()
         Some(state) => {
-          restore(state, saved.persisted_offset())
+          restore(state, saved.persisted_offset(), saved.frontier_digest())
           primary_replay_start = replay.record_count_before(saved.wal_offset()) catch {
             _ =>
               raise FrameIoError::Handler("checkpoint is not on a WAL boundary")

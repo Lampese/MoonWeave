@@ -6,6 +6,7 @@ pub(all) suberror OutputLogError {
   InvalidPartition(Int)
   InvalidEpoch(Int)
   InvalidSequence(Int64)
+  SequenceGap(expected~ : Int64, actual~ : Int64)
   Malformed
   UnsupportedVersion(Int)
   IdentityConflict(String)
@@ -197,6 +198,14 @@ pub async fn TaskOutputLog::append(
     error => raise OutputLogError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  let mut expected = first_sequence
+  for index, _ in outputs {
+    let sequence = first_sequence + index.to_int64()
+    if sequence != expected {
+      raise OutputLogError::SequenceGap(expected~, actual=sequence)
+    }
+    expected += 1L
+  }
   for index, output in outputs {
     let sequence = first_sequence + index.to_int64()
     let record = TaskOutputRecord::{

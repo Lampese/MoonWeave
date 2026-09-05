@@ -121,6 +121,7 @@ pub(all) suberror OutputLogError {
   InvalidPartition(Int)
   InvalidEpoch(Int)
   InvalidSequence(Int64)
+  SequenceGap(expected~ : Int64, actual~ : Int64)
   Malformed
   UnsupportedVersion(Int)
   IdentityConflict(String)
