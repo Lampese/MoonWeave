@@ -25,6 +25,7 @@ pub(all) suberror FrameIoError {
   DeltaMismatch
   DrainMismatch
   PendingEvents(Int)
+  Reconciliation(ReconciliationError)
   Handler(String)
 } derive(Debug, Eq)
 

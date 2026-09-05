@@ -334,6 +334,101 @@ async fn JobStore::append_entry(
 }
 
 ///|
+/// Unlocked mutations reserved for the cross-store reconciliation critical
+/// section. `reconcile_job_coordinator` acquires `write_lock` first.
+async fn JobStore::reconcile_assign_unlocked(
+  self : JobStore,
+  partition : Int,
+  worker_id : String,
+  epoch : Int,
+  start_offset : Int64,
+) -> @control.JobPartition raise JobStoreError {
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("assign"),
+    partition,
+    worker_id,
+    epoch,
+    start_offset,
+  }
+  let preview = self.preview_state()
+  let assignment = preview.assign(partition, worker_id, epoch, start_offset) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.assign(partition, worker_id, epoch, start_offset) catch {
+      error => raise JobStoreError::Job(error)
+    },
+  )
+  assignment
+}
+
+///|
+async fn JobStore::reconcile_record_batch_unlocked(
+  self : JobStore,
+  partition : Int,
+  worker_id : String,
+  epoch : Int,
+  first_offset : Int64,
+  event_count : Int64,
+) -> Int64 raise JobStoreError {
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("batch_sent"),
+    partition,
+    worker_id,
+    epoch,
+    first_offset,
+    event_count,
+  }
+  let preview = self.preview_state()
+  let end_offset = preview.record_batch_sent(
+    partition, worker_id, epoch, first_offset, event_count,
+  ) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.record_batch_sent(
+      partition, worker_id, epoch, first_offset, event_count,
+    ) catch {
+      error => raise JobStoreError::Job(error)
+    },
+  )
+  end_offset
+}
+
+///|
+async fn JobStore::reconcile_record_progress_unlocked(
+  self : JobStore,
+  partition : Int,
+  worker_id : String,
+  epoch : Int,
+  persisted_offset : Int64,
+  applied_offset : Int64,
+) -> Unit raise JobStoreError {
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("progress"),
+    partition,
+    worker_id,
+    epoch,
+    persisted_offset,
+    applied_offset,
+  }
+  let preview = self.preview_state()
+  preview.record_progress(
+    partition, worker_id, epoch, persisted_offset, applied_offset,
+  ) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  self.state.record_progress(
+    partition, worker_id, epoch, persisted_offset, applied_offset,
+  ) catch {
+    error => raise JobStoreError::Job(error)
+  }
+}
+
+///|
 pub async fn JobStore::checkpoint(self : JobStore) -> Unit raise JobStoreError {
   self.write_lock.acquire() catch {
     error => raise JobStoreError::Io(@debug.to_string(error))

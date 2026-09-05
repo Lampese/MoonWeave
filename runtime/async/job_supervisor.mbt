@@ -33,35 +33,69 @@ fn validate_job_control(
 }
 
 ///|
-fn restore_job_control(
+async fn restore_job_control(
   control : @control.CoordinatorState,
   job : JobStore,
   assignment : @control.PartitionAssignment,
+  coordinator : CoordinatorStore?,
 ) -> Unit raise FrameIoError {
   let saved = validate_job_control(job, assignment)
   if assignment.next_offset() < saved.next_offset() {
-    ignore(
-      control.record_batch_sent(
-        assignment.partition(),
-        assignment.worker_id(),
-        assignment.incarnation(),
-        assignment.epoch(),
-        assignment.next_offset(),
-        saved.next_offset() - assignment.next_offset(),
-      ) catch {
-        error => raise FrameIoError::Coordinator(error)
-      },
-    )
+    match coordinator {
+      Some(store) =>
+        ignore(
+          store.record_batch_sent(
+            assignment.partition(),
+            assignment.worker_id(),
+            assignment.incarnation(),
+            assignment.epoch(),
+            assignment.next_offset(),
+            saved.next_offset() - assignment.next_offset(),
+          ) catch {
+            error => raise FrameIoError::CoordinatorStore(error)
+          },
+        )
+      None =>
+        ignore(
+          control.record_batch_sent(
+            assignment.partition(),
+            assignment.worker_id(),
+            assignment.incarnation(),
+            assignment.epoch(),
+            assignment.next_offset(),
+            saved.next_offset() - assignment.next_offset(),
+          ) catch {
+            error => raise FrameIoError::Coordinator(error)
+          },
+        )
+    }
   }
-  control.record_progress(
-    assignment.partition(),
-    assignment.worker_id(),
-    assignment.incarnation(),
-    assignment.epoch(),
-    saved.persisted_offset(),
-    saved.applied_offset(),
-  ) catch {
-    error => raise FrameIoError::Coordinator(error)
+  if assignment.persisted_offset() < saved.persisted_offset() ||
+    assignment.applied_offset() < saved.applied_offset() {
+    match coordinator {
+      Some(store) =>
+        store.record_progress(
+          assignment.partition(),
+          assignment.worker_id(),
+          assignment.incarnation(),
+          assignment.epoch(),
+          saved.persisted_offset(),
+          saved.applied_offset(),
+        ) catch {
+          error => raise FrameIoError::CoordinatorStore(error)
+        }
+      None =>
+        control.record_progress(
+          assignment.partition(),
+          assignment.worker_id(),
+          assignment.incarnation(),
+          assignment.epoch(),
+          saved.persisted_offset(),
+          saved.applied_offset(),
+        ) catch {
+          error => raise FrameIoError::Coordinator(error)
+        }
+    }
   }
 }
 
@@ -116,6 +150,7 @@ async fn wait_job_drain(
   assignment : @control.PartitionAssignment,
   session : @protocol.CoordinatorSession,
   job : JobStore,
+  coordinator : CoordinatorStore?,
   maximum_frame_bytes : Int,
 ) -> Unit raise FrameIoError {
   for ;; {
@@ -133,6 +168,14 @@ async fn wait_job_drain(
         }
         record_job_progress(
           job,
+          assignment,
+          ack.persisted_offset,
+          ack.applied_offset,
+        )
+        supervisor_record_progress(
+          control,
+          coordinator,
+          worker,
           assignment,
           ack.persisted_offset,
           ack.applied_offset,
@@ -159,7 +202,7 @@ async fn wait_job_drain(
         )
         supervisor_record_progress(
           control,
-          None,
+          coordinator,
           worker,
           assignment,
           progress.persisted_offset(),
@@ -167,7 +210,7 @@ async fn wait_job_drain(
         )
       }
       @protocol.FrameKind::Heartbeat =>
-        supervisor_record_heartbeat(control, None, worker)
+        supervisor_record_heartbeat(control, coordinator, worker)
       @protocol.FrameKind::Credit | @protocol.FrameKind::AckPersisted => ()
       _ => raise FrameIoError::DrainMismatch
     }
@@ -183,6 +226,7 @@ async fn confirm_job_drain(
   session : @protocol.CoordinatorSession,
   outbound : @protocol.FrameBuilder,
   job : JobStore,
+  coordinator : CoordinatorStore?,
   target_offset : Int64,
   maximum_frame_bytes : Int,
   timeout_ms : Int,
@@ -214,7 +258,7 @@ async fn confirm_job_drain(
     try {
       write_frame(connection, frame, maximum_frame_bytes~)
       wait_job_drain(
-        connection, control, worker, assignment, session, job, maximum_frame_bytes,
+        connection, control, worker, assignment, session, job, coordinator, maximum_frame_bytes,
       )
       Ok(())
     } catch {
@@ -242,6 +286,58 @@ pub async fn run_job_supervisor(
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   drain_timeout_ms? : Int = 5000,
 ) -> SupervisorRunSummary raise FrameIoError {
+  run_job_supervisor_impl(
+    server,
+    control,
+    job_store,
+    works,
+    maximum_frame_bytes,
+    drain_timeout_ms,
+    None,
+  )
+}
+
+///|
+/// Durable Job supervisor backed by both the Coordinator and Job stores. The
+/// stores are reconciled before any socket is accepted and again after the
+/// finite run; a crash between individual writes is recovered by the sidecar
+/// reconciliation WAL on the next startup.
+pub async fn run_durable_job_supervisor(
+  server : @socket.TcpServer,
+  coordinator_store : CoordinatorStore,
+  job_store : JobStore,
+  works : Array[SupervisorWork],
+  maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  drain_timeout_ms? : Int = 5000,
+  reconcile_path? : String,
+) -> SupervisorRunSummary raise FrameIoError {
+  if coordinator_store.journal_path() == job_store.journal_path() ||
+    coordinator_store.checkpoint_path() == job_store.checkpoint_path() {
+    raise FrameIoError::Handler(
+      "CoordinatorStore and JobStore must use separate paths",
+    )
+  }
+  run_job_supervisor_impl(
+    server,
+    coordinator_store.state(),
+    job_store,
+    works,
+    maximum_frame_bytes,
+    drain_timeout_ms,
+    Some((coordinator_store, reconcile_path)),
+  )
+}
+
+///|
+async fn run_job_supervisor_impl(
+  server : @socket.TcpServer,
+  control : @control.CoordinatorState,
+  job_store : JobStore,
+  works : Array[SupervisorWork],
+  maximum_frame_bytes : Int,
+  drain_timeout_ms : Int,
+  coordinator : (CoordinatorStore, String?)?,
+) -> SupervisorRunSummary raise FrameIoError {
   if !job_store.supervisor_lock.try_acquire() {
     raise FrameIoError::JobStore(JobStoreError::AlreadyRunning)
   }
@@ -265,6 +361,19 @@ pub async fn run_job_supervisor(
     raise FrameIoError::JobStore(
       JobStoreError::Job(@control.JobError::NotFullyAssigned),
     )
+  }
+  match coordinator {
+    None => ()
+    Some((coordinator_store, reconcile_path)) =>
+      // Assignment-only divergence can be repaired before a work plan is
+      // available. A cursor divergence may need the supplied frozen plan, so
+      // defer only that one conservative error until after binding below.
+      ignore(
+        reconcile_job_coordinator(coordinator_store, job_store, reconcile_path?),
+      ) catch {
+        ReconciliationError::MissingPlan(_) => ()
+        error => raise FrameIoError::Reconciliation(error)
+      }
   }
   let active = []
   let frozen_works = []
@@ -296,7 +405,25 @@ pub async fn run_job_supervisor(
         JobStoreError::Job(@control.JobError::PartitionFailed(work.partition())),
       )
     }
+    active.push(frozen)
+  }
+  for work in frozen_works {
+    job_store.bind_work(work) catch {
+      error => raise FrameIoError::JobStore(error)
+    }
+  }
+  match coordinator {
+    None => ()
+    Some((coordinator_store, reconcile_path)) =>
+      ignore(
+        reconcile_job_coordinator(coordinator_store, job_store, reconcile_path?) catch {
+          error => raise FrameIoError::Reconciliation(error)
+        },
+      )
+  }
+  for work in active {
     let (_, assignment, _) = validate_supervisor_work(control, work)
+    let partition = job_store_partition(job_store, work.partition())
     if assignment.epoch() != partition.epoch() ||
       assignment.start_offset() != partition.start_offset() {
       raise FrameIoError::JobStore(
@@ -304,14 +431,8 @@ pub async fn run_job_supervisor(
       )
     }
     ignore(validate_job_control(job_store, assignment))
-    active.push(frozen)
   }
   validate_supervisor_plan(control, active, maximum_frame_bytes)
-  for work in frozen_works {
-    job_store.bind_work(work) catch {
-      error => raise FrameIoError::JobStore(error)
-    }
-  }
   if phase == @control.JobPhase::Created {
     job_store.start() catch {
       error => raise FrameIoError::JobStore(error)
@@ -325,11 +446,27 @@ pub async fn run_job_supervisor(
     control,
     active,
     maximum_frame_bytes,
-    None,
+    match coordinator {
+      None => None
+      Some((coordinator_store, _)) => Some(coordinator_store)
+    },
     retry,
     job_store~,
     drain_timeout_ms~,
   )
+  match coordinator {
+    None => ()
+    Some((coordinator_store, reconcile_path)) => {
+      ignore(
+        reconcile_job_coordinator(coordinator_store, job_store, reconcile_path?) catch {
+          error => raise FrameIoError::Reconciliation(error)
+        },
+      )
+      coordinator_store.checkpoint() catch {
+        error => raise FrameIoError::CoordinatorStore(error)
+      }
+    }
+  }
   job_store.checkpoint() catch {
     error => raise FrameIoError::JobStore(error)
   }

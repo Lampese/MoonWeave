@@ -31,9 +31,13 @@ pub async fn coordinator_send_seal(@socket.Tcp, @protocol.CoordinatorSession, @p
 
 pub async fn[R : @io.Reader] read_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame raise FrameIoError
 
+pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String) -> ReconciliationSummary raise ReconciliationError
+
 pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoError, RetryPolicy) -> Y raise FrameIoError
 
 pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @protocol.AssignmentSpec, Array[@protocol.EventBatch], maximum_frame_bytes? : Int) -> CoordinatorRunSummary raise FrameIoError
+
+pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, reconcile_path? : String) -> SupervisorRunSummary raise FrameIoError
 
 pub async fn run_durable_liveness_scan(CoordinatorStore, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
@@ -129,6 +133,7 @@ pub(all) suberror FrameIoError {
   DeltaMismatch
   DrainMismatch
   PendingEvents(Int)
+  Reconciliation(ReconciliationError)
   Handler(String)
 } derive(Eq, @debug.Debug)
 
@@ -180,6 +185,29 @@ pub(all) suberror OutputLogError {
   IdentityConflict(String)
   Wal(WalError)
   Io(String)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror ReconciliationError {
+  EmptyPath
+  PathConflict
+  EmptyTransactionId
+  EmptyJobId
+  Malformed
+  UnsupportedVersion(Int)
+  IdentityMismatch
+  AssignmentMismatch(Int)
+  MissingAssignment(Int)
+  MissingPlan(Int)
+  CursorRegression(Int)
+  CursorConflict(Int)
+  EpochMismatch(Int)
+  PhaseConflict(Int)
+  StaleIntent(String)
+  UnknownTransaction(String)
+  TransactionConflict(String)
+  JobStore(JobStoreError)
+  CoordinatorStore(CoordinatorStoreError)
+  Wal(WalError)
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror RetryError {
@@ -437,6 +465,21 @@ pub fn LivenessPolicy::replacement_workers(Self) -> ArrayView[String]
 pub fn LivenessPolicy::scan_interval_ms(Self) -> Int
 
 type OutputConsumerEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type ReconciliationEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type ReconciliationPartition derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type ReconciliationPlan derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct ReconciliationSummary {
+  repaired_transactions : Int
+  recovered_transactions : Int
+  repaired_partitions : Int
+} derive(Eq, @debug.Debug)
+pub fn ReconciliationSummary::recovered_transactions(Self) -> Int
+pub fn ReconciliationSummary::repaired_partitions(Self) -> Int
+pub fn ReconciliationSummary::repaired_transactions(Self) -> Int
 
 pub struct RetryPolicy {
   max_attempts : Int

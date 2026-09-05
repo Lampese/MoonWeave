@@ -402,7 +402,7 @@ async fn run_supervised_session(
 ) -> CoordinatorRunSummary raise FrameIoError {
   match job_store {
     None => ()
-    Some(job) => restore_job_control(control, job, assignment)
+    Some(job) => restore_job_control(control, job, assignment, store)
   }
   session.restore_send_cursor(
     assignment.partition(),
@@ -592,8 +592,8 @@ async fn run_supervised_session(
       match job_store {
         Some(job) =>
           confirm_job_drain(
-            connection, control, worker, assignment, session, outbound, job, last_offset,
-            maximum_frame_bytes, drain_timeout_ms,
+            connection, control, worker, assignment, session, outbound, job, store,
+            last_offset, maximum_frame_bytes, drain_timeout_ms,
           )
         None => {
           let drain = outbound.build(@protocol.FrameKind::Drain, "{}") catch {

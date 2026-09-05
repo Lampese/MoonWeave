@@ -359,6 +359,104 @@ async fn CoordinatorStore::append_entry(
 }
 
 ///|
+/// Store mutations used by the cross-store reconciliation barrier. Callers
+/// hold `write_lock`; keeping these helpers unlocked gives reconciliation a
+/// stable critical section across both durable state machines.
+async fn CoordinatorStore::reconcile_assign_unlocked(
+  self : CoordinatorStore,
+  partition : Int,
+  worker_id : String,
+  start_offset : Int64,
+) -> @control.PartitionAssignment raise CoordinatorStoreError {
+  let preview = self.preview_state()
+  let assignment = preview.assign(partition, worker_id, start_offset~) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+  let entry = CoordinatorJournalEntry::{
+    ..empty_entry("assign"),
+    partition,
+    worker_id,
+    start_offset,
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.assign(partition, worker_id, start_offset~) catch {
+      error => raise CoordinatorStoreError::Coordinator(error)
+    },
+  )
+  assignment
+}
+
+///|
+async fn CoordinatorStore::reconcile_record_batch_unlocked(
+  self : CoordinatorStore,
+  partition : Int,
+  worker_id : String,
+  incarnation : @protocol.Incarnation,
+  epoch : Int,
+  first_offset : Int64,
+  event_count : Int64,
+) -> Int64 raise CoordinatorStoreError {
+  let preview = self.preview_state()
+  let end_offset = preview.record_batch_sent(
+    partition, worker_id, incarnation, epoch, first_offset, event_count,
+  ) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+  let entry = CoordinatorJournalEntry::{
+    ..empty_entry("batch_sent"),
+    partition,
+    worker_id,
+    incarnation: incarnation.value(),
+    epoch,
+    first_offset,
+    event_count,
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.record_batch_sent(
+      partition, worker_id, incarnation, epoch, first_offset, event_count,
+    ) catch {
+      error => raise CoordinatorStoreError::Coordinator(error)
+    },
+  )
+  end_offset
+}
+
+///|
+async fn CoordinatorStore::reconcile_record_progress_unlocked(
+  self : CoordinatorStore,
+  partition : Int,
+  worker_id : String,
+  incarnation : @protocol.Incarnation,
+  epoch : Int,
+  persisted_offset : Int64,
+  applied_offset : Int64,
+) -> Unit raise CoordinatorStoreError {
+  let preview = self.preview_state()
+  preview.record_progress(
+    partition, worker_id, incarnation, epoch, persisted_offset, applied_offset,
+  ) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+  let entry = CoordinatorJournalEntry::{
+    ..empty_entry("progress"),
+    partition,
+    worker_id,
+    incarnation: incarnation.value(),
+    epoch,
+    persisted_offset,
+    applied_offset,
+  }
+  self.append_entry(entry)
+  self.state.record_progress(
+    partition, worker_id, incarnation, epoch, persisted_offset, applied_offset,
+  ) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+}
+
+///|
 pub async fn CoordinatorStore::checkpoint(
   self : CoordinatorStore,
 ) -> Unit raise CoordinatorStoreError {
