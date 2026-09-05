@@ -1,4 +1,5 @@
 import {
+  "moonweave/moonweave/runtime/plan",
   "moonweave/moonweave/protocol",
   "moonbitlang/core/json",
 }

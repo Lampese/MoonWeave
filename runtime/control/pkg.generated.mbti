@@ -5,6 +5,7 @@ import {
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
   "moonweave/moonweave/protocol",
+  "moonweave/moonweave/runtime/plan",
 }
 
 // Values
@@ -34,6 +35,28 @@ pub(all) suberror CoordinatorError {
   OffsetRegression(expected_at_least~ : Int64, actual~ : Int64)
   AppliedAheadOfPersisted
   ProgressAheadOfSent
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror JobError {
+  EmptyReason
+  InvalidTransition(expected~ : JobPhase, actual~ : JobPhase)
+  NotFullyAssigned
+  UnknownPartition(Int)
+  UnknownWorker(String)
+  AssignmentConflict(Int)
+  InvalidEpoch(Int)
+  InvalidOffset(Int64)
+  InvalidEventCount(Int64)
+  WorkerMismatch(expected~ : String, actual~ : String)
+  EpochMismatch(expected~ : Int, actual~ : Int)
+  OffsetRegression(expected_at_least~ : Int64, actual~ : Int64)
+  AppliedAheadOfPersisted
+  ProgressAheadOfSent
+  PartitionFailed(Int)
+  PartitionNotRunning(Int)
+  NotCaughtUp(expected~ : Int64, actual~ : Int64)
+  PartitionNotDraining(Int)
+  PendingEvents(Int, Int)
 } derive(Eq, @debug.Debug)
 
 // Types and methods
@@ -105,6 +128,71 @@ pub(all) struct EpochSnapshot {
   partition : Int
   epoch : Int
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct JobPartition {
+  partition : Int
+  worker_id : String
+  epoch : Int
+  start_offset : Int64
+  mut next_offset : Int64
+  mut persisted_offset : Int64
+  mut applied_offset : Int64
+  mut phase : JobPartitionPhase
+  mut failure_reason : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobPartition::applied_offset(Self) -> Int64
+pub fn JobPartition::epoch(Self) -> Int
+pub fn JobPartition::failure_reason(Self) -> String?
+pub fn JobPartition::next_offset(Self) -> Int64
+pub fn JobPartition::partition(Self) -> Int
+pub fn JobPartition::persisted_offset(Self) -> Int64
+pub fn JobPartition::phase(Self) -> JobPartitionPhase
+pub fn JobPartition::start_offset(Self) -> Int64
+pub fn JobPartition::worker_id(Self) -> String
+
+pub(all) enum JobPartitionPhase {
+  Unassigned
+  Assigned
+  Running
+  Draining
+  Succeeded
+  Failed
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) enum JobPhase {
+  Created
+  Running
+  Draining
+  Succeeded
+  Failed
+  Cancelled
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct JobState {
+  spec : @plan.JobSpec
+  mut phase : JobPhase
+  partitions : Map[Int, JobPartition]
+  mut failure_reason : String?
+}
+pub fn JobState::assign(Self, Int, String, Int, Int64) -> JobPartition raise JobError
+pub fn JobState::cancel(Self) -> Unit raise JobError
+pub fn JobState::drain(Self) -> Unit raise JobError
+pub fn JobState::fail(Self, String) -> Unit raise JobError
+pub fn JobState::fail_partition(Self, Int, String, Int, String) -> Unit raise JobError
+pub fn JobState::failure_reason(Self) -> String?
+pub fn JobState::job_id(Self) -> String
+pub fn JobState::new(@plan.JobSpec) -> Self
+pub fn JobState::operator_id(Self) -> String
+pub fn JobState::partition(Self, Int) -> JobPartition?
+pub fn JobState::partition_count(Self) -> Int
+pub fn JobState::partitions(Self) -> Array[JobPartition]
+pub fn JobState::phase(Self) -> JobPhase
+pub fn JobState::reassign(Self, Int, String, Int, Int64) -> JobPartition raise JobError
+pub fn JobState::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobError
+pub fn JobState::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobError
+pub fn JobState::spec(Self) -> @plan.JobSpec
+pub fn JobState::start(Self) -> Unit raise JobError
+pub fn JobState::stop_partition(Self, Int, String, Int, Int) -> Unit raise JobError
 
 pub(all) enum LivenessDecision {
   Healthy
