@@ -24,6 +24,9 @@ pub(all) enum JobPartitionPhase {
 /// Errors raised by the pure Job lifecycle controller.
 pub(all) suberror JobError {
   EmptyReason
+  InvalidSnapshotVersion(Int)
+  MalformedSnapshot
+  Plan(@plan.PlanError)
   InvalidTransition(expected~ : JobPhase, actual~ : JobPhase)
   NotFullyAssigned
   UnknownPartition(Int)
@@ -105,6 +108,68 @@ pub fn JobPartition::failure_reason(self : JobPartition) -> String? {
 }
 
 ///|
+/// Durable data view of a Job lifecycle. The static topology is repeated here
+/// so a store can restore a Job without relying on an external plan registry.
+pub(all) struct JobSnapshot {
+  version : Int
+  job_id : String
+  operator_id : String
+  partition_count : Int
+  workers : Array[String]
+  routes : Array[@plan.ExchangeRoute]
+  phase : JobPhase
+  partitions : Array[JobPartition]
+  failure_reason : String?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobSnapshot::version(self : JobSnapshot) -> Int {
+  self.version
+}
+
+///|
+pub fn JobSnapshot::job_id(self : JobSnapshot) -> String {
+  self.job_id
+}
+
+///|
+pub fn JobSnapshot::operator_id(self : JobSnapshot) -> String {
+  self.operator_id
+}
+
+///|
+pub fn JobSnapshot::partition_count(self : JobSnapshot) -> Int {
+  self.partition_count
+}
+
+///|
+pub fn JobSnapshot::workers(self : JobSnapshot) -> ArrayView[String] {
+  self.workers[:]
+}
+
+///|
+pub fn JobSnapshot::routes(
+  self : JobSnapshot,
+) -> ArrayView[@plan.ExchangeRoute] {
+  self.routes[:]
+}
+
+///|
+pub fn JobSnapshot::phase(self : JobSnapshot) -> JobPhase {
+  self.phase
+}
+
+///|
+pub fn JobSnapshot::partitions(self : JobSnapshot) -> ArrayView[JobPartition] {
+  self.partitions[:]
+}
+
+///|
+pub fn JobSnapshot::failure_reason(self : JobSnapshot) -> String? {
+  self.failure_reason
+}
+
+///|
 /// Mutable Coordinator-side lifecycle state. All methods are synchronous and
 /// deterministic; async adapters supply transport and durable barriers.
 pub struct JobState {
@@ -173,6 +238,130 @@ pub fn JobState::partitions(self : JobState) -> Array[JobPartition] {
 ///|
 pub fn JobState::partition(self : JobState, partition : Int) -> JobPartition? {
   self.partitions.get(partition)
+}
+
+///|
+/// Export a deterministic, self-contained Job snapshot for an async store.
+pub fn JobState::snapshot(self : JobState) -> JobSnapshot {
+  let workers = self.spec.workers().to_owned()
+  let routes = self.spec.routes().to_owned()
+  let partitions = self.partitions()
+  {
+    version: 1,
+    job_id: self.spec.job_id(),
+    operator_id: self.spec.operator_id(),
+    partition_count: self.spec.partition_count(),
+    workers,
+    routes,
+    phase: self.phase,
+    partitions,
+    failure_reason: self.failure_reason,
+  }
+}
+
+///|
+fn validate_snapshot_partition(
+  spec : @plan.JobSpec,
+  value : JobPartition,
+) -> Unit raise JobError {
+  if value.partition < 0 || value.partition >= spec.partition_count() {
+    raise JobError::UnknownPartition(value.partition)
+  }
+  match value.phase {
+    JobPartitionPhase::Unassigned =>
+      if !value.worker_id.is_empty() ||
+        value.epoch != -1 ||
+        value.next_offset != 0L ||
+        value.persisted_offset != -1L ||
+        value.applied_offset != -1L {
+        raise JobError::MalformedSnapshot
+      }
+    _ =>
+      if value.worker_id.is_empty() ||
+        !spec.workers().any(worker => worker == value.worker_id) ||
+        value.epoch < 0 ||
+        value.start_offset < 0L ||
+        value.next_offset < value.start_offset ||
+        value.persisted_offset < value.start_offset - 1L ||
+        value.applied_offset < value.start_offset - 1L ||
+        value.applied_offset > value.persisted_offset ||
+        value.persisted_offset >= value.next_offset ||
+        value.applied_offset >= value.next_offset {
+        raise JobError::MalformedSnapshot
+      }
+  }
+}
+
+///|
+/// Restore a Job from validated durable data. This is synchronous by design;
+/// file and journal adapters remain outside the control package.
+pub fn JobState::from_snapshot(
+  snapshot : JobSnapshot,
+) -> JobState raise JobError {
+  if snapshot.version != 1 {
+    raise JobError::InvalidSnapshotVersion(snapshot.version)
+  }
+  let spec = @plan.JobSpec::new(
+    snapshot.job_id,
+    snapshot.operator_id,
+    snapshot.partition_count,
+    snapshot.workers[:],
+    snapshot.routes[:],
+  ) catch {
+    error => raise JobError::Plan(error)
+  }
+  let state = JobState::new(spec)
+  let seen : Set[Int] = Set([])
+  for value in snapshot.partitions {
+    if !seen.add_and_check(value.partition) {
+      raise JobError::AssignmentConflict(value.partition)
+    }
+    validate_snapshot_partition(spec, value)
+    state.partitions[value.partition] = value
+  }
+  if seen.length() != snapshot.partition_count {
+    raise JobError::MalformedSnapshot
+  }
+  state.phase = snapshot.phase
+  state.failure_reason = snapshot.failure_reason
+  match state.phase {
+    JobPhase::Created =>
+      if state.partitions
+        .values()
+        .any(partition => {
+          partition.phase != JobPartitionPhase::Unassigned &&
+          partition.phase != JobPartitionPhase::Assigned
+        }) {
+        raise JobError::MalformedSnapshot
+      }
+    JobPhase::Running =>
+      if state.partitions
+        .values()
+        .any(partition => {
+          partition.phase != JobPartitionPhase::Running &&
+          partition.phase != JobPartitionPhase::Failed
+        }) {
+        raise JobError::MalformedSnapshot
+      }
+    JobPhase::Draining =>
+      if state.partitions
+        .values()
+        .any(partition => {
+          partition.phase != JobPartitionPhase::Draining &&
+          partition.phase != JobPartitionPhase::Succeeded &&
+          partition.phase != JobPartitionPhase::Failed
+        }) {
+        raise JobError::MalformedSnapshot
+      }
+    JobPhase::Succeeded =>
+      if !state.partitions
+        .values()
+        .all(partition => partition.phase is JobPartitionPhase::Succeeded) {
+        raise JobError::MalformedSnapshot
+      }
+    JobPhase::Failed | JobPhase::Cancelled => ()
+  }
+  state
 }
 
 ///|

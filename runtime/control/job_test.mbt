@@ -152,3 +152,50 @@ test "failed partitions can be fenced and reassigned at a higher epoch" {
   state.stop_partition(1, "worker-b", 0, 0)
   assert_eq(state.phase(), JobPhase::Succeeded)
 }
+
+///|
+test "job snapshots round trip topology, fencing epoch, and lifecycle" {
+  let state = JobState::new(job_spec())
+  ignore(state.assign(0, "worker-a", 0, 0L))
+  ignore(state.assign(1, "worker-b", 0, 2L))
+  state.start()
+  ignore(state.record_batch_sent(0, "worker-a", 0, 0L, 1L))
+  state.record_progress(0, "worker-a", 0, 0L, 0L)
+  state.fail_partition(0, "worker-a", 0, "lost worker")
+  let snapshot = state.snapshot()
+  let restored = JobState::from_snapshot(snapshot)
+  assert_eq(restored.job_id(), "job-lifecycle")
+  assert_eq(restored.operator_id(), "reachability")
+  assert_eq(restored.phase(), JobPhase::Running)
+  assert_eq(restored.spec().routes(), [])
+  assert_eq(restored.partition(0).unwrap().epoch(), 0)
+  assert_eq(
+    restored.partition(0).unwrap().failure_reason(),
+    Some("lost worker"),
+  )
+  assert_eq(restored.snapshot(), snapshot)
+}
+
+///|
+test "job snapshot rejects incomplete or inconsistent partition data" {
+  let state = JobState::new(job_spec())
+  ignore(state.assign(0, "worker-a", 0, 0L))
+  let snapshot = state.snapshot()
+  let incomplete : JobSnapshot = {
+    version: snapshot.version(),
+    job_id: snapshot.job_id(),
+    operator_id: snapshot.operator_id(),
+    partition_count: snapshot.partition_count(),
+    workers: snapshot.workers().to_owned(),
+    routes: snapshot.routes().to_owned(),
+    phase: snapshot.phase(),
+    partitions: [snapshot.partitions()[0]],
+    failure_reason: snapshot.failure_reason(),
+  }
+  try JobState::from_snapshot(incomplete) catch {
+    JobError::MalformedSnapshot => ()
+    _ => fail("expected incomplete snapshot rejection")
+  } noraise {
+    _ => fail("expected incomplete snapshot rejection")
+  }
+}

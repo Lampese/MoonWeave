@@ -39,6 +39,9 @@ pub(all) suberror CoordinatorError {
 
 pub(all) suberror JobError {
   EmptyReason
+  InvalidSnapshotVersion(Int)
+  MalformedSnapshot
+  Plan(@plan.PlanError)
   InvalidTransition(expected~ : JobPhase, actual~ : JobPhase)
   NotFullyAssigned
   UnknownPartition(Int)
@@ -168,6 +171,27 @@ pub(all) enum JobPhase {
   Cancelled
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 
+pub(all) struct JobSnapshot {
+  version : Int
+  job_id : String
+  operator_id : String
+  partition_count : Int
+  workers : Array[String]
+  routes : Array[@plan.ExchangeRoute]
+  phase : JobPhase
+  partitions : Array[JobPartition]
+  failure_reason : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobSnapshot::failure_reason(Self) -> String?
+pub fn JobSnapshot::job_id(Self) -> String
+pub fn JobSnapshot::operator_id(Self) -> String
+pub fn JobSnapshot::partition_count(Self) -> Int
+pub fn JobSnapshot::partitions(Self) -> ArrayView[JobPartition]
+pub fn JobSnapshot::phase(Self) -> JobPhase
+pub fn JobSnapshot::routes(Self) -> ArrayView[@plan.ExchangeRoute]
+pub fn JobSnapshot::version(Self) -> Int
+pub fn JobSnapshot::workers(Self) -> ArrayView[String]
+
 pub struct JobState {
   spec : @plan.JobSpec
   mut phase : JobPhase
@@ -180,6 +204,7 @@ pub fn JobState::drain(Self) -> Unit raise JobError
 pub fn JobState::fail(Self, String) -> Unit raise JobError
 pub fn JobState::fail_partition(Self, Int, String, Int, String) -> Unit raise JobError
 pub fn JobState::failure_reason(Self) -> String?
+pub fn JobState::from_snapshot(JobSnapshot) -> Self raise JobError
 pub fn JobState::job_id(Self) -> String
 pub fn JobState::new(@plan.JobSpec) -> Self
 pub fn JobState::operator_id(Self) -> String
@@ -190,6 +215,7 @@ pub fn JobState::phase(Self) -> JobPhase
 pub fn JobState::reassign(Self, Int, String, Int, Int64) -> JobPartition raise JobError
 pub fn JobState::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobError
 pub fn JobState::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobError
+pub fn JobState::snapshot(Self) -> JobSnapshot
 pub fn JobState::spec(Self) -> @plan.JobSpec
 pub fn JobState::start(Self) -> Unit raise JobError
 pub fn JobState::stop_partition(Self, Int, String, Int, Int) -> Unit raise JobError
