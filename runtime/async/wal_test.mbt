@@ -9,6 +9,9 @@ async fn with_wal_path(f : async (String) -> Unit) -> Unit {
     @fs.remove(path + ".lock") catch {
       _ => ()
     }
+    @fs.remove(path + ".compact") catch {
+      _ => ()
+    }
     @fs.rmdir(directory) catch {
       _ => ()
     }
@@ -115,5 +118,91 @@ async test "wal enforces record size" {
       _ => fail("expected record size failure")
     }
     wal.close()
+  }
+}
+
+///|
+async test "wal rewrites records atomically under the existing lock" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path)
+    ignore(wal.append(b"old-1"))
+    ignore(wal.append(b"old-2"))
+    wal.rewrite([b"new"])
+    let compacted_size = wal.write_offset()
+    let lock = @fs.open(path + ".lock", mode=@fs.ReadWrite)
+    assert_false(lock.try_lock(@fs.Exclusive))
+    lock.close()
+    assert_eq(wal.append(b"tail"), compacted_size)
+    wal.close()
+    let (reopened, replay) = Wal::open(path)
+    assert_eq(replay.records(), [b"new", b"tail"])
+    reopened.rewrite([])
+    assert_eq(reopened.write_offset(), 0L)
+    assert_eq(reopened.append(b"after-empty"), 0L)
+    reopened.close()
+    let (final_wal, final_replay) = Wal::open(path)
+    defer final_wal.close()
+    assert_eq(final_replay.records(), [b"after-empty"])
+  }
+}
+
+///|
+async test "wal rewrite rejection keeps the old handle and contents usable" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path, maximum_record_bytes=8)
+    ignore(wal.append(b"old"))
+    let original_offset = wal.write_offset()
+    try wal.rewrite([b"replacement"]) catch {
+      error => assert_true(error is WalError::RecordTooLarge(..))
+    } noraise {
+      _ => fail("expected record size rejection")
+    }
+    assert_eq(wal.write_offset(), original_offset)
+
+    @fs.rename(path, path + ".original")
+    @fs.mkdir(path)
+    let result = Ok(wal.rewrite([b"new"])) catch { error => Err(error) }
+    @fs.rmdir(path)
+    @fs.rename(path + ".original", path)
+    assert_true(result is Err(WalError::Io(_)))
+    assert_eq(wal.write_offset(), original_offset)
+    assert_eq(wal.append(b"tail"), original_offset)
+    wal.close()
+    let (restored, replay) = Wal::open(path)
+    defer restored.close()
+    assert_eq(replay.records(), [b"old", b"tail"])
+  }
+}
+
+///|
+async test "wal serializes concurrent append and rewrite and rejects closed writes" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path)
+    @async_runtime.with_timeout(5000, () => {
+      @async_runtime.with_task_group <| group => {
+        let rewrite = group.spawn() <| () => { wal.rewrite([b"base"]) }
+        let append = group.spawn() <| () => { wal.append(b"tail") }
+        rewrite.wait()
+        ignore(append.wait())
+      }
+    })
+    let final_size = wal.write_offset()
+    wal.close()
+    try wal.append(b"closed") catch {
+      error => assert_eq(error, WalError::Closed)
+    } noraise {
+      _ => fail("expected closed WAL")
+    }
+    try wal.rewrite([]) catch {
+      error => assert_eq(error, WalError::Closed)
+    } noraise {
+      _ => fail("expected closed WAL")
+    }
+    let (restored, replay) = Wal::open(path)
+    defer restored.close()
+    assert_eq(final_size, replay.valid_bytes())
+    assert_true(
+      replay.records() == [b"base"] || replay.records() == [b"base", b"tail"],
+    )
   }
 }

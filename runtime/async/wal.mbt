@@ -9,6 +9,8 @@ pub(all) suberror WalError {
   UnsupportedVersion(version~ : Int, position~ : Int64)
   ChecksumMismatch(position~ : Int64)
   InvalidReplayOffset(Int64)
+  Closed
+  Failed
   Io(String)
 } derive(Debug, Eq)
 
@@ -91,10 +93,13 @@ pub fn WalReplay::repaired_tail_bytes(self : WalReplay) -> Int {
 pub struct Wal {
   path : String
   lock_path : String
-  file : @fs.File
+  mut file : @fs.File
   lock_file : @fs.File
   maximum_record_bytes : Int
   mut write_offset : Int64
+  write_lock : @async.Mutex
+  mut closed : Bool
+  mut failed : Bool
 }
 
 ///|
@@ -113,9 +118,32 @@ pub fn Wal::maximum_record_bytes(self : Wal) -> Int {
 }
 
 ///|
+/// Stop accepting new writes. An in-flight operation retains the file and
+/// process lock until its write barrier completes, then releases both.
 pub fn Wal::close(self : Wal) -> Unit {
-  self.file.close()
-  self.lock_file.close()
+  self.closed = true
+  if self.write_lock.try_acquire() {
+    self.release_write()
+  }
+}
+
+///|
+fn Wal::release_write(self : Wal) -> Unit {
+  if self.closed {
+    self.file.close()
+    self.lock_file.close()
+  }
+  self.write_lock.release()
+}
+
+///|
+fn Wal::check_writable(self : Wal) -> Unit raise WalError {
+  if self.closed {
+    raise WalError::Closed
+  }
+  if self.failed {
+    raise WalError::Failed
+  }
 }
 
 ///|
@@ -265,6 +293,7 @@ pub async fn Wal::open(
     error => raise WalError::Io(@debug.to_string(error))
   }
   let mut file = open_locked_file(path)
+  errdefer file.close()
   let data = file.read_all().binary() catch {
       error => raise WalError::Io(@debug.to_string(error))
     }
@@ -294,6 +323,9 @@ pub async fn Wal::open(
       lock_file,
       maximum_record_bytes,
       write_offset: replay.valid_bytes(),
+      write_lock: @async.Mutex::Mutex(),
+      closed: false,
+      failed: false,
     },
     replay,
   )
@@ -303,13 +335,67 @@ pub async fn Wal::open(
 /// Append one payload and synchronize it before reporting its record offset.
 pub async fn Wal::append(self : Wal, payload : Bytes) -> Int64 raise WalError {
   let record = encode_record(payload, self.maximum_record_bytes)
+  self.write_lock.acquire() catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
+  defer self.release_write()
+  self.check_writable()
   let offset = self.write_offset
-  self.file.write(record) catch {
-    error => raise WalError::Io(@debug.to_string(error))
+  @async.protect_from_cancel(resume_on_cancel=true, () => {
+    self.file.write(record)
+    self.file.sync()
+    self.write_offset += record.length().to_int64()
+  }) catch {
+    error => {
+      self.failed = true
+      raise WalError::Io(@debug.to_string(error))
+    }
   }
-  self.file.sync() catch {
-    error => raise WalError::Io(@debug.to_string(error))
-  }
-  self.write_offset += record.length().to_int64()
   offset
+}
+
+///|
+/// Atomically replace the verified WAL contents while retaining the process
+/// lock. Callers use this for compaction after their logical state decides
+/// which records remain replayable. This invalidates all previous byte offsets;
+/// callers must not use it on a WAL referenced by an external checkpoint.
+pub async fn Wal::rewrite(
+  self : Wal,
+  payloads : ArrayView[Bytes],
+) -> Unit raise WalError {
+  let encoded = encode_records(payloads, self.maximum_record_bytes)
+  self.write_lock.acquire() catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
+  defer self.release_write()
+  self.check_writable()
+  let temporary = self.path + ".compact"
+  let replacement = @fs.open(
+    temporary,
+    mode=@fs.ReadWrite,
+    append=true,
+    create_mode=@fs.CreateOrTruncate,
+  ) catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
+  let mut installed = false
+  defer (if !installed { replacement.close() })
+  replacement.write(encoded) catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
+  replacement.sync() catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
+  // Keep the original handle usable on rename failure. Shield the rename and
+  // handle handoff together so cancellation cannot leave writes on the old file.
+  @async.protect_from_cancel(resume_on_cancel=true, () => {
+    @fs.rename(temporary, self.path, replace=true)
+    let previous = self.file
+    self.file = replacement
+    self.write_offset = encoded.length().to_int64()
+    installed = true
+    previous.close()
+  }) catch {
+    error => raise WalError::Io(@debug.to_string(error))
+  }
 }

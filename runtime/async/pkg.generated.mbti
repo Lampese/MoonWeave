@@ -206,6 +206,8 @@ pub(all) suberror WalError {
   UnsupportedVersion(version~ : Int, position~ : Int64)
   ChecksumMismatch(position~ : Int64)
   InvalidReplayOffset(Int64)
+  Closed
+  Failed
   Io(String)
 } derive(Eq, @debug.Debug)
 
@@ -290,11 +292,14 @@ pub struct DurableExchangeOutbox {
   mut inflight : @set.Set[String]
   write_lock : @moonbitlang/async.Mutex
   mut closed : Bool
+  mut disposed : Bool
+  known_digests : Map[String, String]
 }
 pub async fn DurableExchangeOutbox::ack(Self, String) -> Unit raise DurableOutboxError
 pub fn DurableExchangeOutbox::acked_count(Self) -> Int
 pub fn DurableExchangeOutbox::capacity(Self) -> Int
 pub fn DurableExchangeOutbox::close(Self) -> Unit
+pub async fn DurableExchangeOutbox::compact(Self) -> Unit raise DurableOutboxError
 pub fn DurableExchangeOutbox::inflight_count(Self) -> Int
 pub fn DurableExchangeOutbox::is_closed(Self) -> Bool
 pub async fn DurableExchangeOutbox::open(String, Int) -> Self raise DurableOutboxError
@@ -520,16 +525,20 @@ pub fn TaskOutputRecord::version(Self) -> Int
 pub struct Wal {
   path : String
   lock_path : String
-  file : @fs.File
+  mut file : @fs.File
   lock_file : @fs.File
   maximum_record_bytes : Int
   mut write_offset : Int64
+  write_lock : @moonbitlang/async.Mutex
+  mut closed : Bool
+  mut failed : Bool
 }
 pub async fn Wal::append(Self, Bytes) -> Int64 raise WalError
 pub fn Wal::close(Self) -> Unit
 pub fn Wal::maximum_record_bytes(Self) -> Int
 pub async fn Wal::open(String, maximum_record_bytes? : Int) -> (Self, WalReplay) raise WalError
 pub fn Wal::path(Self) -> String
+pub async fn Wal::rewrite(Self, ArrayView[Bytes]) -> Unit raise WalError
 pub fn Wal::write_offset(Self) -> Int64
 
 pub struct WalReplay {

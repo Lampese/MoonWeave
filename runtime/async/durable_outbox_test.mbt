@@ -30,6 +30,9 @@ async fn with_durable_outbox_path(f : async (String) -> Unit) -> Unit {
     @fs.remove(path + ".repair") catch {
       _ => ()
     }
+    @fs.remove(path + ".compact") catch {
+      _ => ()
+    }
     @fs.rmdir(directory) catch {
       _ => ()
     }
@@ -64,7 +67,15 @@ async test "durable exchange outbox recovers unacked deltas and deduplicates put
       _ => fail("expected durable delta identity conflict")
     }
     restored.requeue_all()
+    restored.compact()
     restored.close()
+
+    let compacted = DurableExchangeOutbox::open(path, 2)
+    assert_eq(compacted.pending_count(), 1)
+    assert_eq(compacted.acked_count(), 1)
+    assert_true(compacted.try_push(first))
+    assert_eq(compacted.pending_count(), 1)
+    compacted.close()
   }
 }
 

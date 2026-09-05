@@ -14,16 +14,6 @@ pub(all) suberror DurableOutboxError {
 } derive(Debug, Eq)
 
 ///|
-/// One append-only outbox command. A `put` records the Delta payload; an `ack`
-/// records that the target Worker durably admitted it.
-struct DurableOutboxEntry {
-  version : Int
-  kind : String
-  delta_id : String
-  delta : @protocol.DeltaBatch?
-} derive(Debug, Eq, ToJson, FromJson)
-
-///|
 /// Durable, bounded exchange queue. `pending` contains all unacknowledged
 /// Deltas, while `inflight` identifies entries currently handed to a sender.
 pub struct DurableExchangeOutbox {
@@ -35,81 +25,14 @@ pub struct DurableExchangeOutbox {
   mut inflight : Set[String]
   write_lock : @async.Mutex
   mut closed : Bool
-}
-
-///|
-fn durable_outbox_key(delta_id : String) -> String {
-  delta_id.length().to_string() + ":" + delta_id
-}
-
-///|
-fn durable_put_entry(delta : @protocol.DeltaBatch) -> DurableOutboxEntry {
-  { version: 1, kind: "put", delta_id: delta.delta_id(), delta: Some(delta), }
-}
-
-///|
-fn durable_ack_entry(delta_id : String) -> DurableOutboxEntry {
-  { version: 1, kind: "ack", delta_id, delta: None, }
+  mut disposed : Bool
+  known_digests : Map[String, String]
 }
 
 ///|
 async fn durable_outbox_sleep() -> Unit raise DurableOutboxError {
   @async.sleep(1) catch {
     error => raise DurableOutboxError::Io(@debug.to_string(error))
-  }
-}
-
-///|
-fn apply_durable_outbox_entry(
-  pending : Array[@protocol.DeltaBatch],
-  known : Map[String, @protocol.DeltaBatch],
-  acked : Set[String],
-  entry : DurableOutboxEntry,
-) -> Unit raise DurableOutboxError {
-  if entry.version != 1 {
-    raise DurableOutboxError::UnsupportedVersion(entry.version)
-  }
-  if entry.delta_id.is_empty() {
-    raise DurableOutboxError::Malformed
-  }
-  let key = durable_outbox_key(entry.delta_id)
-  match entry.kind {
-    "put" => {
-      let delta = match entry.delta {
-        Some(value) => value
-        None => raise DurableOutboxError::Malformed
-      }
-      if delta.delta_id() != entry.delta_id {
-        raise DurableOutboxError::IdentityConflict(key)
-      }
-      match known.get(entry.delta_id) {
-        Some(previous) =>
-          if previous != delta {
-            raise DurableOutboxError::IdentityConflict(key)
-          }
-        None => {
-          known[entry.delta_id] = delta
-          if !acked.contains(entry.delta_id) {
-            pending.push(delta)
-          }
-        }
-      }
-    }
-    "ack" => {
-      guard known.contains(entry.delta_id) else {
-        raise DurableOutboxError::UnknownDelta(entry.delta_id)
-      }
-      acked.add(entry.delta_id)
-      let mut index = 0
-      while index < pending.length() {
-        if pending[index].delta_id() == entry.delta_id {
-          ignore(pending.remove(index))
-          break
-        }
-        index += 1
-      }
-    }
-    _ => raise DurableOutboxError::Malformed
   }
 }
 
@@ -130,6 +53,7 @@ pub async fn DurableExchangeOutbox::open(
   errdefer wal.close()
   let pending : Array[@protocol.DeltaBatch] = []
   let known : Map[String, @protocol.DeltaBatch] = Map([])
+  let known_digests : Map[String, String] = Map([])
   let acked : Set[String] = Set([])
   for encoded in replay.records() {
     let text = @utf8.decode(encoded) catch {
@@ -141,17 +65,19 @@ pub async fn DurableExchangeOutbox::open(
     let entry : DurableOutboxEntry = @json.from_json(json) catch {
       _ => raise DurableOutboxError::Malformed
     }
-    apply_durable_outbox_entry(pending, known, acked, entry)
+    apply_durable_outbox_entry(pending, known, known_digests, acked, entry)
   }
   {
     wal,
     capacity,
     pending,
     known,
+    known_digests,
     acked,
     inflight: Set([]),
     write_lock: @async.Mutex::Mutex(),
     closed: false,
+    disposed: false,
   }
 }
 
@@ -168,6 +94,20 @@ pub fn DurableExchangeOutbox::path(self : DurableExchangeOutbox) -> String {
 ///|
 pub fn DurableExchangeOutbox::is_closed(self : DurableExchangeOutbox) -> Bool {
   self.closed
+}
+
+///|
+fn DurableExchangeOutbox::is_drained(
+  self : DurableExchangeOutbox,
+) -> Bool raise DurableOutboxError {
+  if self.disposed {
+    raise DurableOutboxError::Closed
+  }
+  if !self.write_lock.try_acquire() {
+    return false
+  }
+  defer self.write_lock.release()
+  self.closed && self.pending.is_empty()
 }
 
 ///|
@@ -193,12 +133,13 @@ pub fn DurableExchangeOutbox::acked_count(self : DurableExchangeOutbox) -> Int {
 pub fn DurableExchangeOutbox::pending(
   self : DurableExchangeOutbox,
 ) -> Array[@protocol.DeltaBatch] {
-  self.pending.copy()
+  self.pending.map(copy_durable_delta)
 }
 
 ///|
 pub fn DurableExchangeOutbox::close(self : DurableExchangeOutbox) -> Unit {
   self.closed = true
+  self.disposed = true
   self.wal.close()
 }
 
@@ -237,12 +178,28 @@ fn DurableExchangeOutbox::check_delta(
       )
     _ => ()
   }
+  match self.known_digests.get(delta.delta_id()) {
+    Some(expected) if expected != durable_delta_digest(delta) =>
+      raise DurableOutboxError::IdentityConflict(
+        durable_outbox_key(delta.delta_id()),
+      )
+    _ => ()
+  }
 }
 
 ///|
-/// Nonblocking enqueue. `false` means the durable unacknowledged window is
-/// full; no payload is dropped.
+/// Enqueue without waiting for capacity. It still awaits the WAL durability
+/// barrier; `false` means the unacknowledged window is full.
 pub async fn DurableExchangeOutbox::try_push(
+  self : DurableExchangeOutbox,
+  delta : @protocol.DeltaBatch,
+) -> Bool raise DurableOutboxError {
+  let delta = validate_durable_delta(delta)
+  self.try_push_validated(delta)
+}
+
+///|
+async fn DurableExchangeOutbox::try_push_validated(
   self : DurableExchangeOutbox,
   delta : @protocol.DeltaBatch,
 ) -> Bool raise DurableOutboxError {
@@ -258,11 +215,15 @@ pub async fn DurableExchangeOutbox::try_push(
     Some(_) => return true
     None => ()
   }
+  if self.acked.contains(delta.delta_id()) {
+    return true
+  }
   if self.pending.length() >= self.capacity {
     return false
   }
   self.append_entry(durable_put_entry(delta))
   self.known[delta.delta_id()] = delta
+  self.known_digests[delta.delta_id()] = durable_delta_digest(delta)
   self.pending.push(delta)
   true
 }
@@ -273,30 +234,11 @@ pub async fn DurableExchangeOutbox::push(
   self : DurableExchangeOutbox,
   delta : @protocol.DeltaBatch,
 ) -> Unit raise DurableOutboxError {
+  let delta = validate_durable_delta(delta)
   for ;; {
-    self.write_lock.acquire() catch {
-      error => raise DurableOutboxError::Io(@debug.to_string(error))
-    }
-    if self.closed {
-      self.write_lock.release()
-      raise DurableOutboxError::Closed
-    }
-    self.check_delta(delta)
-    match self.known.get(delta.delta_id()) {
-      Some(_) => {
-        self.write_lock.release()
-        return
-      }
-      None => ()
-    }
-    if self.pending.length() < self.capacity {
-      self.append_entry(durable_put_entry(delta))
-      self.known[delta.delta_id()] = delta
-      self.pending.push(delta)
-      self.write_lock.release()
+    if self.try_push_validated(delta) {
       return
     }
-    self.write_lock.release()
     durable_outbox_sleep()
   }
 }
@@ -307,14 +249,14 @@ pub async fn DurableExchangeOutbox::push(
 pub fn DurableExchangeOutbox::try_pop(
   self : DurableExchangeOutbox,
 ) -> @protocol.DeltaBatch? {
-  if !self.write_lock.try_acquire() {
+  if self.disposed || !self.write_lock.try_acquire() {
     return None
   }
   defer self.write_lock.release()
   for delta in self.pending {
     if !self.inflight.contains(delta.delta_id()) {
       self.inflight.add(delta.delta_id())
-      return Some(delta)
+      return Some(copy_durable_delta(delta))
     }
   }
   None
@@ -325,7 +267,7 @@ pub async fn DurableExchangeOutbox::pop(
   self : DurableExchangeOutbox,
 ) -> @protocol.DeltaBatch raise DurableOutboxError {
   for ;; {
-    if self.closed && self.pending.is_empty() {
+    if self.is_drained() {
       raise DurableOutboxError::Closed
     }
     match self.try_pop() {
@@ -345,15 +287,19 @@ pub async fn DurableExchangeOutbox::ack(
     error => raise DurableOutboxError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
-  guard self.known.contains(delta_id) else {
-    raise DurableOutboxError::UnknownDelta(delta_id)
+  if self.disposed {
+    raise DurableOutboxError::Closed
   }
   if self.acked.contains(delta_id) {
     self.inflight.remove(delta_id)
     return
   }
+  guard self.known.contains(delta_id) else {
+    raise DurableOutboxError::UnknownDelta(delta_id)
+  }
   self.append_entry(durable_ack_entry(delta_id))
   self.acked.add(delta_id)
+  self.known.remove(delta_id)
   self.inflight.remove(delta_id)
   let mut index = 0
   while index < self.pending.length() {
@@ -379,4 +325,44 @@ pub fn DurableExchangeOutbox::requeue(
 /// connection so the same outbox can be retried without reopening its WAL.
 pub fn DurableExchangeOutbox::requeue_all(self : DurableExchangeOutbox) -> Unit {
   self.inflight = Set([])
+}
+
+///|
+/// Compact the outbox without losing duplicate suppression. Pending payloads
+/// remain as `put` records; acknowledged identities become small tombstones.
+/// Tombstones are retained indefinitely; this does not bound identity history.
+pub async fn DurableExchangeOutbox::compact(
+  self : DurableExchangeOutbox,
+) -> Unit raise DurableOutboxError {
+  self.write_lock.acquire() catch {
+    error => raise DurableOutboxError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  if self.disposed {
+    raise DurableOutboxError::Closed
+  }
+  let entries : Array[Bytes] = []
+  for delta in self.pending {
+    if !self.acked.contains(delta.delta_id()) {
+      entries.push(
+        @utf8.encode(@json.to_json(durable_put_entry(delta)).stringify()),
+      )
+    }
+  }
+  let acked_ids = self.acked.to_array()
+  acked_ids.sort()
+  for delta_id in acked_ids {
+    guard self.known_digests.get(delta_id) is Some(digest) else {
+      raise DurableOutboxError::Malformed
+    }
+    validate_durable_digest(digest)
+    entries.push(
+      @utf8.encode(
+        @json.to_json(durable_tombstone_entry(delta_id, digest)).stringify(),
+      ),
+    )
+  }
+  self.wal.rewrite(entries[:]) catch {
+    error => raise DurableOutboxError::Wal(error)
+  }
 }

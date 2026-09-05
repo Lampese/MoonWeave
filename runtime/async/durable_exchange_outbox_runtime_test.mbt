@@ -61,6 +61,11 @@ async test "durable exchange driver sends and acknowledges recovered deltas" {
   )
   defer server.close()
   @async_runtime.with_task_group <| group => {
+    let compacting = group.spawn() <| () => {
+      for _ in 0..<4 {
+        recovered.compact()
+      }
+    }
     let coordinator = group.spawn() <| () => {
       let (connection, _) = server.accept()
       run_managed_durable_exchange_outbox(
@@ -94,6 +99,7 @@ async test "durable exchange driver sends and acknowledges recovered deltas" {
       delta_wal_path=delta_wal,
     )
     let summary = coordinator.wait()
+    compacting.wait()
     assert_eq(worker.live_batches(), 0)
     assert_eq(received, 1)
     assert_eq(summary.sent_deltas(), 1)

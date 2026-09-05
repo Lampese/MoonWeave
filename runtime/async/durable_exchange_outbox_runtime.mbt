@@ -2,11 +2,11 @@
 fn collect_durable_outbox(
   outbox : DurableExchangeOutbox,
   pending : Array[@protocol.DeltaBatch],
-) -> Bool {
+) -> Unit {
   for ;; {
     match outbox.try_pop() {
       Some(delta) => pending.push(delta)
-      None => return outbox.is_closed()
+      None => return
     }
   }
 }
@@ -133,7 +133,6 @@ pub async fn run_managed_durable_exchange_outbox(
     error => raise FrameIoError::Session(error)
   }
   let pending : Array[@protocol.DeltaBatch] = []
-  let mut outbox_closed = false
   let sent_ids : Map[String, Bool] = Map([])
   let mut sent_deltas = 0
   let mut acked_deltas = 0
@@ -219,13 +218,14 @@ pub async fn run_managed_durable_exchange_outbox(
         }
       }
     }
-    if !outbox_closed {
-      outbox_closed = collect_durable_outbox(outbox, pending)
-    }
+    collect_durable_outbox(outbox, pending)
     sent_deltas += send_pending_durable_deltas(
       connection, session, outbound, outbox, pending, sent_ids, maximum_frame_bytes,
     )
-    if outbox_closed && pending.is_empty() && acked_deltas == sent_deltas {
+    let drained = outbox.is_drained() catch {
+      error => raise FrameIoError::DurableOutbox(error)
+    }
+    if drained && pending.is_empty() && acked_deltas == sent_deltas {
       let drain = outbound.build(@protocol.FrameKind::Drain, "{}") catch {
         error => raise FrameIoError::Protocol(error)
       }
