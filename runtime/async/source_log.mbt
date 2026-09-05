@@ -609,8 +609,8 @@ pub fn IngressRouter::supervisor_work(
 
 ///|
 /// Build the complete deterministic connection plan after startup or fencing.
-/// Protocol v1 owns one partition per Worker connection, so duplicate Worker
-/// ownership is rejected explicitly instead of hanging during Hello routing.
+/// A Worker may own multiple partitions; each Task session advertises its
+/// partition hint in Hello so the Supervisor can route connections precisely.
 pub fn IngressRouter::supervisor_works(
   self : IngressRouter,
   session_prefix : String,
@@ -622,15 +622,11 @@ pub fn IngressRouter::supervisor_works(
   if maximum_batch_events <= 0 {
     raise SourceLogError::InvalidBatchSize(maximum_batch_events)
   }
-  let workers : Set[String] = Set([])
   let works = []
   for partition in 0..<self.plan.partition_count() {
-    let assignment = match self.control.assignment(partition) {
-      Some(value) => value
+    match self.control.assignment(partition) {
+      Some(_) => ()
       None => raise SourceLogError::InvalidPartition(partition)
-    }
-    if !workers.add_and_check(assignment.worker_id()) {
-      raise SourceLogError::DuplicateWorkerConnection(assignment.worker_id())
     }
     works.push(
       self.supervisor_work(

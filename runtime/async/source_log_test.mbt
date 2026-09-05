@@ -256,7 +256,7 @@ async test "ingress recovery rebuilds primary and inbound exchange work" {
 }
 
 ///|
-async test "supervisor work rejects duplicate worker connections" {
+async test "supervisor work permits multiple partitions on one worker" {
   let directory = @fs.tmpdir(prefix="moonweave-ingress-duplicate-worker")
   let path = directory + "/source.wal"
   defer {
@@ -281,12 +281,9 @@ async test "supervisor work rejects duplicate worker connections" {
     )
   }
   let router = IngressRouter::open(plan, control, path)
-  try router.supervisor_works("session") catch {
-    SourceLogError::DuplicateWorkerConnection(worker_id) =>
-      assert_eq(worker_id, "worker-a")
-    _ => fail("expected duplicate Worker connection error")
-  } noraise {
-    _ => fail("expected duplicate Worker connection error")
-  }
+  let works = router.supervisor_works("session")
+  assert_eq(works.length(), 2)
+  assert_eq(works[0].worker_id(), "worker-a")
+  assert_eq(works[1].worker_id(), "worker-a")
   router.close()
 }
