@@ -8,6 +8,7 @@ import {
   "moonbitlang/async/socket",
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
+  "moonbitlang/core/set",
   "moonweave/moonweave/causal",
   "moonweave/moonweave/protocol",
   "moonweave/moonweave/runtime/control",
@@ -50,6 +51,8 @@ pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?,
 
 pub async fn run_managed_coordinator(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe) -> CoordinatorRunSummary raise FrameIoError
 
+pub async fn run_managed_durable_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, DurableExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
+
 pub async fn run_managed_exchange(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.DeltaBatch], maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
 
 pub async fn run_managed_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, ExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
@@ -88,6 +91,19 @@ pub(all) suberror CoordinatorStoreError {
   Protocol(@protocol.ProtocolError)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror DurableOutboxError {
+  EmptyPath
+  InvalidCapacity(Int)
+  Closed
+  Full(Int)
+  UnknownDelta(String)
+  IdentityConflict(String)
+  Malformed
+  UnsupportedVersion(Int)
+  Wal(WalError)
+  Io(String)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror FrameIoError {
   InvalidMaximumFrameBytes(Int)
   FrameTooLarge(actual~ : Int, limit~ : Int)
@@ -101,6 +117,7 @@ pub(all) suberror FrameIoError {
   TaskSet(@task.TaskSetError)
   OutputLog(OutputLogError)
   JobStore(JobStoreError)
+  DurableOutbox(DurableOutboxError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)
@@ -262,6 +279,36 @@ pub fn CoordinatorStore::snapshot(Self) -> @control.CoordinatorSnapshot
 type CoordinatorStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type DeltaWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct DurableExchangeOutbox {
+  wal : Wal
+  capacity : Int
+  pending : Array[@protocol.DeltaBatch]
+  known : Map[String, @protocol.DeltaBatch]
+  acked : @set.Set[String]
+  mut inflight : @set.Set[String]
+  write_lock : @moonbitlang/async.Mutex
+  mut closed : Bool
+}
+pub async fn DurableExchangeOutbox::ack(Self, String) -> Unit raise DurableOutboxError
+pub fn DurableExchangeOutbox::acked_count(Self) -> Int
+pub fn DurableExchangeOutbox::capacity(Self) -> Int
+pub fn DurableExchangeOutbox::close(Self) -> Unit
+pub fn DurableExchangeOutbox::inflight_count(Self) -> Int
+pub fn DurableExchangeOutbox::is_closed(Self) -> Bool
+pub async fn DurableExchangeOutbox::open(String, Int) -> Self raise DurableOutboxError
+pub fn DurableExchangeOutbox::path(Self) -> String
+pub fn DurableExchangeOutbox::pending(Self) -> Array[@protocol.DeltaBatch]
+pub fn DurableExchangeOutbox::pending_count(Self) -> Int
+pub async fn DurableExchangeOutbox::pop(Self) -> @protocol.DeltaBatch raise DurableOutboxError
+pub async fn DurableExchangeOutbox::push(Self, @protocol.DeltaBatch) -> Unit raise DurableOutboxError
+pub fn DurableExchangeOutbox::requeue(Self, String) -> Unit
+pub fn DurableExchangeOutbox::requeue_all(Self) -> Unit
+pub fn DurableExchangeOutbox::seal(Self) -> Unit
+pub fn DurableExchangeOutbox::try_pop(Self) -> @protocol.DeltaBatch?
+pub async fn DurableExchangeOutbox::try_push(Self, @protocol.DeltaBatch) -> Bool raise DurableOutboxError
+
+type DurableOutboxEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct ExchangeOutbox {
   queue : @aqueue.Queue[@protocol.DeltaBatch]
