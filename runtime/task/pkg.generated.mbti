@@ -31,6 +31,18 @@ pub(all) suberror TaskError {
   Protocol(@protocol.ProtocolError)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror TaskSetError {
+  EmptyJobId
+  EmptyOperatorId
+  EmptyTaskSet
+  DuplicatePartition(Int)
+  DuplicateTaskId(String)
+  OperatorMismatch(expected~ : String, actual~ : String)
+  WrongPhase(expected~ : TaskSetPhase, actual~ : TaskSetPhase)
+  UnknownPartition(Int)
+  Task(partition~ : Int, error~ : TaskError)
+} derive(Eq, @debug.Debug)
+
 // Types and methods
 pub(all) enum OperatorKind {
   Reachability
@@ -79,6 +91,17 @@ pub fn Task::stop(Self) -> Unit raise TaskError
 pub fn Task::task_id(Self) -> String
 pub fn Task::validate_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
 
+pub(all) struct TaskDispatch {
+  task_id : String
+  partition : Int
+  epoch : Int
+  outputs : Array[TaskOutput]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskDispatch::epoch(Self) -> Int
+pub fn TaskDispatch::outputs(Self) -> ArrayView[TaskOutput]
+pub fn TaskDispatch::partition(Self) -> Int
+pub fn TaskDispatch::task_id(Self) -> String
+
 pub(all) struct TaskInput {
   event : @protocol.EventRecord
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
@@ -114,6 +137,40 @@ pub fn TaskProgress::offset(Self) -> Int64
 pub fn TaskProgress::partition(Self) -> Int
 pub fn TaskProgress::phase(Self) -> TaskPhase
 pub fn TaskProgress::task_id(Self) -> String
+
+pub struct TaskSet {
+  job_id : String
+  operator_id : String
+  tasks : Map[Int, Task]
+  task_ids : Map[String, Int]
+}
+pub fn TaskSet::add(Self, Task) -> Unit raise TaskSetError
+pub fn TaskSet::drain(Self) -> Unit raise TaskSetError
+pub fn TaskSet::fail(Self) -> Unit
+pub fn TaskSet::from_job(@plan.JobSpec, ArrayView[@protocol.AssignmentSpec]) -> Self raise TaskSetError
+pub fn TaskSet::job_id(Self) -> String
+pub fn TaskSet::length(Self) -> Int
+pub fn TaskSet::new(String, String) -> Self raise TaskSetError
+pub fn TaskSet::operator_id(Self) -> String
+pub fn TaskSet::partitions(Self) -> Array[Int]
+pub fn TaskSet::phase(Self) -> TaskSetPhase
+pub fn TaskSet::process_batch(Self, @protocol.EventBatch) -> TaskDispatch raise TaskSetError
+pub fn TaskSet::process_delta(Self, @protocol.DeltaBatch) -> TaskDispatch raise TaskSetError
+pub fn TaskSet::progress(Self) -> Array[TaskProgress]
+pub fn TaskSet::start(Self) -> Unit raise TaskSetError
+pub fn TaskSet::stop(Self) -> Unit raise TaskSetError
+pub fn TaskSet::task(Self, Int) -> Task?
+pub fn TaskSet::tasks(Self) -> Array[Task]
+
+pub(all) enum TaskSetPhase {
+  Empty
+  Created
+  Running
+  Draining
+  Stopped
+  Failed
+  Mixed
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct TaskSnapshot {
   task_id : String

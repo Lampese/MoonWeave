@@ -7,7 +7,7 @@ pub struct WorkerRunSummary {
   live_batches : Int
   persisted_offset : Int64
   applied_offset : Int64
-}
+} derive(Debug, Eq)
 
 ///|
 pub fn WorkerRunSummary::replayed_batches(self : WorkerRunSummary) -> Int {

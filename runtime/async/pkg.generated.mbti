@@ -60,6 +60,8 @@ pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[Strin
 
 pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String) -> WorkerRunSummary raise FrameIoError
 
+pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
+
 pub async fn serve_echo(@socket.Tcp, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
 pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
@@ -94,6 +96,7 @@ pub(all) suberror FrameIoError {
   CoordinatorStore(CoordinatorStoreError)
   SourceLog(SourceLogError)
   Task(@task.TaskError)
+  TaskSet(@task.TaskSetError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)
@@ -405,12 +408,59 @@ pub struct WorkerRunSummary {
   live_batches : Int
   persisted_offset : Int64
   applied_offset : Int64
-}
+} derive(Eq, @debug.Debug)
 pub fn WorkerRunSummary::applied_offset(Self) -> Int64
 pub fn WorkerRunSummary::live_batches(Self) -> Int
 pub fn WorkerRunSummary::persisted_offset(Self) -> Int64
 pub fn WorkerRunSummary::replayed_batches(Self) -> Int
 pub fn WorkerRunSummary::replayed_deltas(Self) -> Int
+
+pub(all) struct WorkerTaskResult {
+  task_id : String
+  partition : Int
+  summary : WorkerRunSummary?
+  failure : String?
+} derive(Eq, @debug.Debug)
+pub fn WorkerTaskResult::failure(Self) -> String?
+pub fn WorkerTaskResult::partition(Self) -> Int
+pub fn WorkerTaskResult::summary(Self) -> WorkerRunSummary?
+pub fn WorkerTaskResult::task_id(Self) -> String
+
+pub(all) struct WorkerTaskSetSummary {
+  completed_tasks : Int
+  failed_tasks : Int
+  results : Array[WorkerTaskResult]
+  live_batches : Int
+  replayed_batches : Int
+  replayed_deltas : Int
+} derive(Eq, @debug.Debug)
+pub fn WorkerTaskSetSummary::completed_tasks(Self) -> Int
+pub fn WorkerTaskSetSummary::failed_tasks(Self) -> Int
+pub fn WorkerTaskSetSummary::live_batches(Self) -> Int
+pub fn WorkerTaskSetSummary::replayed_batches(Self) -> Int
+pub fn WorkerTaskSetSummary::replayed_deltas(Self) -> Int
+pub fn WorkerTaskSetSummary::results(Self) -> ArrayView[WorkerTaskResult]
+
+pub struct WorkerTaskWork {
+  connection : @socket.Tcp
+  cluster_id : String
+  coordinator_id : String
+  worker_id : String
+  incarnation : String
+  capabilities : Array[String]
+  wal_path : String
+  task : @task.Task
+  checkpoint_path : String?
+  delta_wal_path : String?
+  maximum_frame_bytes : Int
+  initial_credit_events : Int64
+  initial_credit_bytes : Int64
+  heartbeat_interval_ms : Int
+}
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
+pub fn WorkerTaskWork::partition(Self) -> Int
+pub fn WorkerTaskWork::task(Self) -> @task.Task
+pub fn WorkerTaskWork::task_id(Self) -> String
 
 // Type aliases
 

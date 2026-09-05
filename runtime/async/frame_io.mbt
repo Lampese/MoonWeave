@@ -10,6 +10,7 @@ pub(all) suberror FrameIoError {
   CoordinatorStore(CoordinatorStoreError)
   SourceLog(SourceLogError)
   Task(@task.TaskError)
+  TaskSet(@task.TaskSetError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)
