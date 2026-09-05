@@ -219,6 +219,7 @@ async test "worker task restores operator state and replays only the WAL suffix"
   let directory = @fs.tmpdir(prefix="moonweave-task-restore")
   let wal_path = directory + "/worker.wal"
   let checkpoint_path = directory + "/worker.json"
+  let output_log_path = directory + "/outputs.wal"
   defer {
     @fs.remove(wal_path) catch {
       _ => ()
@@ -230,6 +231,12 @@ async test "worker task restores operator state and replays only the WAL suffix"
       _ => ()
     }
     @fs.remove(checkpoint_path + ".tmp") catch {
+      _ => ()
+    }
+    @fs.remove(output_log_path) catch {
+      _ => ()
+    }
+    @fs.remove(output_log_path + ".lock") catch {
       _ => ()
     }
     @fs.rmdir(directory) catch {
@@ -298,10 +305,14 @@ async test "worker task restores operator state and replays only the WAL suffix"
       checkpoint_path~,
       initial_credit_events=2L,
       initial_credit_bytes=4096L,
+      output_log_path~,
     )
     assert_eq(first.live_batches(), 1)
     assert_eq(first.replayed_batches(), 0)
     assert_eq(first_outputs.length(), 3)
+    let output_log = TaskOutputLog::open(output_log_path)
+    assert_eq(output_log.records_for("restore-task").length(), 3)
+    output_log.close()
     coordinator_task.wait()
   }
 
@@ -362,11 +373,75 @@ async test "worker task restores operator state and replays only the WAL suffix"
       checkpoint_path~,
       initial_credit_events=2L,
       initial_credit_bytes=4096L,
+      output_log_path~,
     )
     assert_eq(second.replayed_batches(), 0)
     assert_eq(second.live_batches(), 0)
     assert_eq(second_outputs, [])
     assert_eq(task.offset(), 1L)
+    assert_eq(task.outputs().length(), 3)
+    coordinator_task.wait()
+  }
+
+  @fs.remove(checkpoint_path)
+  let third_server = @socket.TcpServer(
+    @socket.Addr::parse("127.0.0.1:0"),
+    reuse_addr=true,
+  )
+  defer third_server.close()
+  @async_runtime.with_task_group <| group => {
+    let coordinator_task = group.spawn() <| () => {
+      let (connection, _) = third_server.accept()
+      defer connection.close()
+      let assignment = @protocol.AssignmentSpec::new(0, 2, "boot-restore")
+      let (coordinator, outbound) = coordinator_handshake(
+        connection,
+        "cluster-restore",
+        "coordinator",
+        "worker-restore",
+        "restore-third",
+        assignment~,
+      )
+      coordinator.restore_send_cursor(0, 2, 2L)
+      coordinator.accept_frame(read_frame(connection))
+      coordinator.accept_frame(read_frame(connection))
+      coordinator.accept_frame(read_frame(connection))
+      write_frame(
+        connection,
+        outbound.build(@protocol.FrameKind::EventBatch, batch.to_payload()),
+      )
+      coordinator.accept_frame(read_frame(connection))
+      coordinator.accept_frame(read_frame(connection))
+      write_frame(connection, outbound.build(@protocol.FrameKind::Drain, "{}"))
+    }
+    let task = @task.Task::new(
+      "restore-task",
+      "reachability",
+      @task.OperatorKind::Reachability,
+      0,
+      2,
+    )
+    let replay_outputs : Array[@task.TaskOutput] = []
+    let replay_handler : (@task.TaskOutput) -> Unit raise = output => {
+      replay_outputs.push(output)
+    }
+    let replayed = run_worker_task(
+      @socket.Tcp::connect(third_server.addr),
+      "cluster-restore",
+      "coordinator",
+      "worker-restore",
+      "boot-restore",
+      [],
+      wal_path,
+      task,
+      replay_handler,
+      initial_credit_events=2L,
+      initial_credit_bytes=4096L,
+      output_log_path~,
+    )
+    assert_eq(replayed.replayed_batches(), 1)
+    assert_eq(replayed.live_batches(), 0)
+    assert_eq(replay_outputs.length(), 3)
     assert_eq(task.outputs().length(), 3)
     coordinator_task.wait()
   }

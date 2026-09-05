@@ -508,6 +508,7 @@ async fn run_worker_impl(
   assignment_validator? : (@protocol.Assignment) -> Unit raise FrameIoError,
   state_restore? : (Json, Int64) -> Unit raise FrameIoError,
   state_snapshot? : () -> Json raise FrameIoError,
+  output_barrier? : async () -> Unit raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -634,6 +635,10 @@ async fn run_worker_impl(
           callback,
         )
     }
+  }
+  match output_barrier {
+    None => ()
+    Some(barrier) => barrier()
   }
   session.restore_progress(restored_offset, restored_offset, restored_offset) catch {
     error => raise FrameIoError::Session(error)
@@ -833,6 +838,10 @@ async fn run_worker_impl(
           handler(batch_value) catch {
             error => raise FrameIoError::Handler(@debug.to_string(error))
           }
+          match output_barrier {
+            None => ()
+            Some(barrier) => barrier()
+          }
           session.mark_applied(batch_value.end_offset()) catch {
             error => raise FrameIoError::Session(error)
           }
@@ -922,6 +931,10 @@ async fn run_worker_impl(
               handler(delta_value) catch {
                 error => raise FrameIoError::Handler(@debug.to_string(error))
               }
+          }
+          match output_barrier {
+            None => ()
+            Some(barrier) => barrier()
           }
           save_checkpoint(
             checkpoint_path,

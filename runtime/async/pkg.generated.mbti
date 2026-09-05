@@ -58,7 +58,7 @@ pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorSt
 
 pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String) -> WorkerRunSummary raise FrameIoError
 
-pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
 
@@ -97,6 +97,7 @@ pub(all) suberror FrameIoError {
   SourceLog(SourceLogError)
   Task(@task.TaskError)
   TaskSet(@task.TaskSetError)
+  OutputLog(OutputLogError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)
@@ -112,6 +113,19 @@ pub(all) suberror FrameIoError {
 pub(all) suberror OutboxError {
   InvalidCapacity(Int)
   Closed(String)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror OutputLogError {
+  EmptyPath
+  EmptyTaskId
+  InvalidPartition(Int)
+  InvalidEpoch(Int)
+  InvalidSequence(Int64)
+  Malformed
+  UnsupportedVersion(Int)
+  IdentityConflict(String)
+  Wal(WalError)
+  Io(String)
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror RetryError {
@@ -374,6 +388,34 @@ pub fn SupervisorWork::probe(Self) -> @protocol.Probe?
 pub fn SupervisorWork::session_id(Self) -> String
 pub fn SupervisorWork::worker_id(Self) -> String
 
+pub struct TaskOutputLog {
+  wal : Wal
+  records : Array[TaskOutputRecord]
+  known : Map[String, TaskOutputRecord]
+  write_lock : @moonbitlang/async.Mutex
+}
+pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@task.TaskOutput]) -> Unit raise OutputLogError
+pub fn TaskOutputLog::close(Self) -> Unit
+pub async fn TaskOutputLog::open(String) -> Self raise OutputLogError
+pub fn TaskOutputLog::path(Self) -> String
+pub fn TaskOutputLog::records(Self) -> Array[TaskOutputRecord]
+pub fn TaskOutputLog::records_for(Self, String) -> Array[TaskOutputRecord]
+
+pub(all) struct TaskOutputRecord {
+  version : Int
+  task_id : String
+  partition : Int
+  epoch : Int
+  sequence : Int64
+  output : @task.TaskOutput
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskOutputRecord::epoch(Self) -> Int
+pub fn TaskOutputRecord::output(Self) -> @task.TaskOutput
+pub fn TaskOutputRecord::partition(Self) -> Int
+pub fn TaskOutputRecord::sequence(Self) -> Int64
+pub fn TaskOutputRecord::task_id(Self) -> String
+pub fn TaskOutputRecord::version(Self) -> Int
+
 pub struct Wal {
   path : String
   lock_path : String
@@ -452,12 +494,13 @@ pub struct WorkerTaskWork {
   task : @task.Task
   checkpoint_path : String?
   delta_wal_path : String?
+  output_log_path : String?
   maximum_frame_bytes : Int
   initial_credit_events : Int64
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
 }
-pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
 pub fn WorkerTaskWork::partition(Self) -> Int
 pub fn WorkerTaskWork::task(Self) -> @task.Task
 pub fn WorkerTaskWork::task_id(Self) -> String

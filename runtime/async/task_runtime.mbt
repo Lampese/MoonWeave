@@ -18,15 +18,65 @@ pub async fn run_worker_task(
   initial_credit_bytes? : Int64 = 4L * 1024L * 1024L,
   heartbeat_interval_ms? : Int = 0,
   delta_wal_path? : String,
+  output_log_path? : String,
 ) -> WorkerRunSummary raise FrameIoError {
   task.start() catch {
     error => raise FrameIoError::Task(error)
   }
+  let output_log = match output_log_path {
+    None => None
+    Some(path) =>
+      Some(
+        TaskOutputLog::open(path) catch {
+          error => {
+            task.fail()
+            raise FrameIoError::OutputLog(error)
+          }
+        },
+      )
+  }
+  defer (match output_log {
+    None => ()
+    Some(log) => log.close()
+  })
+  let pending_outputs : Array[(Int64, @task.TaskOutput)] = []
+  let mut next_output_sequence = task.progress().emitted_outputs().to_int64()
   let emit = (outputs : ArrayView[@task.TaskOutput]) => {
     for output in outputs {
-      output_handler(output) catch {
-        error => raise FrameIoError::Handler(@debug.to_string(error))
+      let sequence = next_output_sequence
+      next_output_sequence += 1L
+      match output_log {
+        None =>
+          output_handler(output) catch {
+            error => raise FrameIoError::Handler(@debug.to_string(error))
+          }
+        Some(_) => pending_outputs.push((sequence, output))
       }
+    }
+  }
+  let output_barrier : async () -> Unit raise FrameIoError = () => {
+    match output_log {
+      None => ()
+      Some(log) =>
+        if !pending_outputs.is_empty() {
+          let first_sequence = pending_outputs[0].0
+          let outputs = pending_outputs.map(pair => pair.1)
+          log.append(
+            task.task_id(),
+            task.partition(),
+            task.epoch(),
+            first_sequence,
+            outputs[:],
+          ) catch {
+            error => raise FrameIoError::OutputLog(error)
+          }
+          for pair in pending_outputs {
+            output_handler(pair.1) catch {
+              error => raise FrameIoError::Handler(@debug.to_string(error))
+            }
+          }
+          pending_outputs.clear()
+        }
     }
   }
   let primary_handler : (@protocol.EventBatch) -> Unit raise = batch => {
@@ -50,6 +100,7 @@ pub async fn run_worker_task(
         "operator snapshot offset does not match the checkpoint",
       )
     }
+    next_output_sequence = snapshot.emitted_outputs().to_int64()
     task.restore(snapshot) catch {
       error => raise FrameIoError::Task(error)
     }
@@ -84,6 +135,7 @@ pub async fn run_worker_task(
       },
       state_restore~,
       state_snapshot~,
+      output_barrier~,
     ),
   ) catch {
     error => Err(error)
