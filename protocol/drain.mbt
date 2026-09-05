@@ -44,6 +44,9 @@ pub(all) struct DrainAck {
   applied_offset : Int64
   pending_events : Int
   frontier_digest : String
+  task_id : String?
+  output_count : Int64?
+  output_digest : String?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -55,6 +58,9 @@ pub fn DrainAck::new(
   applied_offset : Int64,
   pending_events : Int,
   frontier_digest : String,
+  task_id? : String,
+  output_count? : Int64,
+  output_digest? : String,
 ) -> DrainAck raise ProtocolError {
   if request_id.is_empty() ||
     partition < 0 ||
@@ -63,8 +69,22 @@ pub fn DrainAck::new(
     applied_offset < -1L ||
     applied_offset > persisted_offset ||
     pending_events < 0 ||
-    frontier_digest.is_empty() {
+    frontier_digest.is_empty() ||
+    (
+      (
+        task_id is Some(_) ||
+        output_count is Some(_) ||
+        output_digest is Some(_)
+      ) &&
+      (task_id is None || output_count is None || output_digest is None)
+    ) {
     raise ProtocolError::InvalidFrameField
+  }
+  match (task_id, output_count, output_digest) {
+    (Some(id), Some(count), Some(digest)) if id.is_empty() ||
+      count < 0L ||
+      digest.is_empty() => raise ProtocolError::InvalidFrameField
+    _ => ()
   }
   {
     request_id,
@@ -74,7 +94,25 @@ pub fn DrainAck::new(
     applied_offset,
     pending_events,
     frontier_digest,
+    task_id,
+    output_count,
+    output_digest,
   }
+}
+
+///|
+pub fn DrainAck::task_id(self : DrainAck) -> String? {
+  self.task_id
+}
+
+///|
+pub fn DrainAck::output_count(self : DrainAck) -> Int64? {
+  self.output_count
+}
+
+///|
+pub fn DrainAck::output_digest(self : DrainAck) -> String? {
+  self.output_digest
 }
 
 ///|
@@ -93,6 +131,9 @@ pub fn DrainAck::from_payload(text : String) -> DrainAck raise MessageError {
     value.applied_offset,
     value.pending_events,
     value.frontier_digest,
+    task_id?=value.task_id,
+    output_count?=value.output_count,
+    output_digest?=value.output_digest,
   ) catch {
     error => raise protocol_error(error)
   }

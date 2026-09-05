@@ -79,6 +79,18 @@ pub async fn run_worker_task(
         }
     }
   }
+  let output_summary : () -> (String, Int64, String) raise FrameIoError = () => {
+    match output_log {
+      None =>
+        raise FrameIoError::Handler("output summary requires an output log")
+      Some(log) =>
+        (
+          task.task_id(),
+          log.next_sequence(task.task_id()),
+          log.output_digest(task.task_id()),
+        )
+    }
+  }
   let primary_handler : (@protocol.EventBatch) -> Unit raise = batch => {
     let outputs = task.process_batch(batch) catch {
       error => raise FrameIoError::Task(error)
@@ -153,6 +165,10 @@ pub async fn run_worker_task(
         task.stop() catch {
           error => raise FrameIoError::Task(error)
         }
+      },
+      output_summary?=match output_log {
+        None => None
+        Some(_) => Some(output_summary)
       },
     ),
   ) catch {

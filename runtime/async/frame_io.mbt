@@ -26,6 +26,7 @@ pub(all) suberror FrameIoError {
   DrainMismatch
   PendingEvents(Int)
   Reconciliation(ReconciliationError)
+  JobOutputManifest(JobOutputManifestError)
   Handler(String)
 } derive(Debug, Eq)
 

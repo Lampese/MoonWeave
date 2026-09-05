@@ -117,3 +117,39 @@ test "drain acknowledgement validates counters and preserves an incomplete repor
     _ => fail("negative pending count accepted")
   }
 }
+
+///|
+test "drain acknowledgement optionally carries a durable Task output summary" {
+  let ack = @protocol.DrainAck::new(
+    "drain-output",
+    2,
+    3,
+    1L,
+    1L,
+    0,
+    "frontier",
+    task_id="task/p2/e3",
+    output_count=4L,
+    output_digest="manifest-output",
+  )
+  assert_eq(@protocol.DrainAck::from_payload(ack.to_payload()), ack)
+  assert_eq(ack.task_id(), Some("task/p2/e3"))
+  assert_eq(ack.output_count(), Some(4L))
+  assert_eq(ack.output_digest(), Some("manifest-output"))
+  try
+    @protocol.DrainAck::new(
+      "partial-output",
+      2,
+      3,
+      1L,
+      1L,
+      0,
+      "frontier",
+      task_id="task/p2/e3",
+    )
+  catch {
+    _ => ()
+  } noraise {
+    _ => fail("partial output summary accepted")
+  }
+}

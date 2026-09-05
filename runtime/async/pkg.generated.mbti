@@ -37,7 +37,7 @@ pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoEr
 
 pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @protocol.AssignmentSpec, Array[@protocol.EventBatch], maximum_frame_bytes? : Int) -> CoordinatorRunSummary raise FrameIoError
 
-pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, reconcile_path? : String) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconcile_path? : String) -> SupervisorRunSummary raise FrameIoError
 
 pub async fn run_durable_liveness_scan(CoordinatorStore, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
@@ -47,7 +47,7 @@ pub async fn run_durable_supervisor(@socket.TcpServer, CoordinatorStore, Array[S
 
 pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> SupervisorRunSummary raise FrameIoError
 
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
@@ -134,6 +134,7 @@ pub(all) suberror FrameIoError {
   DrainMismatch
   PendingEvents(Int)
   Reconciliation(ReconciliationError)
+  JobOutputManifest(JobOutputManifestError)
   Handler(String)
 } derive(Eq, @debug.Debug)
 
@@ -153,6 +154,7 @@ pub(all) suberror JobOutputManifestError {
   NotComplete
   FrontierMismatch
   UnknownPartition(Int)
+  MissingSummary(Int)
   IdentityConflict(String)
   Job(@control.JobError)
   CursorRegression(String)
@@ -509,6 +511,7 @@ pub fn JobOutputManifest::path(Self) -> String
 pub async fn JobOutputManifest::publish_certificate(Self, JobOutputCertificate) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, Bool) -> Unit raise JobOutputManifestError
 pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
 pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
 
@@ -728,6 +731,7 @@ pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@tas
 pub fn TaskOutputLog::close(Self) -> Unit
 pub fn TaskOutputLog::next_sequence(Self, String) -> Int64
 pub async fn TaskOutputLog::open(String) -> Self raise OutputLogError
+pub fn TaskOutputLog::output_digest(Self, String) -> String
 pub fn TaskOutputLog::path(Self) -> String
 pub fn TaskOutputLog::records(Self) -> Array[TaskOutputRecord]
 pub fn TaskOutputLog::records_after(Self, String, Int64) -> Array[TaskOutputRecord]

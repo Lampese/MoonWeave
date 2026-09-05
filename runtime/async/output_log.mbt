@@ -206,6 +206,16 @@ pub fn TaskOutputLog::records_for(
 }
 
 ///|
+/// Deterministic digest of one Task's durable output prefix. This is a local
+/// consistency fingerprint for drain summaries, not an authentication tag.
+pub fn TaskOutputLog::output_digest(
+  self : TaskOutputLog,
+  task_id : String,
+) -> String {
+  manifest_records_digest(self.records_for(task_id))
+}
+
+///|
 /// Return the next output sequence expected for one Task.
 pub fn TaskOutputLog::next_sequence(
   self : TaskOutputLog,

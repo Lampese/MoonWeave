@@ -398,6 +398,7 @@ async fn run_supervised_session(
   maximum_frame_bytes : Int,
   store : CoordinatorStore?,
   job_store : JobStore?,
+  output_manifest : JobOutputManifest?,
   drain_timeout_ms : Int,
 ) -> CoordinatorRunSummary raise FrameIoError {
   match job_store {
@@ -593,7 +594,7 @@ async fn run_supervised_session(
         Some(job) =>
           confirm_job_drain(
             connection, control, worker, assignment, session, outbound, job, store,
-            last_offset, maximum_frame_bytes, drain_timeout_ms,
+            output_manifest, last_offset, maximum_frame_bytes, drain_timeout_ms,
           )
         None => {
           let drain = outbound.build(@protocol.FrameKind::Drain, "{}") catch {
@@ -648,6 +649,7 @@ async fn supervise_one_connection(
   store : CoordinatorStore?,
   retry_policy : RetryPolicy,
   job_store : JobStore?,
+  output_manifest : JobOutputManifest?,
   drain_timeout_ms : Int,
 ) -> SupervisedAttemptResult raise FrameIoError {
   let mut attempt = 1
@@ -729,6 +731,7 @@ async fn supervise_one_connection(
         maximum_frame_bytes,
         store,
         job_store,
+        output_manifest,
         drain_timeout_ms,
       )
       Ok(summary)
@@ -877,6 +880,7 @@ async fn run_supervisor_impl(
   store : CoordinatorStore?,
   retry_policy : RetryPolicy,
   job_store? : JobStore,
+  output_manifest? : JobOutputManifest,
   drain_timeout_ms? : Int = 5000,
 ) -> SupervisorRunSummary raise FrameIoError {
   validate_supervisor_plan(control, works[:], maximum_frame_bytes)
@@ -896,6 +900,7 @@ async fn run_supervisor_impl(
           store,
           retry_policy,
           job_store,
+          output_manifest,
           drain_timeout_ms,
         )
       }

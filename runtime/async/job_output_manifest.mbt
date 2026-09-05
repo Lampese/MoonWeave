@@ -19,6 +19,7 @@ pub(all) suberror JobOutputManifestError {
   NotComplete
   FrontierMismatch
   UnknownPartition(Int)
+  MissingSummary(Int)
   IdentityConflict(String)
   Job(@control.JobError)
   CursorRegression(String)
@@ -955,6 +956,50 @@ pub async fn JobOutputManifest::record_job_partition(
     frontier_digest,
     complete,
   )
+}
+
+///|
+/// Record a summary received from a remote Worker during a drain handshake.
+/// The logical output URI intentionally does not claim that the Coordinator
+/// can open the Worker-local WAL; the digest/count are the durable evidence
+/// transferred over the protocol.
+pub async fn JobOutputManifest::record_partition_summary(
+  self : JobOutputManifest,
+  partition : Int,
+  task_id : String,
+  worker_id : String,
+  epoch : Int,
+  output_count : Int64,
+  output_digest : String,
+  frontier_digest : String,
+  complete : Bool,
+) -> Unit raise JobOutputManifestError {
+  let value = JobOutputPartitionSummary::{
+    partition,
+    task_id,
+    worker_id,
+    epoch,
+    output_log_path: "worker://" + worker_id + "/" + task_id,
+    output_count,
+    output_digest,
+    frontier_digest,
+    complete,
+  }
+  validate_partition_summary(value, self.partition_count)
+  self.write_lock.acquire() catch {
+    error =>
+      raise JobOutputManifestError::Wal(WalError::Io(@debug.to_string(error)))
+  }
+  defer self.write_lock.release()
+  self.append_entry(JobOutputManifestEntry::{
+    ..empty_manifest_entry(
+      self.job_id,
+      self.operator_id,
+      self.partition_count,
+      "partition",
+    ),
+    partition: Some(value),
+  })
 }
 
 ///|

@@ -151,6 +151,7 @@ async fn wait_job_drain(
   session : @protocol.CoordinatorSession,
   job : JobStore,
   coordinator : CoordinatorStore?,
+  output_manifest : JobOutputManifest?,
   maximum_frame_bytes : Int,
 ) -> Unit raise FrameIoError {
   for ;; {
@@ -180,6 +181,27 @@ async fn wait_job_drain(
           ack.persisted_offset,
           ack.applied_offset,
         )
+        match output_manifest {
+          None => ()
+          Some(manifest) => {
+            guard (ack.task_id, ack.output_count, ack.output_digest)
+              is (Some(task_id), Some(output_count), Some(output_digest)) else {
+              raise FrameIoError::DrainMismatch
+            }
+            manifest.record_partition_summary(
+              assignment.partition(),
+              task_id,
+              worker.worker_id(),
+              assignment.epoch(),
+              output_count,
+              output_digest,
+              ack.frontier_digest,
+              true,
+            ) catch {
+              error => raise FrameIoError::JobOutputManifest(error)
+            }
+          }
+        }
         job.stop_partition(
           assignment.partition(),
           worker.worker_id(),
@@ -227,6 +249,7 @@ async fn confirm_job_drain(
   outbound : @protocol.FrameBuilder,
   job : JobStore,
   coordinator : CoordinatorStore?,
+  output_manifest : JobOutputManifest?,
   target_offset : Int64,
   maximum_frame_bytes : Int,
   timeout_ms : Int,
@@ -258,7 +281,8 @@ async fn confirm_job_drain(
     try {
       write_frame(connection, frame, maximum_frame_bytes~)
       wait_job_drain(
-        connection, control, worker, assignment, session, job, coordinator, maximum_frame_bytes,
+        connection, control, worker, assignment, session, job, coordinator, output_manifest,
+        maximum_frame_bytes,
       )
       Ok(())
     } catch {
@@ -285,6 +309,7 @@ pub async fn run_job_supervisor(
   works : Array[SupervisorWork],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   drain_timeout_ms? : Int = 5000,
+  output_manifest? : JobOutputManifest,
 ) -> SupervisorRunSummary raise FrameIoError {
   run_job_supervisor_impl(
     server,
@@ -294,6 +319,7 @@ pub async fn run_job_supervisor(
     maximum_frame_bytes,
     drain_timeout_ms,
     None,
+    output_manifest,
   )
 }
 
@@ -309,6 +335,7 @@ pub async fn run_durable_job_supervisor(
   works : Array[SupervisorWork],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   drain_timeout_ms? : Int = 5000,
+  output_manifest? : JobOutputManifest,
   reconcile_path? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   if coordinator_store.journal_path() == job_store.journal_path() ||
@@ -325,6 +352,7 @@ pub async fn run_durable_job_supervisor(
     maximum_frame_bytes,
     drain_timeout_ms,
     Some((coordinator_store, reconcile_path)),
+    output_manifest,
   )
 }
 
@@ -337,6 +365,7 @@ async fn run_job_supervisor_impl(
   maximum_frame_bytes : Int,
   drain_timeout_ms : Int,
   coordinator : (CoordinatorStore, String?)?,
+  output_manifest : JobOutputManifest?,
 ) -> SupervisorRunSummary raise FrameIoError {
   if !job_store.supervisor_lock.try_acquire() {
     raise FrameIoError::JobStore(JobStoreError::AlreadyRunning)
@@ -398,6 +427,17 @@ async fn run_job_supervisor_impl(
     frozen_works.push(frozen)
     let partition = job_store_partition(job_store, work.partition())
     if partition.phase() == @control.JobPartitionPhase::Succeeded {
+      match output_manifest {
+        None => ()
+        Some(manifest) => {
+          guard manifest.partition(work.partition()) is Some(summary) &&
+            summary.complete() else {
+            raise FrameIoError::JobOutputManifest(
+              JobOutputManifestError::MissingSummary(work.partition()),
+            )
+          }
+        }
+      }
       continue
     }
     if partition.phase() == @control.JobPartitionPhase::Failed {
@@ -452,6 +492,7 @@ async fn run_job_supervisor_impl(
     },
     retry,
     job_store~,
+    output_manifest?,
     drain_timeout_ms~,
   )
   match coordinator {

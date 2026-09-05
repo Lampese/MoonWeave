@@ -268,3 +268,95 @@ async test "empty successful partitions are already fully consumed" {
     assert_true(manifest.is_fully_consumed())
   }
 }
+
+///|
+async test "durable Job supervisor automatically records Worker output summaries" {
+  with_job_output_paths <| directory => {
+    let coordinator_journal = directory + "/coordinator.wal"
+    let coordinator_checkpoint = directory + "/coordinator.json"
+    let job_journal = directory + "/job.wal"
+    let job_checkpoint = directory + "/job.json"
+    let reconcile = directory + "/reconcile.wal"
+    let worker_wal = directory + "/worker.wal"
+    let output_wal = directory + "/worker-output.wal"
+    let output_manifest_path = directory + "/job-output.wal"
+    let coordinator = CoordinatorStore::open(
+      "manifest-cluster",
+      "coordinator",
+      coordinator_journal,
+      checkpoint_path=coordinator_checkpoint,
+    )
+    let job = JobStore::open(
+      @plan.JobSpec::new("manifest-job", "reachability", 1, ["worker"], []),
+      job_journal,
+      checkpoint_path=job_checkpoint,
+    )
+    let incarnation = @protocol.Incarnation::new("manifest-worker")
+    ignore(coordinator.register_worker("worker", incarnation, ["reachability"]))
+    let assignment = coordinator.assign(0, "worker")
+    ignore(job.assign(0, "worker", assignment.epoch(), 0L))
+    let manifest = JobOutputManifest::open_for_job(output_manifest_path, job)
+    let event = @protocol.EventRecord::new(
+      @causal.EventId::new("manifest-input", 0),
+      [],
+      "manifest-key",
+      Json::object({ "source": Json::string("A"), "target": Json::string("B") }),
+    )
+    let batch = @protocol.EventBatch::new(0, assignment.epoch(), 0L, [event])
+    let server = @socket.TcpServer(
+      @socket.Addr::parse("127.0.0.1:0"),
+      reuse_addr=true,
+    )
+    defer server.close()
+    @async_runtime.with_task_group <| group => {
+      let supervisor = group.spawn() <| () => {
+        run_durable_job_supervisor(
+          server,
+          coordinator,
+          job,
+          [SupervisorWork::new("worker", "manifest-session", 0, [batch])],
+          reconcile_path=reconcile,
+          output_manifest=manifest,
+        )
+      }
+      let task = @task.Task::new(
+        "manifest-job/p0/e0",
+        "reachability",
+        @task.OperatorKind::Reachability,
+        0,
+        assignment.epoch(),
+      )
+      let discard : (@task.TaskOutput) -> Unit raise = _ => ()
+      let worker_summary = run_worker_task(
+        @socket.Tcp::connect(server.addr),
+        "manifest-cluster",
+        "coordinator",
+        "worker",
+        incarnation.value(),
+        ["reachability"],
+        worker_wal,
+        task,
+        discard,
+        output_log_path=output_wal,
+        initial_credit_events=1L,
+        initial_credit_bytes=4096L,
+      )
+      let supervisor_summary = supervisor.wait()
+      assert_eq(worker_summary.live_batches(), 1)
+      assert_eq(supervisor_summary.failed_workers(), 0)
+      assert_eq(supervisor_summary.completed_workers(), 1)
+    }
+    assert_true(manifest.is_complete())
+    guard manifest.partition(0) is Some(summary) else {
+      fail("automatic output summary missing")
+    }
+    assert_eq(summary.task_id(), "manifest-job/p0/e0")
+    assert_eq(summary.worker_id(), "worker")
+    assert_eq(summary.output_count(), 1L)
+    assert_true(summary.output_digest().has_prefix("manifest-"))
+    assert_true(summary.output_log_path().has_prefix("worker://worker/"))
+    manifest.close()
+    job.close()
+    coordinator.close()
+  }
+}
