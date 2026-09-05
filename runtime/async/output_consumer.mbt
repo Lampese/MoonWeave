@@ -108,6 +108,16 @@ pub fn TaskOutputConsumer::task_id(self : TaskOutputConsumer) -> String {
 }
 
 ///|
+pub fn TaskOutputConsumer::partition(self : TaskOutputConsumer) -> Int {
+  self.binding.partition
+}
+
+///|
+pub fn TaskOutputConsumer::epoch(self : TaskOutputConsumer) -> Int {
+  self.binding.epoch
+}
+
+///|
 pub fn TaskOutputConsumer::checkpoint_path(self : TaskOutputConsumer) -> String {
   self.journal.path()
 }

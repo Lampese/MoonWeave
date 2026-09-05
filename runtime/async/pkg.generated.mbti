@@ -137,6 +137,33 @@ pub(all) suberror FrameIoError {
   Handler(String)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror JobOutputManifestError {
+  EmptyPath
+  EmptyJobId
+  EmptyOperatorId
+  EmptyTaskId
+  EmptyWorkerId
+  EmptyConsumerId
+  InvalidPartition(Int)
+  InvalidPartitionCount(Int)
+  InvalidEpoch(Int)
+  InvalidSequence(Int64)
+  InvalidDigest
+  InvalidCertificate
+  NotComplete
+  FrontierMismatch
+  UnknownPartition(Int)
+  IdentityConflict(String)
+  Job(@control.JobError)
+  CursorRegression(String)
+  CursorAhead(String)
+  DuplicatePartition(Int)
+  Malformed
+  UnsupportedVersion(Int)
+  Wal(WalError)
+  OutputLog(OutputLogError)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror JobStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
@@ -421,6 +448,112 @@ type JobExecutionPlan derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type JobJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+pub(all) struct JobOutputCertificate {
+  query_id : String
+  operator_id : String
+  status : String
+  result_digest : String
+  frontier_digest : String
+  payload : Json
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputCertificate::digest(Self) -> String
+pub fn JobOutputCertificate::frontier_digest(Self) -> String
+pub fn JobOutputCertificate::new(String, String, String, String, String, Json) -> Self raise JobOutputManifestError
+pub fn JobOutputCertificate::operator_id(Self) -> String
+pub fn JobOutputCertificate::payload(Self) -> Json
+pub fn JobOutputCertificate::query_id(Self) -> String
+pub fn JobOutputCertificate::result_digest(Self) -> String
+pub fn JobOutputCertificate::status(Self) -> String
+
+pub(all) struct JobOutputConsumerSummary {
+  consumer_id : String
+  task_id : String
+  partition : Int
+  epoch : Int
+  checkpoint_path : String
+  acked_sequence : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputConsumerSummary::acked_sequence(Self) -> Int64
+pub fn JobOutputConsumerSummary::checkpoint_path(Self) -> String
+pub fn JobOutputConsumerSummary::consumer_id(Self) -> String
+pub fn JobOutputConsumerSummary::epoch(Self) -> Int
+pub fn JobOutputConsumerSummary::partition(Self) -> Int
+pub fn JobOutputConsumerSummary::task_id(Self) -> String
+
+pub struct JobOutputManifest {
+  wal : Wal
+  job_id : String
+  operator_id : String
+  partition_count : Int
+  partitions : Map[Int, JobOutputPartitionSummary]
+  consumers : Map[String, JobOutputConsumerSummary]
+  mut certificate : JobOutputCertificate?
+  write_lock : @moonbitlang/async.Mutex
+}
+pub fn JobOutputManifest::certificate(Self) -> JobOutputCertificate?
+pub fn JobOutputManifest::close(Self) -> Unit
+pub fn JobOutputManifest::consumers(Self) -> Array[JobOutputConsumerSummary]
+pub fn JobOutputManifest::final_digest(Self) -> String
+pub fn JobOutputManifest::frontier_digest(Self) -> String
+pub fn JobOutputManifest::is_complete(Self) -> Bool
+pub fn JobOutputManifest::is_fully_consumed(Self) -> Bool
+pub fn JobOutputManifest::job_id(Self) -> String
+pub async fn JobOutputManifest::open(String, String, String, Int) -> Self raise JobOutputManifestError
+pub async fn JobOutputManifest::open_for_job(String, JobStore) -> Self raise JobOutputManifestError
+pub fn JobOutputManifest::operator_id(Self) -> String
+pub fn JobOutputManifest::output_digest(Self) -> String
+pub fn JobOutputManifest::partition(Self, Int) -> JobOutputPartitionSummary?
+pub fn JobOutputManifest::partition_count(Self) -> Int
+pub fn JobOutputManifest::partitions(Self) -> Array[JobOutputPartitionSummary]
+pub fn JobOutputManifest::path(Self) -> String
+pub async fn JobOutputManifest::publish_certificate(Self, JobOutputCertificate) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
+pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
+pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
+
+type JobOutputManifestEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct JobOutputManifestSnapshot {
+  version : Int
+  job_id : String
+  operator_id : String
+  partition_count : Int
+  partitions : Array[JobOutputPartitionSummary]
+  consumers : Array[JobOutputConsumerSummary]
+  certificate : JobOutputCertificate?
+  final_digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputManifestSnapshot::certificate(Self) -> JobOutputCertificate?
+pub fn JobOutputManifestSnapshot::consumers(Self) -> ArrayView[JobOutputConsumerSummary]
+pub fn JobOutputManifestSnapshot::final_digest(Self) -> String
+pub fn JobOutputManifestSnapshot::job_id(Self) -> String
+pub fn JobOutputManifestSnapshot::operator_id(Self) -> String
+pub fn JobOutputManifestSnapshot::partition_count(Self) -> Int
+pub fn JobOutputManifestSnapshot::partitions(Self) -> ArrayView[JobOutputPartitionSummary]
+pub fn JobOutputManifestSnapshot::version(Self) -> Int
+
+pub(all) struct JobOutputPartitionSummary {
+  partition : Int
+  task_id : String
+  worker_id : String
+  epoch : Int
+  output_log_path : String
+  output_count : Int64
+  output_digest : String
+  frontier_digest : String
+  complete : Bool
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputPartitionSummary::complete(Self) -> Bool
+pub fn JobOutputPartitionSummary::epoch(Self) -> Int
+pub fn JobOutputPartitionSummary::frontier_digest(Self) -> String
+pub fn JobOutputPartitionSummary::output_count(Self) -> Int64
+pub fn JobOutputPartitionSummary::output_digest(Self) -> String
+pub fn JobOutputPartitionSummary::output_log_path(Self) -> String
+pub fn JobOutputPartitionSummary::partition(Self) -> Int
+pub fn JobOutputPartitionSummary::task_id(Self) -> String
+pub fn JobOutputPartitionSummary::worker_id(Self) -> String
+
 pub struct JobStore {
   state : @control.JobState
   journal_path : String
@@ -577,8 +710,10 @@ pub fn TaskOutputConsumer::checkpoint_path(Self) -> String
 pub fn TaskOutputConsumer::close(Self) -> Unit
 pub async fn TaskOutputConsumer::consume(Self, async (TaskOutputRecord) -> Unit, maximum_records? : Int) -> Int
 pub fn TaskOutputConsumer::consumer_id(Self) -> String
+pub fn TaskOutputConsumer::epoch(Self) -> Int
 pub fn TaskOutputConsumer::next_sequence(Self) -> Int64
 pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int) -> Self raise OutputConsumerError
+pub fn TaskOutputConsumer::partition(Self) -> Int
 pub fn TaskOutputConsumer::read(Self, maximum_records? : Int) -> Array[TaskOutputRecord] raise OutputConsumerError
 pub fn TaskOutputConsumer::task_id(Self) -> String
 
