@@ -491,9 +491,11 @@ pub struct TaskOutputLog {
 }
 pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@task.TaskOutput]) -> Unit raise OutputLogError
 pub fn TaskOutputLog::close(Self) -> Unit
+pub fn TaskOutputLog::next_sequence(Self, String) -> Int64
 pub async fn TaskOutputLog::open(String) -> Self raise OutputLogError
 pub fn TaskOutputLog::path(Self) -> String
 pub fn TaskOutputLog::records(Self) -> Array[TaskOutputRecord]
+pub fn TaskOutputLog::records_after(Self, String, Int64) -> Array[TaskOutputRecord]
 pub fn TaskOutputLog::records_for(Self, String) -> Array[TaskOutputRecord]
 
 pub(all) struct TaskOutputRecord {

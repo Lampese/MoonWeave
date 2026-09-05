@@ -40,6 +40,17 @@ async test "output log is durable and idempotent by task sequence" {
     assert_eq(records[0].sequence(), 0L)
     assert_eq(records[1].sequence(), 1L)
     assert_eq(records[0].output(), first)
+    assert_eq(reopened.next_sequence("task-output"), 2L)
+    assert_eq(reopened.records_after("task-output", 0L).length(), 1)
+    try reopened.append("task-output", 2, 4, 3L, [first]) catch {
+      OutputLogError::SequenceGap(expected~, actual~) => {
+        assert_eq(expected, 2L)
+        assert_eq(actual, 3L)
+      }
+      _ => fail("expected output sequence gap")
+    } noraise {
+      _ => fail("expected output sequence gap")
+    }
     try
       reopened.append("task-output", 2, 4, 1L, [
         @task.TaskOutput::Reachable(@reachability.Reachable::new("X", "Y")),

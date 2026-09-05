@@ -172,6 +172,34 @@ pub fn TaskOutputLog::records_for(
 }
 
 ///|
+/// Return the next output sequence expected for one Task.
+pub fn TaskOutputLog::next_sequence(
+  self : TaskOutputLog,
+  task_id : String,
+) -> Int64 {
+  let records = self.records_for(task_id)
+  match records.last() {
+    None => 0L
+    Some(record) => record.sequence() + 1L
+  }
+}
+
+///|
+/// Read durable outputs strictly after a consumer checkpoint. Records remain
+/// in the WAL until an explicit compaction policy is introduced.
+pub fn TaskOutputLog::records_after(
+  self : TaskOutputLog,
+  task_id : String,
+  sequence : Int64,
+) -> Array[TaskOutputRecord] {
+  let result = self.records.filter(record => {
+    record.task_id == task_id && record.sequence > sequence
+  })
+  result.sort_by((left, right) => left.sequence.compare(right.sequence))
+  result
+}
+
+///|
 /// Append a contiguous output range. Equal records are silently treated as
 /// retries; a reused sequence with different content fails closed.
 pub async fn TaskOutputLog::append(
@@ -198,14 +226,8 @@ pub async fn TaskOutputLog::append(
     error => raise OutputLogError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
-  let mut expected = first_sequence
-  for index, _ in outputs {
-    let sequence = first_sequence + index.to_int64()
-    if sequence != expected {
-      raise OutputLogError::SequenceGap(expected~, actual=sequence)
-    }
-    expected += 1L
-  }
+  let mut expected = self.next_sequence(task_id)
+  let canonical_records : Array[TaskOutputRecord] = []
   for index, output in outputs {
     let sequence = first_sequence + index.to_int64()
     let record = TaskOutputRecord::{
@@ -224,15 +246,23 @@ pub async fn TaskOutputLog::append(
           raise OutputLogError::IdentityConflict(key)
         }
       None => {
-        let encoded = @utf8.encode(@json.to_json(canonical).stringify())
-        ignore(
-          self.wal.append(encoded) catch {
-            error => raise OutputLogError::Wal(error)
-          },
-        )
-        self.records.push(canonical)
-        self.known[key] = canonical
+        if sequence != expected {
+          raise OutputLogError::SequenceGap(expected~, actual=sequence)
+        }
+        canonical_records.push(canonical)
+        expected += 1L
       }
     }
+  }
+  for canonical in canonical_records {
+    let key = output_key(canonical.task_id, canonical.sequence)
+    let encoded = @utf8.encode(@json.to_json(canonical).stringify())
+    ignore(
+      self.wal.append(encoded) catch {
+        error => raise OutputLogError::Wal(error)
+      },
+    )
+    self.records.push(canonical)
+    self.known[key] = canonical
   }
 }
