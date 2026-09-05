@@ -287,3 +287,72 @@ async test "supervisor work permits multiple partitions on one worker" {
   assert_eq(works[1].worker_id(), "worker-a")
   router.close()
 }
+
+///|
+async test "ingress dispatch can enqueue into a durable exchange outbox" {
+  let directory = @fs.tmpdir(prefix="moonweave-ingress-durable-outbox")
+  let source_path = directory + "/source.wal"
+  let outbox_path = directory + "/exchange.wal"
+  defer {
+    @fs.remove(source_path) catch {
+      _ => ()
+    }
+    @fs.remove(source_path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(source_path + ".repair") catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path) catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path + ".repair") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let plan = @plan.JobSpec::new(
+    "durable-ingress",
+    "reachability",
+    2,
+    ["worker-a", "worker-b"],
+    [@plan.ExchangeRoute::new(0, 1)],
+  )
+  let control = @control.CoordinatorState::new("cluster-a", "coordinator")
+  ignore(
+    control.register_worker("worker-a", @protocol.Incarnation::new("boot-a"), []),
+  )
+  ignore(
+    control.register_worker("worker-b", @protocol.Incarnation::new("boot-b"), []),
+  )
+  for partition_plan in plan.plan_partitions() {
+    ignore(
+      control.assign(partition_plan.partition(), partition_plan.worker_id()),
+    )
+  }
+  let router = IngressRouter::open(plan, control, source_path)
+  let outbox = DurableExchangeOutbox::open(outbox_path, 4)
+  router.register_durable_outbox(1, outbox)
+  let event = source_event(
+    "durable-ingress",
+    0,
+    key_for_partition(plan, 0),
+    "B",
+  )
+  let dispatch = router.dispatch_and_enqueue(event)
+  assert_eq(dispatch.deltas().length(), 1)
+  let queued = outbox.try_pop().unwrap()
+  assert_eq(queued.delta_id(), dispatch.deltas()[0].delta_id())
+  outbox.requeue_all()
+  outbox.close()
+  router.close()
+  let restored = DurableExchangeOutbox::open(outbox_path, 4)
+  assert_eq(restored.pending_count(), 1)
+  assert_eq(restored.try_pop().unwrap().delta_id(), queued.delta_id())
+  restored.close()
+}

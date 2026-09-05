@@ -16,6 +16,7 @@ pub(all) suberror SourceLogError {
   UnsupportedVersion(Int)
   Plan(@plan.PlanError)
   Protocol(@protocol.ProtocolError)
+  DurableOutbox(DurableOutboxError)
   Wal(WalError)
   Io(String)
 } derive(Debug, Eq)
@@ -337,6 +338,7 @@ pub struct IngressRouter {
   control : @control.CoordinatorState
   source : SourceLog
   outboxes : Map[Int, ExchangeOutbox]
+  durable_outboxes : Map[Int, DurableExchangeOutbox]
 }
 
 ///|
@@ -371,7 +373,7 @@ pub async fn IngressRouter::open(
   source_path : String,
 ) -> IngressRouter raise SourceLogError {
   let source = SourceLog::open(source_path)
-  { plan, control, source, outboxes: Map([]), }
+  { plan, control, source, outboxes: Map([]), durable_outboxes: Map([]), }
 }
 
 ///|
@@ -479,6 +481,9 @@ pub fn IngressRouter::register_outbox(
   if self.outboxes.contains(partition) {
     raise SourceLogError::DuplicateOutbox(partition)
   }
+  if self.durable_outboxes.contains(partition) {
+    raise SourceLogError::DuplicateOutbox(partition)
+  }
   self.outboxes[partition] = outbox
 }
 
@@ -488,6 +493,32 @@ pub fn IngressRouter::outbox(
   partition : Int,
 ) -> ExchangeOutbox? {
   self.outboxes.get(partition)
+}
+
+///|
+/// Register a WAL-backed target outbox. At most one outbox implementation may
+/// be registered for a partition, preventing duplicate Delta delivery paths.
+pub fn IngressRouter::register_durable_outbox(
+  self : IngressRouter,
+  partition : Int,
+  outbox : DurableExchangeOutbox,
+) -> Unit raise SourceLogError {
+  if partition < 0 || self.control.assignment(partition) is None {
+    raise SourceLogError::InvalidPartition(partition)
+  }
+  if self.outboxes.contains(partition) ||
+    self.durable_outboxes.contains(partition) {
+    raise SourceLogError::DuplicateOutbox(partition)
+  }
+  self.durable_outboxes[partition] = outbox
+}
+
+///|
+pub fn IngressRouter::durable_outbox(
+  self : IngressRouter,
+  partition : Int,
+) -> DurableExchangeOutbox? {
+  self.durable_outboxes.get(partition)
 }
 
 ///|
@@ -504,19 +535,36 @@ pub async fn IngressRouter::dispatch_and_enqueue(
     error => raise SourceLogError::Plan(error)
   }
   for target in targets {
-    let outbox = match self.outboxes.get(target.partition()) {
-      Some(value) => value
-      None => raise SourceLogError::MissingOutbox(target.partition())
-    }
-    if outbox.is_closed() {
-      raise SourceLogError::ClosedOutbox(target.partition())
+    match
+      (
+        self.outboxes.get(target.partition()),
+        self.durable_outboxes.get(target.partition()),
+      ) {
+      (Some(outbox), None) if outbox.is_closed() =>
+        raise SourceLogError::ClosedOutbox(target.partition())
+      (None, Some(outbox)) if outbox.is_closed() =>
+        raise SourceLogError::ClosedOutbox(target.partition())
+      (Some(_), None) | (None, Some(_)) => ()
+      (None, None) => raise SourceLogError::MissingOutbox(target.partition())
+      (Some(_), Some(_)) =>
+        raise SourceLogError::DuplicateOutbox(target.partition())
     }
   }
   let dispatch = self.dispatch(event)
   for delta in dispatch.deltas() {
-    let outbox = self.outboxes.get(delta.target_partition()).unwrap()
-    outbox.push(delta) catch {
-      error => raise SourceLogError::Io(@debug.to_string(error))
+    match self.outboxes.get(delta.target_partition()) {
+      Some(outbox) =>
+        outbox.push(delta) catch {
+          error => raise SourceLogError::Io(@debug.to_string(error))
+        }
+      None => {
+        let outbox = self.durable_outboxes
+          .get(delta.target_partition())
+          .unwrap()
+        outbox.push(delta) catch {
+          error => raise SourceLogError::DurableOutbox(error)
+        }
+      }
     }
   }
   dispatch

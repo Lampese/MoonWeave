@@ -181,6 +181,7 @@ pub(all) suberror SourceLogError {
   UnsupportedVersion(Int)
   Plan(@plan.PlanError)
   Protocol(@protocol.ProtocolError)
+  DurableOutbox(DurableOutboxError)
   Wal(WalError)
   Io(String)
 } derive(Eq, @debug.Debug)
@@ -346,12 +347,15 @@ pub struct IngressRouter {
   control : @control.CoordinatorState
   source : SourceLog
   outboxes : Map[Int, ExchangeOutbox]
+  durable_outboxes : Map[Int, DurableExchangeOutbox]
 }
 pub fn IngressRouter::close(Self) -> Unit
 pub async fn IngressRouter::dispatch(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
 pub async fn IngressRouter::dispatch_and_enqueue(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
+pub fn IngressRouter::durable_outbox(Self, Int) -> DurableExchangeOutbox?
 pub async fn IngressRouter::open(@plan.JobSpec, @control.CoordinatorState, String) -> Self raise SourceLogError
 pub fn IngressRouter::outbox(Self, Int) -> ExchangeOutbox?
+pub fn IngressRouter::register_durable_outbox(Self, Int, DurableExchangeOutbox) -> Unit raise SourceLogError
 pub fn IngressRouter::register_outbox(Self, Int, ExchangeOutbox) -> Unit raise SourceLogError
 pub async fn IngressRouter::route(Self, @protocol.EventRecord) -> RoutedIngress raise SourceLogError
 pub fn IngressRouter::supervisor_work(Self, Int, String, maximum_batch_events? : Int, probe? : @protocol.Probe) -> SupervisorWork raise SourceLogError
