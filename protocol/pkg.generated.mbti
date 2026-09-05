@@ -287,12 +287,14 @@ pub(all) struct Hello {
   incarnation : String
   capabilities : Array[String]
   last_session_id : String?
+  requested_partition : Int?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Hello::capabilities(Self) -> ArrayView[String]
 pub fn Hello::from_payload(String) -> Self raise MessageError
 pub fn Hello::incarnation(Self) -> String
 pub fn Hello::last_session_id(Self) -> String?
-pub fn Hello::new(String, String, Array[String], last_session_id? : String) -> Self raise ProtocolError
+pub fn Hello::new(String, String, Array[String], last_session_id? : String, requested_partition? : Int) -> Self raise ProtocolError
+pub fn Hello::requested_partition(Self) -> Int?
 pub fn Hello::to_payload(Self) -> String
 pub fn Hello::worker_id(Self) -> String
 

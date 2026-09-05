@@ -12,6 +12,7 @@ pub(all) suberror FrameIoError {
   Task(@task.TaskError)
   TaskSet(@task.TaskSetError)
   OutputLog(OutputLogError)
+  JobStore(JobStoreError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)

@@ -1,7 +1,7 @@
 ///|
 /// Work assigned to one Worker connection. The supervisor routes by
-/// `worker_id`; assignment ownership and incarnation are checked against the
-/// synchronous control state before any data frame is sent.
+/// `(worker_id, partition)` when a Worker owns multiple sessions; a missing
+/// partition hint retains the legacy one-connection-per-worker behavior.
 pub struct SupervisorWork {
   worker_id : String
   session_id : String
@@ -145,13 +145,22 @@ pub fn SupervisorRunSummary::sent_deltas(self : SupervisorRunSummary) -> Int {
 fn supervisor_work(
   works : ArrayView[SupervisorWork],
   worker_id : String,
+  requested_partition : Int?,
 ) -> SupervisorWork? {
+  let mut found : SupervisorWork? = None
   for work in works {
     if work.worker_id() == worker_id {
-      return Some(work)
+      match requested_partition {
+        Some(partition) if work.partition() != partition => ()
+        _ =>
+          match found {
+            Some(_) => return None
+            None => found = Some(work)
+          }
+      }
     }
   }
-  None
+  found
 }
 
 ///|
@@ -165,7 +174,7 @@ fn validate_supervisor_plan(
       SupervisorPlanError::InvalidMaximumFrameBytes(maximum_frame_bytes),
     )
   }
-  let worker_ids : Set[String] = Set([])
+  let worker_partitions : Set[String] = Set([])
   let partitions : Set[Int] = Set([])
   let sessions : Set[String] = Set([])
   let delta_ids : Set[String] = Set([])
@@ -176,7 +185,10 @@ fn validate_supervisor_plan(
     if work.session_id().is_empty() {
       raise FrameIoError::SupervisorPlan(SupervisorPlanError::EmptySessionId)
     }
-    if !worker_ids.add_and_check(work.worker_id()) {
+    let worker_partition_key = work.worker_id() +
+      "#" +
+      work.partition().to_string()
+    if !worker_partitions.add_and_check(worker_partition_key) {
       raise FrameIoError::SupervisorPlan(
         SupervisorPlanError::DuplicateWorker(work.worker_id()),
       )
@@ -561,15 +573,15 @@ priv struct SupervisedAttemptResult {
 async fn release_supervisor_claim(
   claimed : Set[String],
   claim_lock : @async.Mutex,
-  worker_id : String,
+  claim_id : String,
 ) -> Unit raise FrameIoError {
-  if worker_id.is_empty() {
+  if claim_id.is_empty() {
     return
   }
   claim_lock.acquire() catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
   }
-  claimed.remove(worker_id)
+  claimed.remove(claim_id)
   claim_lock.release()
 }
 
@@ -586,6 +598,7 @@ async fn supervise_one_connection(
 ) -> SupervisedAttemptResult raise FrameIoError {
   let mut attempt = 1
   for ;; {
+    let mut claimed_id = ""
     let mut claimed_worker_id = ""
     let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
       let (connection, _) = server.accept() catch {
@@ -596,24 +609,27 @@ async fn supervise_one_connection(
       let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
         error => raise FrameIoError::Message(error)
       }
-      claim_lock.acquire() catch {
-        error => raise FrameIoError::Io(@debug.to_string(error))
-      }
-      let unique = claimed.add_and_check(hello.worker_id())
-      claim_lock.release()
-      if !unique {
-        raise FrameIoError::Coordinator(
-          @control.CoordinatorError::IncarnationConflict,
-        )
-      }
       claimed_worker_id = hello.worker_id()
-      let work = match supervisor_work(works, hello.worker_id()) {
+      let work = match
+        supervisor_work(works, hello.worker_id(), hello.requested_partition()) {
         Some(value) => value
         None =>
           raise FrameIoError::Coordinator(
             @control.CoordinatorError::UnknownWorker(hello.worker_id()),
           )
       }
+      let claim_key = hello.worker_id() + "#" + work.partition().to_string()
+      claim_lock.acquire() catch {
+        error => raise FrameIoError::Io(@debug.to_string(error))
+      }
+      let unique = claimed.add_and_check(claim_key)
+      claim_lock.release()
+      if !unique {
+        raise FrameIoError::Coordinator(
+          @control.CoordinatorError::IncarnationConflict,
+        )
+      }
+      claimed_id = claim_key
       let (worker, assignment, spec) = validate_supervisor_work(control, work)
       if hello.incarnation() != worker.incarnation().value() {
         raise FrameIoError::Coordinator(
@@ -651,7 +667,7 @@ async fn supervise_one_connection(
       Ok(summary) =>
         return { attempts: attempt, summary: Some(summary), failure: None, }
       Err(error) => {
-        release_supervisor_claim(claimed, claim_lock, claimed_worker_id)
+        release_supervisor_claim(claimed, claim_lock, claimed_id)
         let transient = error is FrameIoError::Io(_)
         if transient && attempt < retry_policy.max_attempts() {
           let delay = retry_policy.backoff_ms(attempt)
@@ -840,4 +856,210 @@ async fn run_supervisor_impl(
   }) catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
   }
+}
+
+///|
+fn job_partition_for(
+  snapshot : @control.JobSnapshot,
+  partition : Int,
+) -> @control.JobPartition? {
+  for value in snapshot.partitions() {
+    if value.partition() == partition {
+      return Some(value)
+    }
+  }
+  None
+}
+
+///|
+fn validate_job_supervisor_plan(
+  control : @control.CoordinatorState,
+  job_store : JobStore,
+  works : ArrayView[SupervisorWork],
+  maximum_frame_bytes : Int,
+) -> Unit raise FrameIoError {
+  if job_store.phase() != @control.JobPhase::Created {
+    raise FrameIoError::JobStore(
+      JobStoreError::Job(
+        @control.JobError::InvalidTransition(
+          expected=@control.JobPhase::Created,
+          actual=job_store.phase(),
+        ),
+      ),
+    )
+  }
+  let snapshot = job_store.snapshot()
+  if works.length() != snapshot.partition_count() {
+    raise FrameIoError::JobStore(
+      JobStoreError::Job(@control.JobError::NotFullyAssigned),
+    )
+  }
+  validate_supervisor_plan(control, works, maximum_frame_bytes)
+  for work in works {
+    let (_, assignment, _) = validate_supervisor_work(control, work)
+    let job_partition = match job_partition_for(snapshot, work.partition()) {
+      Some(value) => value
+      None =>
+        raise FrameIoError::JobStore(
+          JobStoreError::Job(
+            @control.JobError::UnknownPartition(work.partition()),
+          ),
+        )
+    }
+    if job_partition.worker_id() != assignment.worker_id() ||
+      job_partition.epoch() != assignment.epoch() ||
+      job_partition.start_offset() != assignment.start_offset() {
+      raise FrameIoError::JobStore(
+        JobStoreError::Job(
+          @control.JobError::AssignmentConflict(work.partition()),
+        ),
+      )
+    }
+  }
+}
+
+///|
+async fn finalize_job_supervisor_success(
+  control : @control.CoordinatorState,
+  job_store : JobStore,
+  works : ArrayView[SupervisorWork],
+) -> Unit raise FrameIoError {
+  job_store.drain() catch {
+    error => raise FrameIoError::JobStore(error)
+  }
+  for work in works {
+    let assignment = match control.assignment(work.partition()) {
+      Some(value) => value
+      None =>
+        raise FrameIoError::Coordinator(
+          @control.CoordinatorError::UnknownPartition(work.partition()),
+        )
+    }
+    for batch in work.batches() {
+      ignore(
+        job_store.record_batch_sent(
+          batch.partition(),
+          assignment.worker_id(),
+          assignment.epoch(),
+          batch.first_offset(),
+          batch.events().length().to_int64(),
+        ) catch {
+          error => raise FrameIoError::JobStore(error)
+        },
+      )
+    }
+    job_store.record_progress(
+      assignment.partition(),
+      assignment.worker_id(),
+      assignment.epoch(),
+      assignment.persisted_offset(),
+      assignment.applied_offset(),
+    ) catch {
+      error => raise FrameIoError::JobStore(error)
+    }
+    job_store.stop_partition(
+      assignment.partition(),
+      assignment.worker_id(),
+      assignment.epoch(),
+      0,
+    ) catch {
+      error => raise FrameIoError::JobStore(error)
+    }
+  }
+  job_store.checkpoint() catch {
+    error => raise FrameIoError::JobStore(error)
+  }
+}
+
+///|
+async fn finalize_job_supervisor_failure(
+  control : @control.CoordinatorState,
+  job_store : JobStore,
+  works : ArrayView[SupervisorWork],
+  summary : SupervisorRunSummary,
+) -> Unit raise FrameIoError {
+  for failure in summary.failures() {
+    if failure.worker_id().is_empty() {
+      job_store.fail(failure.reason()) catch {
+        error => raise FrameIoError::JobStore(error)
+      }
+    } else {
+      let work = match supervisor_work(works, failure.worker_id(), None) {
+        Some(value) => value
+        None => {
+          job_store.fail(failure.reason()) catch {
+            error => raise FrameIoError::JobStore(error)
+          }
+          continue
+        }
+      }
+      let assignment = match control.assignment(work.partition()) {
+        Some(value) => value
+        None => {
+          job_store.fail(failure.reason()) catch {
+            error => raise FrameIoError::JobStore(error)
+          }
+          continue
+        }
+      }
+      job_store.fail_partition(
+        assignment.partition(),
+        assignment.worker_id(),
+        assignment.epoch(),
+        failure.reason(),
+      ) catch {
+        error => raise FrameIoError::JobStore(error)
+      }
+    }
+  }
+  job_store.checkpoint() catch {
+    error => raise FrameIoError::JobStore(error)
+  }
+}
+
+///|
+/// Run a Supervisor while advancing a durable Job lifecycle. The existing
+/// Supervisor remains responsible for socket routing and Worker control; this
+/// adapter commits Job terminal state only after those per-session results are
+/// known, preserving a clear two-phase boundary between transport and Job
+/// scheduling state.
+pub async fn run_job_supervisor(
+  server : @socket.TcpServer,
+  control : @control.CoordinatorState,
+  job_store : JobStore,
+  works : Array[SupervisorWork],
+  maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+) -> SupervisorRunSummary raise FrameIoError {
+  validate_job_supervisor_plan(
+    control,
+    job_store,
+    works[:],
+    maximum_frame_bytes,
+  )
+  job_store.start() catch {
+    error => raise FrameIoError::JobStore(error)
+  }
+  let result : Result[SupervisorRunSummary, FrameIoError] = Ok(
+    run_supervisor(server, control, works, maximum_frame_bytes~),
+  ) catch {
+    error => Err(error)
+  }
+  let summary = match result {
+    Ok(value) => value
+    Err(error) => {
+      job_store.fail(@debug.to_string(error)) catch {
+        failure => raise FrameIoError::JobStore(failure)
+      }
+      job_store.checkpoint() catch {
+        failure => raise FrameIoError::JobStore(failure)
+      }
+      raise error
+    }
+  }
+  if summary.failed_workers() == 0 {
+    finalize_job_supervisor_success(control, job_store, works[:])
+  } else {
+    finalize_job_supervisor_failure(control, job_store, works[:], summary)
+  }
+  summary
 }

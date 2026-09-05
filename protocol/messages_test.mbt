@@ -28,6 +28,26 @@ test "hello and welcome payloads round trip" {
 }
 
 ///|
+test "hello carries an optional partition hint for multi-session workers" {
+  let hello = @protocol.Hello::new(
+    "worker-a",
+    "boot-1",
+    ["reachability"],
+    requested_partition=3,
+  )
+  let decoded = @protocol.Hello::from_payload(hello.to_payload())
+  assert_eq(decoded.requested_partition(), Some(3))
+  try
+    @protocol.Hello::new("worker-a", "boot-1", [], requested_partition=-1)
+  catch {
+    @protocol.ProtocolError::UnknownAssignment => ()
+    _ => fail("expected invalid partition hint")
+  } noraise {
+    _ => fail("expected invalid partition hint")
+  }
+}
+
+///|
 test "event batch carries causal event records" {
   let root = @protocol.EventRecord::new(
     message_id("source", 0),

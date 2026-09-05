@@ -509,6 +509,7 @@ async fn run_worker_impl(
   state_restore? : (Json, Int64, String) -> Unit raise FrameIoError,
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
+  requested_partition? : Int,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -550,6 +551,7 @@ async fn run_worker_impl(
     incarnation,
     capabilities,
     maximum_frame_bytes~,
+    requested_partition?,
   )
   guard session.state().assignment() is Some(assignment) else {
     raise FrameIoError::MissingAssignment
@@ -1012,6 +1014,7 @@ pub async fn run_worker(
   heartbeat_interval_ms? : Int = 0,
   delta_handler? : (@protocol.DeltaBatch) -> Unit raise,
   delta_wal_path? : String,
+  requested_partition? : Int,
 ) -> WorkerRunSummary raise FrameIoError {
   run_worker_impl(
     connection,
@@ -1029,5 +1032,6 @@ pub async fn run_worker(
     heartbeat_interval_ms~,
     delta_handler?,
     delta_wal_path?,
+    requested_partition?,
   )
 }

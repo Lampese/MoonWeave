@@ -145,6 +145,7 @@ pub async fn run_worker_task(
       state_restore~,
       state_snapshot~,
       output_barrier~,
+      requested_partition=task.partition(),
     ),
   ) catch {
     error => Err(error)

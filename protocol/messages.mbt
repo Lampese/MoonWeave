@@ -68,6 +68,7 @@ pub(all) struct Hello {
   incarnation : String
   capabilities : Array[String]
   last_session_id : String?
+  requested_partition : Int?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -76,6 +77,7 @@ pub fn Hello::new(
   incarnation : String,
   capabilities : Array[String],
   last_session_id? : String,
+  requested_partition? : Int,
 ) -> Hello raise ProtocolError {
   if worker_id.is_empty() {
     raise ProtocolError::EmptyWorkerId
@@ -83,7 +85,17 @@ pub fn Hello::new(
   if incarnation.is_empty() {
     raise ProtocolError::EmptyIncarnation
   }
-  { worker_id, incarnation, capabilities, last_session_id, }
+  match requested_partition {
+    Some(partition) if partition < 0 => raise ProtocolError::UnknownAssignment
+    _ => ()
+  }
+  {
+    worker_id,
+    incarnation,
+    capabilities,
+    last_session_id,
+    requested_partition,
+  }
 }
 
 ///|
@@ -104,6 +116,13 @@ pub fn Hello::capabilities(self : Hello) -> ArrayView[String] {
 ///|
 pub fn Hello::last_session_id(self : Hello) -> String? {
   self.last_session_id
+}
+
+///|
+/// Optional partition hint used when one Worker process owns multiple
+/// independent transport sessions. A missing hint preserves legacy routing.
+pub fn Hello::requested_partition(self : Hello) -> Int? {
+  self.requested_partition
 }
 
 ///|
@@ -769,6 +788,7 @@ pub fn Hello::from_payload(text : String) -> Hello raise MessageError {
     value.incarnation,
     value.capabilities,
     last_session_id?=value.last_session_id,
+    requested_partition?=value.requested_partition,
   ) catch {
     error => raise protocol_error(error)
   }

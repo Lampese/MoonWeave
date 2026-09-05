@@ -99,6 +99,7 @@ pub async fn worker_handshake(
   incarnation : String,
   capabilities : Array[String],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  requested_partition? : Int,
 ) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError {
   let session = @protocol.WorkerSession::new(
     cluster_id,
@@ -111,7 +112,12 @@ pub async fn worker_handshake(
   let outbound = @protocol.FrameBuilder::new(cluster_id, worker_id, incarnation) catch {
     error => raise FrameIoError::Protocol(error)
   }
-  let hello = @protocol.Hello::new(worker_id, incarnation, capabilities) catch {
+  let hello = @protocol.Hello::new(
+    worker_id,
+    incarnation,
+    capabilities,
+    requested_partition?,
+  ) catch {
     error => raise FrameIoError::Protocol(error)
   }
   let hello_frame = outbound.build(

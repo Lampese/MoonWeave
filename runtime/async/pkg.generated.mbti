@@ -42,6 +42,8 @@ pub async fn run_durable_supervisor(@socket.TcpServer, CoordinatorStore, Array[S
 
 pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
 
+pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
 pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?, LivenessPolicy) -> Unit raise FrameIoError
@@ -56,7 +58,7 @@ pub async fn run_supervisor(@socket.TcpServer, @control.CoordinatorState, Array[
 
 pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorState, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String) -> WorkerRunSummary raise FrameIoError
 
@@ -64,7 +66,7 @@ pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.Task
 
 pub async fn serve_echo(@socket.Tcp, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
-pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
+pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn[W : @io.Writer] write_frame(W, @protocol.Frame, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
@@ -98,6 +100,7 @@ pub(all) suberror FrameIoError {
   Task(@task.TaskError)
   TaskSet(@task.TaskSetError)
   OutputLog(OutputLogError)
+  JobStore(JobStoreError)
   SupervisorPlan(SupervisorPlanError)
   Message(@protocol.MessageError)
   Wal(WalError)
