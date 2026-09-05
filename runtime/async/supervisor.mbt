@@ -86,6 +86,7 @@ pub struct SupervisorRunSummary {
 /// Worker sessions.
 pub(all) struct SupervisorFailure {
   worker_id : String
+  partition : Int?
   attempts : Int
   reason : String
 } derive(Debug, Eq)
@@ -93,6 +94,11 @@ pub(all) struct SupervisorFailure {
 ///|
 pub fn SupervisorFailure::worker_id(self : SupervisorFailure) -> String {
   self.worker_id
+}
+
+///|
+pub fn SupervisorFailure::partition(self : SupervisorFailure) -> Int? {
+  self.partition
 }
 
 ///|
@@ -161,6 +167,19 @@ fn supervisor_work(
     }
   }
   found
+}
+
+///|
+fn supervisor_work_for_partition(
+  works : ArrayView[SupervisorWork],
+  partition : Int,
+) -> SupervisorWork? {
+  for work in works {
+    if work.partition() == partition {
+      return Some(work)
+    }
+  }
+  None
 }
 
 ///|
@@ -600,6 +619,7 @@ async fn supervise_one_connection(
   for ;; {
     let mut claimed_id = ""
     let mut claimed_worker_id = ""
+    let mut claimed_partition : Int? = None
     let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
       let (connection, _) = server.accept() catch {
         error => raise FrameIoError::Io(@debug.to_string(error))
@@ -618,6 +638,7 @@ async fn supervise_one_connection(
             @control.CoordinatorError::UnknownWorker(hello.worker_id()),
           )
       }
+      claimed_partition = Some(work.partition())
       let claim_key = hello.worker_id() + "#" + work.partition().to_string()
       claim_lock.acquire() catch {
         error => raise FrameIoError::Io(@debug.to_string(error))
@@ -684,6 +705,7 @@ async fn supervise_one_connection(
           summary: None,
           failure: Some({
             worker_id: claimed_worker_id,
+            partition: claimed_partition,
             attempts: attempt,
             reason: @debug.to_string(error),
           }),
@@ -821,6 +843,7 @@ async fn run_supervisor_impl(
         error => {
           failures.push({
             worker_id: "",
+            partition: None,
             attempts: 1,
             reason: @debug.to_string(error),
           })
@@ -984,7 +1007,11 @@ async fn finalize_job_supervisor_failure(
         error => raise FrameIoError::JobStore(error)
       }
     } else {
-      let work = match supervisor_work(works, failure.worker_id(), None) {
+      let work = match failure.partition() {
+        Some(partition) => supervisor_work_for_partition(works, partition)
+        None => supervisor_work(works, failure.worker_id(), None)
+      }
+      let work = match work {
         Some(value) => value
         None => {
           job_store.fail(failure.reason()) catch {

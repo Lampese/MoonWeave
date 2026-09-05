@@ -396,10 +396,12 @@ pub async fn SourceLog::open(String) -> Self raise SourceLogError
 
 pub(all) struct SupervisorFailure {
   worker_id : String
+  partition : Int?
   attempts : Int
   reason : String
 } derive(Eq, @debug.Debug)
 pub fn SupervisorFailure::attempts(Self) -> Int
+pub fn SupervisorFailure::partition(Self) -> Int?
 pub fn SupervisorFailure::reason(Self) -> String
 pub fn SupervisorFailure::worker_id(Self) -> String
 
