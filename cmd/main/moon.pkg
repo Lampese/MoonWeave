@@ -1,0 +1,5 @@
+// import {
+//   "moonweave/moonweave" @lib,
+// }
+
+pkgtype(kind: "executable")

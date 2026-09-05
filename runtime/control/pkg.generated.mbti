@@ -1,0 +1,173 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/control"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/protocol",
+}
+
+// Values
+
+// Errors
+pub(all) suberror CoordinatorError {
+  EmptyClusterId
+  EmptyCoordinatorId
+  EmptyWorkerId
+  InvalidPartition(Int)
+  InvalidOffset(Int64)
+  InvalidEventCount(Int64)
+  UnknownWorker(String)
+  EmptyWorkerSet
+  InvalidSnapshotVersion(Int)
+  InvalidTick(Int64)
+  InvalidHeartbeatTimeout(Int64)
+  HeartbeatRegression(expected_at_least~ : Int64, actual~ : Int64)
+  UnknownPartition(Int)
+  WorkerNotActive(String)
+  IncarnationMismatch
+  IncarnationConflict
+  StaleIncarnation
+  StaleEpoch(expected~ : Int, actual~ : Int)
+  AssignmentConflict(Int)
+  InvalidSendOffset(expected~ : Int64, actual~ : Int64)
+  OffsetRegression(expected_at_least~ : Int64, actual~ : Int64)
+  AppliedAheadOfPersisted
+  ProgressAheadOfSent
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) struct AssignmentSnapshot {
+  partition : Int
+  epoch : Int
+  worker_id : String
+  incarnation : String
+  start_offset : Int64
+  next_offset : Int64
+  persisted_offset : Int64
+  applied_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn AssignmentSnapshot::applied_offset(Self) -> Int64
+pub fn AssignmentSnapshot::epoch(Self) -> Int
+pub fn AssignmentSnapshot::next_offset(Self) -> Int64
+pub fn AssignmentSnapshot::partition(Self) -> Int
+pub fn AssignmentSnapshot::persisted_offset(Self) -> Int64
+pub fn AssignmentSnapshot::start_offset(Self) -> Int64
+pub fn AssignmentSnapshot::worker_id(Self) -> String
+
+pub(all) struct CoordinatorSnapshot {
+  version : Int
+  cluster_id : String
+  coordinator_id : String
+  workers : Array[WorkerSnapshot]
+  assignments : Array[AssignmentSnapshot]
+  epochs : Array[EpochSnapshot]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn CoordinatorSnapshot::assignments(Self) -> ArrayView[AssignmentSnapshot]
+pub fn CoordinatorSnapshot::epochs(Self) -> ArrayView[EpochSnapshot]
+pub fn CoordinatorSnapshot::workers(Self) -> ArrayView[WorkerSnapshot]
+
+pub struct CoordinatorState {
+  cluster_id : String
+  coordinator_id : String
+  workers : Map[String, WorkerRecord]
+  assignments : Map[Int, PartitionAssignment]
+  epochs : Map[Int, Int]
+}
+pub fn CoordinatorState::assign(Self, Int, String, start_offset? : Int64) -> PartitionAssignment raise CoordinatorError
+pub fn CoordinatorState::assign_round_robin(Self, Int, ArrayView[String], start_offset? : Int64) -> Array[PartitionAssignment] raise CoordinatorError
+pub fn CoordinatorState::assignment(Self, Int) -> PartitionAssignment?
+pub fn CoordinatorState::assignments(Self) -> Array[PartitionAssignment]
+pub fn CoordinatorState::cluster_id(Self) -> String
+pub fn CoordinatorState::coordinator_id(Self) -> String
+pub fn CoordinatorState::expire_workers(Self, Int64, Int64) -> Array[String] raise CoordinatorError
+pub fn CoordinatorState::fence_and_reassign(Self, String, @protocol.Incarnation, String) -> Array[PartitionAssignment] raise CoordinatorError
+pub fn CoordinatorState::fence_worker(Self, String, @protocol.Incarnation) -> Unit raise CoordinatorError
+pub fn CoordinatorState::from_snapshot(CoordinatorSnapshot) -> Self raise CoordinatorError
+pub fn CoordinatorState::liveness(Self, String, Int64, Int64) -> LivenessDecision raise CoordinatorError
+pub fn CoordinatorState::new(String, String) -> Self raise CoordinatorError
+pub fn CoordinatorState::next_offset(Self, Int, String, @protocol.Incarnation, Int) -> Int64 raise CoordinatorError
+pub fn CoordinatorState::partition_count(Self) -> Int
+pub fn CoordinatorState::reassign(Self, Int, String, start_offset? : Int64) -> PartitionAssignment raise CoordinatorError
+pub fn CoordinatorState::record_batch_sent(Self, Int, String, @protocol.Incarnation, Int, Int64, Int64) -> Int64 raise CoordinatorError
+pub fn CoordinatorState::record_heartbeat(Self, String, @protocol.Incarnation, Int64) -> Unit raise CoordinatorError
+pub fn CoordinatorState::record_progress(Self, Int, String, @protocol.Incarnation, Int, Int64, Int64) -> Unit raise CoordinatorError
+pub fn CoordinatorState::record_resume(Self, Int, String, @protocol.Incarnation, Int, Int64) -> Unit raise CoordinatorError
+pub fn CoordinatorState::register_worker(Self, String, @protocol.Incarnation, ArrayView[String]) -> RegisterStatus raise CoordinatorError
+pub fn CoordinatorState::revoke(Self, Int) -> Unit raise CoordinatorError
+pub fn CoordinatorState::set_suspect(Self, String) -> Unit raise CoordinatorError
+pub fn CoordinatorState::snapshot(Self) -> CoordinatorSnapshot
+pub fn CoordinatorState::worker(Self, String) -> WorkerInfo?
+pub fn CoordinatorState::worker_count(Self) -> Int
+pub fn CoordinatorState::workers(Self) -> Array[WorkerInfo]
+
+pub(all) struct EpochSnapshot {
+  partition : Int
+  epoch : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) enum LivenessDecision {
+  Healthy
+  Suspect
+  Fenced
+} derive(Eq, @debug.Debug)
+
+pub struct PartitionAssignment {
+  partition : Int
+  epoch : Int
+  worker_id : String
+  incarnation : @protocol.Incarnation
+  start_offset : Int64
+  mut next_offset : Int64
+  mut persisted_offset : Int64
+  mut applied_offset : Int64
+} derive(Eq, @debug.Debug)
+pub fn PartitionAssignment::applied_offset(Self) -> Int64
+pub fn PartitionAssignment::epoch(Self) -> Int
+pub fn PartitionAssignment::incarnation(Self) -> @protocol.Incarnation
+pub fn PartitionAssignment::next_offset(Self) -> Int64
+pub fn PartitionAssignment::partition(Self) -> Int
+pub fn PartitionAssignment::persisted_offset(Self) -> Int64
+pub fn PartitionAssignment::start_offset(Self) -> Int64
+pub fn PartitionAssignment::worker_id(Self) -> String
+
+pub(all) enum RegisterStatus {
+  Added
+  Duplicate
+  Refreshed
+} derive(Eq, @debug.Debug)
+
+pub struct WorkerInfo {
+  worker_id : String
+  incarnation : @protocol.Incarnation
+  capabilities : ReadOnlyArray[String]
+  lifecycle : WorkerLifecycle
+  last_heartbeat_tick : Int64?
+} derive(Eq, @debug.Debug)
+pub fn WorkerInfo::capabilities(Self) -> ArrayView[String]
+pub fn WorkerInfo::incarnation(Self) -> @protocol.Incarnation
+pub fn WorkerInfo::last_heartbeat_tick(Self) -> Int64?
+pub fn WorkerInfo::lifecycle(Self) -> WorkerLifecycle
+pub fn WorkerInfo::worker_id(Self) -> String
+
+pub(all) enum WorkerLifecycle {
+  Active
+  Suspect
+  Fenced
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type WorkerRecord
+
+pub(all) struct WorkerSnapshot {
+  worker_id : String
+  incarnation : String
+  capabilities : Array[String]
+  lifecycle : WorkerLifecycle
+  last_heartbeat_tick : Int64?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn WorkerSnapshot::lifecycle(Self) -> WorkerLifecycle
+pub fn WorkerSnapshot::worker_id(Self) -> String
+
+// Type aliases
+
+// Traits

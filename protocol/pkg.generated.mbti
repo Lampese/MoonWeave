@@ -1,0 +1,443 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/protocol"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/causal",
+}
+
+// Values
+pub fn protocol_version() -> Int
+
+// Errors
+pub(all) suberror MessageError {
+  Malformed
+  WrongKind(expected~ : FrameKind, actual~ : FrameKind)
+  Protocol(ProtocolError)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror ProtocolError {
+  EmptyWorkerId
+  EmptyIncarnation
+  InvalidEpoch(Int)
+  InvalidOffset(Int64)
+  InvalidCredit
+  StaleIncarnation
+  StaleEpoch(expected~ : Int, actual~ : Int)
+  AckRegression(expected_at_least~ : Int64, actual~ : Int64)
+  CreditExceeded(remaining~ : Int64, requested~ : Int64)
+  UnknownAssignment
+  InvalidProtocolVersion(Int)
+  InvalidFrameField
+  FrameTooLarge(actual~ : Int, limit~ : Int)
+  MalformedFrame
+  EmptyBatch
+  InvalidBatchOffset
+  InvalidQueryId
+  InvalidDeltaId
+  InvalidDigest
+  Causal(@causal.CausalError)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror SessionError {
+  WrongPhase(expected~ : SessionPhase, actual~ : SessionPhase)
+  ClusterMismatch
+  SessionMismatch
+  SenderMismatch
+  IncarnationMismatch
+  MessageRegression(expected_at_least~ : Int64, actual~ : Int64)
+  MessageGap(expected~ : Int64, actual~ : Int64)
+  MessageIdConflict(String)
+  Frame(ProtocolError)
+  Payload(MessageError)
+  Assignment(ProtocolError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) struct AckPersisted {
+  partition : Int
+  epoch : Int
+  offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn AckPersisted::epoch(Self) -> Int
+pub fn AckPersisted::from_payload(String) -> Self raise MessageError
+pub fn AckPersisted::new(Int, Int, Int64) -> Self raise ProtocolError
+pub fn AckPersisted::offset(Self) -> Int64
+pub fn AckPersisted::partition(Self) -> Int
+pub fn AckPersisted::to_payload(Self) -> String
+
+pub struct Assignment {
+  partition : Int
+  epoch : Int
+  incarnation : Incarnation
+  mut next_offset : Int64
+  mut acked_offset : Int64
+  mut credit_events : Int64
+  mut credit_bytes : Int64
+} derive(@debug.Debug)
+pub fn Assignment::acked_offset(Self) -> Int64
+pub fn Assignment::credit_bytes(Self) -> Int64
+pub fn Assignment::credit_events(Self) -> Int64
+pub fn Assignment::epoch(Self) -> Int
+pub fn Assignment::incarnation(Self) -> Incarnation
+pub fn Assignment::new(Int, Int, Incarnation, start_offset? : Int64) -> Self raise ProtocolError
+pub fn Assignment::next_offset(Self) -> Int64
+pub fn Assignment::partition(Self) -> Int
+
+pub(all) struct AssignmentSpec {
+  partition : Int
+  epoch : Int
+  incarnation : String
+  start_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn AssignmentSpec::epoch(Self) -> Int
+pub fn AssignmentSpec::from_payload(String) -> Self raise MessageError
+pub fn AssignmentSpec::incarnation(Self) -> String
+pub fn AssignmentSpec::new(Int, Int, String, start_offset? : Int64) -> Self raise ProtocolError
+pub fn AssignmentSpec::partition(Self) -> Int
+pub fn AssignmentSpec::start_offset(Self) -> Int64
+pub fn AssignmentSpec::to_payload(Self) -> String
+
+pub struct CoordinatorSession {
+  cluster_id : String
+  coordinator_id : String
+  worker_id : String
+  mut incarnation : String
+  mut session_id : String
+  mut phase : SessionPhase
+  mut next_sequence : Int64
+  seen_messages : Map[String, Frame]
+  mut state : WorkerState?
+  mut last_persisted_offset : Int64
+  mut last_applied_offset : Int64
+}
+pub fn CoordinatorSession::accept_frame(Self, Frame) -> Unit raise SessionError
+pub fn CoordinatorSession::accept_hello(Self, Frame) -> Hello raise SessionError
+pub fn CoordinatorSession::activate(Self, String, assignment? : AssignmentSpec) -> Welcome raise SessionError
+pub fn CoordinatorSession::credit_bytes(Self) -> Int64
+pub fn CoordinatorSession::credit_events(Self) -> Int64
+pub fn CoordinatorSession::incarnation(Self) -> String
+pub fn CoordinatorSession::last_applied_offset(Self) -> Int64
+pub fn CoordinatorSession::last_persisted_offset(Self) -> Int64
+pub fn CoordinatorSession::new(String, String, String) -> Self raise SessionError
+pub fn CoordinatorSession::next_offset(Self, Int, Int) -> Int64 raise SessionError
+pub fn CoordinatorSession::next_sequence(Self) -> Int64
+pub fn CoordinatorSession::phase(Self) -> SessionPhase
+pub fn CoordinatorSession::reserve_batch(Self, Int, Int, Int64, Int64) -> Int64 raise SessionError
+pub fn CoordinatorSession::reserve_delta(Self, Int, Int, Int64, Int64) -> Unit raise SessionError
+pub fn CoordinatorSession::restore_send_cursor(Self, Int, Int, Int64) -> Unit raise SessionError
+pub fn CoordinatorSession::session_id(Self) -> String
+pub fn CoordinatorSession::state(Self) -> WorkerState?
+
+pub(all) struct Credit {
+  partition : Int
+  epoch : Int
+  events : Int64
+  bytes : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Credit::bytes(Self) -> Int64
+pub fn Credit::epoch(Self) -> Int
+pub fn Credit::events(Self) -> Int64
+pub fn Credit::from_payload(String) -> Self raise MessageError
+pub fn Credit::new(Int, Int, Int64, Int64) -> Self raise ProtocolError
+pub fn Credit::partition(Self) -> Int
+pub fn Credit::to_payload(Self) -> String
+
+pub(all) struct DeltaAck {
+  delta_id : String
+  target_partition : Int
+  target_epoch : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DeltaAck::delta_id(Self) -> String
+pub fn DeltaAck::from_payload(String) -> Self raise MessageError
+pub fn DeltaAck::new(String, Int, Int) -> Self raise ProtocolError
+pub fn DeltaAck::target_epoch(Self) -> Int
+pub fn DeltaAck::target_partition(Self) -> Int
+pub fn DeltaAck::to_payload(Self) -> String
+
+pub(all) struct DeltaBatch {
+  delta_id : String
+  source_partition : Int
+  source_epoch : Int
+  target_partition : Int
+  target_epoch : Int
+  events : Array[EventRecord]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DeltaBatch::delta_id(Self) -> String
+pub fn DeltaBatch::events(Self) -> ArrayView[EventRecord]
+pub fn DeltaBatch::from_payload(String) -> Self raise MessageError
+pub fn DeltaBatch::new(String, Int, Int, Int, Int, Array[EventRecord]) -> Self raise ProtocolError
+pub fn DeltaBatch::source_epoch(Self) -> Int
+pub fn DeltaBatch::source_partition(Self) -> Int
+pub fn DeltaBatch::target_epoch(Self) -> Int
+pub fn DeltaBatch::target_partition(Self) -> Int
+pub fn DeltaBatch::to_payload(Self) -> String
+
+pub(all) struct EventBatch {
+  partition : Int
+  epoch : Int
+  first_offset : Int64
+  events : Array[EventRecord]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn EventBatch::end_offset(Self) -> Int64
+pub fn EventBatch::epoch(Self) -> Int
+pub fn EventBatch::events(Self) -> ArrayView[EventRecord]
+pub fn EventBatch::first_offset(Self) -> Int64
+pub fn EventBatch::from_payload(String) -> Self raise MessageError
+pub fn EventBatch::new(Int, Int, Int64, Array[EventRecord]) -> Self raise ProtocolError
+pub fn EventBatch::partition(Self) -> Int
+pub fn EventBatch::to_payload(Self) -> String
+
+pub(all) struct EventRecord {
+  id : @causal.EventId
+  parents : Array[@causal.EventId]
+  key : String
+  payload : Json
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn EventRecord::id(Self) -> @causal.EventId
+pub fn EventRecord::key(Self) -> String
+pub fn EventRecord::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ProtocolError
+pub fn EventRecord::parents(Self) -> ArrayView[@causal.EventId]
+pub fn EventRecord::payload(Self) -> Json
+pub fn EventRecord::to_event(Self) -> @causal.Event[Json] raise ProtocolError
+
+pub struct Frame {
+  version : Int
+  cluster_id : String
+  session_id : String
+  message_id : String
+  sender_id : String
+  worker_incarnation : String
+  message_sequence : Int64
+  assignment_epoch : Int
+  kind : FrameKind
+  payload : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Frame::assignment_epoch(Self) -> Int
+pub fn Frame::cluster_id(Self) -> String
+pub fn Frame::decode_payload(Bytes, maximum_frame_bytes? : Int) -> Self raise ProtocolError
+pub fn Frame::encode(Self, maximum_frame_bytes? : Int) -> Bytes raise ProtocolError
+pub fn Frame::kind(Self) -> FrameKind
+pub fn Frame::message_id(Self) -> String
+pub fn Frame::message_sequence(Self) -> Int64
+pub fn Frame::new(Int, String, String, String, String, String, Int64, Int, FrameKind, String) -> Self raise ProtocolError
+pub fn Frame::payload(Self) -> String
+pub fn Frame::sender_id(Self) -> String
+pub fn Frame::session_id(Self) -> String
+pub fn Frame::version(Self) -> Int
+pub fn Frame::worker_incarnation(Self) -> String
+
+pub struct FrameBuilder {
+  version : Int
+  cluster_id : String
+  sender_id : String
+  worker_incarnation : String
+  mut session_id : String
+  mut assignment_epoch : Int
+  mut next_sequence : Int64
+}
+pub fn FrameBuilder::assignment_epoch(Self) -> Int
+pub fn FrameBuilder::build(Self, FrameKind, String) -> Frame raise ProtocolError
+pub fn FrameBuilder::new(String, String, String, session_id? : String, assignment_epoch? : Int, start_sequence? : Int64) -> Self raise ProtocolError
+pub fn FrameBuilder::next_sequence(Self) -> Int64
+pub fn FrameBuilder::sender_id(Self) -> String
+pub fn FrameBuilder::session_id(Self) -> String
+pub fn FrameBuilder::set_assignment_epoch(Self, Int) -> Unit raise ProtocolError
+pub fn FrameBuilder::set_session_id(Self, String) -> Unit raise ProtocolError
+pub fn FrameBuilder::worker_incarnation(Self) -> String
+
+pub(all) enum FrameKind {
+  Hello
+  Welcome
+  Assign
+  Revoke
+  Drain
+  Resume
+  EventBatch
+  DeltaBatch
+  DeltaAck
+  Credit
+  AckReceived
+  AckPersisted
+  Progress
+  Heartbeat
+  Probe
+  ProbeReply
+  Seal
+  Error
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct Heartbeat {
+  partition : Int
+  epoch : Int
+  queue_depth : Int
+  persisted_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Heartbeat::epoch(Self) -> Int
+pub fn Heartbeat::from_payload(String) -> Self raise MessageError
+pub fn Heartbeat::new(Int, Int, Int, Int64) -> Self raise ProtocolError
+pub fn Heartbeat::partition(Self) -> Int
+pub fn Heartbeat::persisted_offset(Self) -> Int64
+pub fn Heartbeat::queue_depth(Self) -> Int
+pub fn Heartbeat::to_payload(Self) -> String
+
+pub(all) struct Hello {
+  worker_id : String
+  incarnation : String
+  capabilities : Array[String]
+  last_session_id : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Hello::capabilities(Self) -> ArrayView[String]
+pub fn Hello::from_payload(String) -> Self raise MessageError
+pub fn Hello::incarnation(Self) -> String
+pub fn Hello::last_session_id(Self) -> String?
+pub fn Hello::new(String, String, Array[String], last_session_id? : String) -> Self raise ProtocolError
+pub fn Hello::to_payload(Self) -> String
+pub fn Hello::worker_id(Self) -> String
+
+pub struct Incarnation {
+  value : String
+} derive(Compare, Eq, Hash, @debug.Debug)
+pub fn Incarnation::new(String) -> Self raise ProtocolError
+pub fn Incarnation::value(Self) -> String
+
+pub(all) struct Probe {
+  query_id : String
+  partition : Int
+  epoch : Int
+  target_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Probe::epoch(Self) -> Int
+pub fn Probe::from_payload(String) -> Self raise MessageError
+pub fn Probe::new(String, Int, Int, Int64) -> Self raise ProtocolError
+pub fn Probe::partition(Self) -> Int
+pub fn Probe::query_id(Self) -> String
+pub fn Probe::target_offset(Self) -> Int64
+pub fn Probe::to_payload(Self) -> String
+
+pub(all) struct ProbeReply {
+  query_id : String
+  partition : Int
+  epoch : Int
+  reached_offset : Int64
+  frontier_digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn ProbeReply::epoch(Self) -> Int
+pub fn ProbeReply::from_payload(String) -> Self raise MessageError
+pub fn ProbeReply::frontier_digest(Self) -> String
+pub fn ProbeReply::new(String, Int, Int, Int64, String) -> Self raise ProtocolError
+pub fn ProbeReply::partition(Self) -> Int
+pub fn ProbeReply::query_id(Self) -> String
+pub fn ProbeReply::reached_offset(Self) -> Int64
+pub fn ProbeReply::to_payload(Self) -> String
+
+pub(all) struct Progress {
+  partition : Int
+  epoch : Int
+  persisted_offset : Int64
+  applied_offset : Int64
+  frontier_digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Progress::applied_offset(Self) -> Int64
+pub fn Progress::epoch(Self) -> Int
+pub fn Progress::from_payload(String) -> Self raise MessageError
+pub fn Progress::frontier_digest(Self) -> String
+pub fn Progress::new(Int, Int, Int64, Int64, String) -> Self raise ProtocolError
+pub fn Progress::partition(Self) -> Int
+pub fn Progress::persisted_offset(Self) -> Int64
+pub fn Progress::to_payload(Self) -> String
+
+pub(all) struct Resume {
+  partition : Int
+  epoch : Int
+  persisted_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Resume::epoch(Self) -> Int
+pub fn Resume::from_payload(String) -> Self raise MessageError
+pub fn Resume::new(Int, Int, Int64) -> Self raise ProtocolError
+pub fn Resume::partition(Self) -> Int
+pub fn Resume::persisted_offset(Self) -> Int64
+pub fn Resume::to_payload(Self) -> String
+
+pub(all) struct Seal {
+  query_id : String
+  partition : Int
+  epoch : Int
+  sealed_offset : Int64
+  frontier_digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Seal::epoch(Self) -> Int
+pub fn Seal::from_payload(String) -> Self raise MessageError
+pub fn Seal::frontier_digest(Self) -> String
+pub fn Seal::new(String, Int, Int, Int64, String) -> Self raise ProtocolError
+pub fn Seal::partition(Self) -> Int
+pub fn Seal::query_id(Self) -> String
+pub fn Seal::sealed_offset(Self) -> Int64
+pub fn Seal::to_payload(Self) -> String
+
+pub(all) enum SessionPhase {
+  Disconnected
+  Handshaking
+  Running
+  Draining
+} derive(Eq, @debug.Debug)
+
+pub(all) struct Welcome {
+  session_id : String
+  assignment : AssignmentSpec?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Welcome::assignment(Self) -> AssignmentSpec?
+pub fn Welcome::from_payload(String) -> Self raise MessageError
+pub fn Welcome::new(String, assignment? : AssignmentSpec) -> Self raise ProtocolError
+pub fn Welcome::session_id(Self) -> String
+pub fn Welcome::to_payload(Self) -> String
+
+pub struct WorkerSession {
+  cluster_id : String
+  coordinator_id : String
+  worker_id : String
+  incarnation : String
+  mut session_id : String
+  mut phase : SessionPhase
+  mut next_sequence : Int64
+  seen_messages : Map[String, Frame]
+  mut last_received_offset : Int64
+  mut last_persisted_offset : Int64
+  mut last_applied_offset : Int64
+  state : WorkerState
+}
+pub fn WorkerSession::accept_frame(Self, Frame) -> Unit raise SessionError
+pub fn WorkerSession::has_seen(Self, String) -> Bool
+pub fn WorkerSession::last_applied_offset(Self) -> Int64
+pub fn WorkerSession::last_persisted_offset(Self) -> Int64
+pub fn WorkerSession::last_received_offset(Self) -> Int64
+pub fn WorkerSession::mark_applied(Self, Int64) -> Unit raise SessionError
+pub fn WorkerSession::mark_persisted(Self, Int64) -> Unit raise SessionError
+pub fn WorkerSession::new(String, String, String, coordinator_id? : String) -> Self raise SessionError
+pub fn WorkerSession::next_sequence(Self) -> Int64
+pub fn WorkerSession::phase(Self) -> SessionPhase
+pub fn WorkerSession::restore_progress(Self, Int64, Int64, Int64) -> Unit raise SessionError
+pub fn WorkerSession::session_id(Self) -> String
+pub fn WorkerSession::state(Self) -> WorkerState
+
+pub struct WorkerState {
+  worker_id : String
+  incarnation : Incarnation
+  mut assignment : Assignment?
+}
+pub fn WorkerState::ack_persisted(Self, Int, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::assign(Self, Assignment) -> Unit raise ProtocolError
+pub fn WorkerState::assignment(Self) -> Assignment?
+pub fn WorkerState::grant_credit(Self, Int, Int64, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::incarnation(Self) -> Incarnation
+pub fn WorkerState::new(String, Incarnation) -> Self raise ProtocolError
+pub fn WorkerState::reserve_batch(Self, Int, Int64, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::reserve_delta(Self, Int, Int64, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::restore_send_cursor(Self, Int, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::resume_from(Self, Int, Int64) -> Unit raise ProtocolError
+pub fn WorkerState::worker_id(Self) -> String
+
+// Type aliases
+
+// Traits

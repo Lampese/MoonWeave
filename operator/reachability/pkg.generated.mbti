@@ -1,0 +1,145 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/operator/reachability"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonbitlang/core/set",
+  "moonweave/moonweave/causal",
+}
+
+// Values
+
+// Errors
+pub(all) suberror EngineError {
+  Causal(@causal.CausalError)
+  Reachability(ReachabilityError)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror QueryError {
+  EmptyQueryId
+  EmptyNode
+  EmptyDigest
+  MissingQuery
+  NotResolved
+  InvalidPartition(Int)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror ReachabilityError {
+  EmptyNode
+  MalformedPayload
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) struct CoordinationObligation {
+  query_id : String
+  partition : Int
+  reason : String
+} derive(Compare, Eq, Hash, @debug.Debug)
+pub fn CoordinationObligation::new(String, Int, String) -> Self
+pub fn CoordinationObligation::partition(Self) -> Int
+pub fn CoordinationObligation::query_id(Self) -> String
+pub fn CoordinationObligation::reason(Self) -> String
+
+pub struct Edge {
+  source : String
+  target : String
+} derive(Compare, Eq, Hash, @debug.Debug)
+pub fn Edge::from_json(Json) -> Self raise ReachabilityError
+pub fn Edge::new(String, String) -> Self raise ReachabilityError
+pub fn Edge::source(Self) -> String
+pub fn Edge::target(Self) -> String
+
+pub(all) struct EdgePayload {
+  source : String
+  target : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn EdgePayload::new(String, String) -> Self
+pub fn EdgePayload::source(Self) -> String
+pub fn EdgePayload::target(Self) -> String
+
+pub struct Engine {
+  log : @causal.CausalLog[Edge]
+  state : State
+  mut query : Query?
+}
+pub fn Engine::apply(Self, @causal.Event[Edge]) -> Array[Reachable] raise @causal.CausalError
+pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[Reachable] raise EngineError
+pub fn Engine::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCertificate raise QueryError
+pub fn Engine::event_count(Self) -> Int
+pub fn Engine::facts(Self) -> Array[Reachable]
+pub fn Engine::frontier(Self) -> @causal.Frontier
+pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
+pub fn Engine::pending_count(Self) -> Int
+pub fn Engine::query(Self) -> Query?
+pub fn Engine::set_query(Self, Query) -> Unit
+pub fn Engine::verify_certificate(Self, ResultCertificate) -> Bool
+
+pub struct Query {
+  query_id : String
+  source : String
+  target : String
+  reason : String
+  mut matched : Bool
+  obligations : @set.Set[Int]
+  open : @set.Set[Int]
+}
+pub fn Query::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCertificate raise QueryError
+pub fn Query::close_partition(Self, Int) -> Bool
+pub fn Query::matched(Self) -> Bool
+pub fn Query::new(String, String, String, ArrayView[Int], reason? : String) -> Self raise QueryError
+pub fn Query::obligations(Self) -> Array[CoordinationObligation]
+pub fn Query::observe(Self, Reachable) -> Bool
+pub fn Query::query_id(Self) -> String
+pub fn Query::source(Self) -> String
+pub fn Query::status(Self) -> QueryStatus
+pub fn Query::target(Self) -> String
+
+pub(all) enum QueryStatus {
+  Tentative
+  Stable
+  ResolvedNoMatch
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct Reachable {
+  source : String
+  target : String
+} derive(Compare, Eq, Hash, @debug.Debug)
+pub fn Reachable::new(String, String) -> Self
+pub fn Reachable::source(Self) -> String
+pub fn Reachable::target(Self) -> String
+
+pub(all) struct ResultCertificate {
+  query_id : String
+  source : String
+  target : String
+  status : QueryStatus
+  result_digest : String
+  frontier_digest : String
+  supporting_events : Array[@causal.EventId]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn ResultCertificate::frontier_digest(Self) -> String
+pub fn ResultCertificate::query_id(Self) -> String
+pub fn ResultCertificate::result_digest(Self) -> String
+pub fn ResultCertificate::source(Self) -> String
+pub fn ResultCertificate::status(Self) -> QueryStatus
+pub fn ResultCertificate::supporting_events(Self) -> ArrayView[@causal.EventId]
+pub fn ResultCertificate::target(Self) -> String
+pub fn ResultCertificate::verify(Self, Query, String) -> Bool
+
+pub struct State {
+  edges : @set.Set[(String, String)]
+  closure : @set.Set[(String, String)]
+}
+pub fn State::apply(Self, Edge) -> Array[Reachable]
+pub fn State::edge_count(Self) -> Int
+pub fn State::edges(Self) -> Array[Edge]
+pub fn State::fact_count(Self) -> Int
+pub fn State::facts(Self) -> Array[Reachable]
+pub fn State::is_reachable(Self, String, String) -> Bool
+pub fn State::merge(Self, Self) -> Array[Reachable]
+pub fn State::new() -> Self
+
+// Type aliases
+
+// Traits

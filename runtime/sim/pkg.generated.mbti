@@ -1,0 +1,76 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/sim"
+
+import {
+  "moonbitlang/core/debug",
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/reachability",
+}
+
+// Values
+
+// Errors
+pub(all) suberror SimulationError {
+  EmptyReplicaId
+  DuplicateReplica(String)
+  UnknownReplica(String)
+  InvalidQueueIndex(Int)
+  Causal(@causal.CausalError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub struct Envelope {
+  sender : String
+  receiver : String
+  event : @causal.Event[@reachability.Edge]
+} derive(Eq, @debug.Debug)
+pub fn Envelope::event(Self) -> @causal.Event[@reachability.Edge]
+pub fn Envelope::receiver(Self) -> String
+pub fn Envelope::sender(Self) -> String
+
+pub struct Network {
+  replicas : Map[String, Replica]
+  queue : Array[Envelope]
+  mut delivered : Int
+  mut dropped : Int
+}
+pub fn Network::add_replica(Self, Replica) -> Unit raise SimulationError
+pub fn Network::deliver(Self, Int) -> ReceiveReport raise SimulationError
+pub fn Network::deliver_all(Self) -> Array[ReceiveReport] raise SimulationError
+pub fn Network::delivered_count(Self) -> Int
+pub fn Network::drop(Self, Int) -> Envelope raise SimulationError
+pub fn Network::dropped_count(Self) -> Int
+pub fn Network::duplicate(Self, Int) -> Unit raise SimulationError
+pub fn Network::enqueue(Self, String, String, @causal.Event[@reachability.Edge]) -> Unit raise SimulationError
+pub fn Network::new() -> Self
+pub fn Network::queued_count(Self) -> Int
+pub fn Network::replica(Self, String) -> Replica?
+
+pub struct ReceiveReport {
+  status : @causal.SubmitStatus
+  admitted_ids : ReadOnlyArray[@causal.EventId]
+  missing_ids : ReadOnlyArray[@causal.EventId]
+  new_facts : ReadOnlyArray[@reachability.Reachable]
+} derive(@debug.Debug)
+pub fn ReceiveReport::admitted_ids(Self) -> ArrayView[@causal.EventId]
+pub fn ReceiveReport::missing_ids(Self) -> ArrayView[@causal.EventId]
+pub fn ReceiveReport::new_facts(Self) -> ArrayView[@reachability.Reachable]
+pub fn ReceiveReport::status(Self) -> @causal.SubmitStatus
+
+pub struct Replica {
+  id : String
+  log : @causal.CausalLog[@reachability.Edge]
+  reachability : @reachability.State
+}
+pub fn Replica::event_count(Self) -> Int
+pub fn Replica::facts(Self) -> Array[@reachability.Reachable]
+pub fn Replica::frontier(Self) -> @causal.Frontier
+pub fn Replica::id(Self) -> String
+pub fn Replica::is_reachable(Self, String, String) -> Bool
+pub fn Replica::new(String, maximum_pending? : Int) -> Self raise SimulationError
+pub fn Replica::pending_count(Self) -> Int
+pub fn Replica::receive(Self, @causal.Event[@reachability.Edge]) -> ReceiveReport raise SimulationError
+
+// Type aliases
+
+// Traits

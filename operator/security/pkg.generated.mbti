@@ -1,0 +1,69 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/operator/security"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonbitlang/core/set",
+  "moonweave/moonweave/causal",
+}
+
+// Values
+
+// Errors
+pub(all) suberror SecurityError {
+  EmptyUser
+  InvalidKind(String)
+  InvalidTransition(SecurityEventKind)
+  Causal(@causal.CausalError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub struct Engine {
+  mut log : @causal.CausalLog[SecurityEvent]
+  state : SecurityState
+}
+pub fn Engine::alerts(Self) -> Array[SecurityAlert]
+pub fn Engine::apply(Self, @causal.Event[SecurityEvent]) -> Array[SecurityAlert] raise SecurityError
+pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[SecurityAlert] raise SecurityError
+pub fn Engine::event_count(Self) -> Int
+pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
+pub fn Engine::pending_count(Self) -> Int
+
+pub(all) struct SecurityAlert {
+  user_id : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SecurityAlert::user_id(Self) -> String
+
+pub(all) struct SecurityEvent {
+  user_id : String
+  kind : SecurityEventKind
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SecurityEvent::from_json(Json) -> Self raise SecurityError
+pub fn SecurityEvent::kind(Self) -> SecurityEventKind
+pub fn SecurityEvent::new(String, SecurityEventKind) -> Self raise SecurityError
+pub fn SecurityEvent::to_json(Self) -> Json
+pub fn SecurityEvent::user_id(Self) -> String
+
+pub(all) enum SecurityEventKind {
+  LoginSuccess
+  GrantAdmin
+  BulkExport
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct SecurityPayload {
+  user_id : String
+  kind : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct SecurityState {
+  stages : Map[String, @set.Set[SecurityEventKind]]
+  alerts : @set.Set[String]
+}
+pub fn SecurityState::alerts(Self) -> Array[SecurityAlert]
+pub fn SecurityState::apply(Self, SecurityEvent) -> Array[SecurityAlert]
+pub fn SecurityState::new() -> Self
+
+// Type aliases
+
+// Traits

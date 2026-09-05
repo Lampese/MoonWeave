@@ -1,0 +1,15 @@
+import {
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/protocol",
+  "moonweave/moonweave/runtime/async" @transport,
+  "moonweave/moonweave/runtime/control",
+  "moonbitlang/async",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/strconv",
+}
+
+pkgtype(kind: "executable")
+
+supported_targets = "+native"

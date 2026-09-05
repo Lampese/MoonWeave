@@ -1,0 +1,7 @@
+import {
+  "moonweave/moonweave/runtime/bench" @benchmarks,
+  "moonbitlang/core/env",
+  "moonbitlang/core/strconv",
+}
+
+pkgtype(kind: "executable")

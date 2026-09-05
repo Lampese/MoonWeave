@@ -1,0 +1,4 @@
+import {
+  "moonweave/moonweave/protocol",
+  "moonbitlang/core/json",
+}

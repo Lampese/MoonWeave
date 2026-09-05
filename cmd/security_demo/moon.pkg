@@ -1,0 +1,8 @@
+import {
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/security",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+}
+
+pkgtype(kind: "executable")

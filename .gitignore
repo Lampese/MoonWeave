@@ -1,0 +1,10 @@
+.DS_Store
+_build/
+target/
+target
+.mooncakes/
+.moonagent/
+
+# Keep documentation local until it is ready for publication.
+*.md
+docs/

@@ -1,0 +1,89 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/causal"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonbitlang/core/set",
+}
+
+// Values
+
+// Errors
+pub(all) suberror CausalError {
+  EmptyOrigin
+  NegativeSequence(Int)
+  EmptyKey
+  SelfDependency(EventId)
+  DuplicateParent(EventId)
+  IdentityConflict(EventId)
+  InvalidPendingLimit(Int)
+  PendingLimitExceeded(limit~ : Int)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub struct Admission[T] {
+  status : SubmitStatus
+  admitted : ReadOnlyArray[Event[T]]
+  missing : ReadOnlyArray[EventId]
+} derive(@debug.Debug)
+pub fn[T] Admission::admitted(Self[T]) -> ArrayView[Event[T]]
+pub fn[T] Admission::missing(Self[T]) -> ArrayView[EventId]
+pub fn[T] Admission::status(Self[T]) -> SubmitStatus
+
+pub struct CausalLog[T] {
+  admitted : Map[EventId, Event[T]]
+  pending : Map[EventId, Event[T]]
+  frontier : @set.Set[EventId]
+  maximum_pending : Int
+}
+pub fn[T] CausalLog::admitted_count(Self[T]) -> Int
+pub fn[T] CausalLog::contains(Self[T], EventId) -> Bool
+pub fn[T] CausalLog::copy(Self[T]) -> Self[T]
+pub fn[T] CausalLog::event(Self[T], EventId) -> Event[T]?
+pub fn[T] CausalLog::events(Self[T]) -> Array[Event[T]]
+pub fn[T] CausalLog::frontier(Self[T]) -> Frontier
+pub fn[T] CausalLog::frontier_covers(Self[T], Frontier, Frontier) -> Bool
+pub fn[T] CausalLog::new(maximum_pending? : Int) -> Self[T] raise CausalError
+pub fn[T] CausalLog::pending_count(Self[T]) -> Int
+pub fn[T] CausalLog::pending_ids(Self[T]) -> Array[EventId]
+pub fn[T : Eq] CausalLog::submit(Self[T], Event[T]) -> Admission[T] raise CausalError
+
+pub struct Event[T] {
+  id : EventId
+  parents : ReadOnlyArray[EventId]
+  key : String
+  payload : T
+} derive(Eq, @debug.Debug)
+pub fn[T] Event::id(Self[T]) -> EventId
+pub fn[T] Event::key(Self[T]) -> String
+pub fn[T] Event::new(EventId, ArrayView[EventId], String, T) -> Self[T] raise CausalError
+pub fn[T] Event::parents(Self[T]) -> ArrayView[EventId]
+pub fn[T] Event::payload(Self[T]) -> T
+
+pub struct EventId {
+  origin : String
+  sequence : Int
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
+pub fn EventId::new(String, Int) -> Self raise CausalError
+pub fn EventId::origin(Self) -> String
+pub fn EventId::sequence(Self) -> Int
+
+pub struct Frontier {
+  ids : ReadOnlyArray[EventId]
+} derive(Eq, @debug.Debug)
+pub fn Frontier::digest(Self) -> String
+pub fn Frontier::empty() -> Self
+pub fn Frontier::ids(Self) -> ArrayView[EventId]
+pub fn Frontier::is_empty(Self) -> Bool
+pub fn Frontier::length(Self) -> Int
+
+pub(all) enum SubmitStatus {
+  Admitted
+  Pending
+  Duplicate
+} derive(Eq, @debug.Debug)
+
+// Type aliases
+
+// Traits

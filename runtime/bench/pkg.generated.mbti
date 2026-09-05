@@ -1,0 +1,35 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/bench"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/operator/reachability",
+}
+
+// Values
+pub fn run_reachability_benchmark(Int) -> BenchmarkMetrics raise @reachability.QueryError
+
+// Errors
+
+// Types and methods
+pub(all) struct BenchmarkMetrics {
+  events : Int
+  candidate_step : Int
+  stable_step : Int
+  barrier_rounds : Int
+  targeted_probes : Int
+  barrier_messages : Int
+  targeted_messages : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn BenchmarkMetrics::barrier_messages(Self) -> Int
+pub fn BenchmarkMetrics::barrier_rounds(Self) -> Int
+pub fn BenchmarkMetrics::candidate_step(Self) -> Int
+pub fn BenchmarkMetrics::events(Self) -> Int
+pub fn BenchmarkMetrics::stable_step(Self) -> Int
+pub fn BenchmarkMetrics::targeted_messages(Self) -> Int
+pub fn BenchmarkMetrics::targeted_probes(Self) -> Int
+
+// Type aliases
+
+// Traits

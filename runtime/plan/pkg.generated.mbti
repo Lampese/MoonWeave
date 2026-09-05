@@ -1,0 +1,73 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/plan"
+
+import {
+  "moonbitlang/core/debug",
+  "moonweave/moonweave/protocol",
+}
+
+// Values
+
+// Errors
+pub(all) suberror PlanError {
+  EmptyJobId
+  EmptyOperatorId
+  EmptyWorkerId
+  DuplicateWorker(String)
+  InvalidPartitionCount(Int)
+  InvalidPartition(Int)
+  InvalidOffset(Int64)
+  InvalidExchangeRoute(source~ : Int, target~ : Int)
+  MissingExchangeRoute(source~ : Int, target~ : Int)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) struct ExchangeRoute {
+  source_partition : Int
+  target_partition : Int
+} derive(Compare, Eq, Hash, @debug.Debug)
+pub fn ExchangeRoute::new(Int, Int) -> Self raise PlanError
+pub fn ExchangeRoute::source_partition(Self) -> Int
+pub fn ExchangeRoute::target_partition(Self) -> Int
+
+pub(all) struct JobSpec {
+  job_id : String
+  operator_id : String
+  partition_count : Int
+  workers : ReadOnlyArray[String]
+  routes : ReadOnlyArray[ExchangeRoute]
+} derive(Eq, @debug.Debug)
+pub fn JobSpec::delta(Self, Int, Int, Int, Int, ArrayView[@protocol.EventRecord]) -> @protocol.DeltaBatch raise PlanError
+pub fn JobSpec::exchange_targets(Self, Int) -> Array[RouteTarget] raise PlanError
+pub fn JobSpec::job_id(Self) -> String
+pub fn JobSpec::new(String, String, Int, ArrayView[String], ArrayView[ExchangeRoute]) -> Self raise PlanError
+pub fn JobSpec::operator_id(Self) -> String
+pub fn JobSpec::owner(Self, Int) -> String raise PlanError
+pub fn JobSpec::partition_count(Self) -> Int
+pub fn JobSpec::partition_for_key(Self, String) -> Int
+pub fn JobSpec::plan_partitions(Self, start_offset? : Int64) -> Array[PartitionPlan] raise PlanError
+pub fn JobSpec::route_batch(Self, Int, Int, Int, ArrayView[@protocol.EventRecord]) -> Array[@protocol.DeltaBatch] raise PlanError
+pub fn JobSpec::route_event(Self, @protocol.EventRecord) -> RouteTarget
+pub fn JobSpec::route_key(Self, String) -> RouteTarget
+pub fn JobSpec::routes(Self) -> ArrayView[ExchangeRoute]
+pub fn JobSpec::workers(Self) -> ArrayView[String]
+
+pub(all) struct PartitionPlan {
+  partition : Int
+  worker_id : String
+  start_offset : Int64
+} derive(Eq, @debug.Debug)
+pub fn PartitionPlan::partition(Self) -> Int
+pub fn PartitionPlan::start_offset(Self) -> Int64
+pub fn PartitionPlan::worker_id(Self) -> String
+
+pub(all) struct RouteTarget {
+  partition : Int
+  worker_id : String
+} derive(Eq, @debug.Debug)
+pub fn RouteTarget::partition(Self) -> Int
+pub fn RouteTarget::worker_id(Self) -> String
+
+// Type aliases
+
+// Traits
