@@ -779,10 +779,13 @@ pub fn JobOutputManifest::final_digest(self : JobOutputManifest) -> String {
 
 ///|
 pub fn JobOutputManifest::is_fully_consumed(self : JobOutputManifest) -> Bool {
-  if !self.is_complete() || self.consumers.is_empty() {
+  if !self.is_complete() {
     return false
   }
   for partition in self.partitions.values() {
+    if partition.output_count == 0L {
+      continue
+    }
     if !self.consumers
       .values()
       .any(consumer => {

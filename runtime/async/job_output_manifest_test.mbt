@@ -248,3 +248,23 @@ async test "job output manifest rejects malformed configuration and repairs a to
     assert_eq(restored.certificate(), None)
   }
 }
+
+///|
+async test "empty successful partitions are already fully consumed" {
+  with_job_output_paths <| directory => {
+    let manifest = JobOutputManifest::open(
+      directory + "/job-output.wal",
+      "empty-job",
+      "reachability",
+      1,
+    )
+    defer manifest.close()
+    let log = TaskOutputLog::open(directory + "/empty-task.wal")
+    defer log.close()
+    manifest.record_partition(
+      0, "empty-job/p0/e0", "worker", 0, log, "frontier-empty", true,
+    )
+    assert_true(manifest.is_complete())
+    assert_true(manifest.is_fully_consumed())
+  }
+}
