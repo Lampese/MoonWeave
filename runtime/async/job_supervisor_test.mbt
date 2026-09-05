@@ -112,6 +112,7 @@ async test "job supervisor isolates a failed partition from sibling sessions" {
   let job_journal = directory + "/job.journal"
   let job_checkpoint = directory + "/job.json"
   let worker_wal = directory + "/worker-1.wal"
+  let retry_wal = directory + "/worker-0.wal"
   defer {
     @fs.remove(job_journal) catch {
       _ => ()
@@ -129,6 +130,12 @@ async test "job supervisor isolates a failed partition from sibling sessions" {
       _ => ()
     }
     @fs.remove(worker_wal + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(retry_wal) catch {
+      _ => ()
+    }
+    @fs.remove(retry_wal + ".lock") catch {
       _ => ()
     }
     @fs.rmdir(directory) catch {
@@ -227,8 +234,44 @@ async test "job supervisor isolates a failed partition from sibling sessions" {
     )
     assert_eq(
       job_store.snapshot().partitions()[1].phase(),
-      @control.JobPartitionPhase::Running,
+      @control.JobPartitionPhase::Succeeded,
     )
+  }
+  control.revoke(0)
+  let replacement = control.assign(0, "worker-a")
+  ignore(job_store.reassign(0, "worker-a", replacement.epoch(), 0L))
+  @async_runtime.with_task_group <| group => {
+    let supervisor = group.spawn() <| () => {
+      run_job_supervisor(server, control, job_store, [
+        SupervisorWork::new("worker-a", "reassigned-session", 0, []),
+        work_1,
+      ])
+    }
+    let task = @task.Task::new(
+      "replacement",
+      "reachability",
+      @task.OperatorKind::Reachability,
+      0,
+      replacement.epoch(),
+    )
+    let discard : (@task.TaskOutput) -> Unit raise = _ => ()
+    ignore(
+      run_worker_task(
+        @socket.Tcp::connect(server.addr),
+        "cluster-job-failure",
+        "coordinator",
+        "worker-a",
+        boot.value(),
+        [],
+        retry_wal,
+        task,
+        discard,
+      ),
+    )
+    let summary = supervisor.wait()
+    assert_eq(summary.failed_workers(), 0)
+    assert_eq(summary.completed_workers(), 1)
+    assert_eq(job_store.phase(), @control.JobPhase::Succeeded)
   }
   job_store.close()
 }

@@ -354,6 +354,8 @@ pub fn JobState::from_snapshot(
         .values()
         .any(partition => {
           partition.phase != JobPartitionPhase::Running &&
+          partition.phase != JobPartitionPhase::Draining &&
+          partition.phase != JobPartitionPhase::Succeeded &&
           partition.phase != JobPartitionPhase::Failed
         }) {
         raise JobError::MalformedSnapshot
@@ -679,7 +681,7 @@ pub fn JobState::stop_partition(
   epoch : Int,
   pending_events : Int,
 ) -> Unit raise JobError {
-  if self.phase != JobPhase::Draining {
+  if self.phase != JobPhase::Running && self.phase != JobPhase::Draining {
     raise JobError::InvalidTransition(
       expected=JobPhase::Draining,
       actual=self.phase,

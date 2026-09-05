@@ -23,6 +23,8 @@ pub(all) suberror FrameIoError {
   ProbeNotReached(target~ : Int64, actual~ : Int64)
   UnknownDeltaAck(String)
   DeltaMismatch
+  DrainMismatch
+  PendingEvents(Int)
   Handler(String)
 } derive(Debug, Eq)
 

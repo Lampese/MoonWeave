@@ -64,3 +64,95 @@ async test "output log is durable and idempotent by task sequence" {
     reopened.close()
   }
 }
+
+///|
+async test "output log rejects task identity changes and sequence overflow before appending" {
+  with_output_log_path <| path => {
+    let log = TaskOutputLog::open(path)
+    let output = @task.TaskOutput::Reachable(
+      @reachability.Reachable::new("A", "B"),
+    )
+    log.append("task", 0, 0, 0L, [output])
+    try log.append("task", 1, 0, 1L, [output]) catch {
+      error => assert_eq(error, OutputLogError::IdentityConflict("task"))
+    } noraise {
+      _ => fail("changed output partition accepted")
+    }
+    try log.append("task", 0, 1, 1L, [output]) catch {
+      error => assert_eq(error, OutputLogError::IdentityConflict("task"))
+    } noraise {
+      _ => fail("changed output epoch accepted")
+    }
+    try log.append("task", 0, 0, 9223372036854775807L, [output]) catch {
+      error => assert_true(error is OutputLogError::InvalidSequence(_))
+    } noraise {
+      _ => fail("overflowing output sequence accepted")
+    }
+    assert_eq(log.next_sequence("task"), 1L)
+    log.close()
+    try log.append("task", 0, 0, 0L, [output]) catch {
+      error => assert_eq(error, OutputLogError::Wal(WalError::Closed))
+    } noraise {
+      _ => fail("closed output log accepted duplicate append")
+    }
+    let restored = TaskOutputLog::open(path)
+    defer restored.close()
+    assert_eq(restored.records_for("task").length(), 1)
+    assert_eq(restored.next_sequence("task"), 1L)
+  }
+}
+
+///|
+async test "output log replay rejects gaps and lease changes instead of treating a missing prefix as consumed" {
+  for invalid in ["missing-prefix", "gap", "epoch", "partition"] {
+    with_output_log_path <| path => {
+      let first = TaskOutputRecord::{
+        version: 1,
+        task_id: "task",
+        partition: 0,
+        epoch: 0,
+        sequence: 0L,
+        output: @task.TaskOutput::Reachable(
+          @reachability.Reachable::new("A", "B"),
+        ),
+      }
+      let (wal, _) = Wal::open(path)
+      if invalid != "missing-prefix" {
+        ignore(wal.append(@utf8.encode(@json.to_json(first).stringify())))
+      }
+      let next = TaskOutputRecord::{
+        ..first,
+        sequence: if invalid == "gap" {
+          2L
+        } else {
+          1L
+        },
+        partition: if invalid == "partition" {
+          1
+        } else {
+          0
+        },
+        epoch: if invalid == "epoch" {
+          1
+        } else {
+          0
+        },
+      }
+      ignore(wal.append(@utf8.encode(@json.to_json(next).stringify())))
+      wal.close()
+      try TaskOutputLog::open(path) catch {
+        error =>
+          if invalid == "missing-prefix" || invalid == "gap" {
+            assert_true(error is OutputLogError::SequenceGap(..))
+          } else {
+            assert_eq(error, OutputLogError::IdentityConflict("task"))
+          }
+      } noraise {
+        unexpected => {
+          unexpected.close()
+          fail("invalid output log replay accepted")
+        }
+      }
+    }
+  }
+}

@@ -43,7 +43,7 @@ pub async fn run_durable_supervisor(@socket.TcpServer, CoordinatorStore, Array[S
 
 pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int) -> SupervisorRunSummary raise FrameIoError
 
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
@@ -127,6 +127,8 @@ pub(all) suberror FrameIoError {
   ProbeNotReached(target~ : Int64, actual~ : Int64)
   UnknownDeltaAck(String)
   DeltaMismatch
+  DrainMismatch
+  PendingEvents(Int)
   Handler(String)
 } derive(Eq, @debug.Debug)
 
@@ -138,11 +140,32 @@ pub(all) suberror JobStoreError {
   Io(String)
   Job(@control.JobError)
   Wal(WalError)
+  PlanMismatch(Int)
+  AlreadyRunning
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror OutboxError {
   InvalidCapacity(Int)
   Closed(String)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror OutputConsumerError {
+  EmptyPath
+  EmptyConsumerId
+  EmptyTaskId
+  InvalidPartition(Int)
+  InvalidEpoch(Int)
+  InvalidBatchSize(Int)
+  PathConflict
+  IdentityMismatch
+  MissingOutput(Int64)
+  OutputConflict(Int64)
+  SequenceGap(expected~ : Int64, actual~ : Int64)
+  Busy
+  Malformed
+  UnsupportedVersion(Int)
+  Wal(WalError)
+  Source(OutputLogError)
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror OutputLogError {
@@ -366,6 +389,8 @@ pub async fn IngressRouter::route(Self, @protocol.EventRecord) -> RoutedIngress 
 pub fn IngressRouter::supervisor_work(Self, Int, String, maximum_batch_events? : Int, probe? : @protocol.Probe) -> SupervisorWork raise SourceLogError
 pub fn IngressRouter::supervisor_works(Self, String, maximum_batch_events? : Int) -> Array[SupervisorWork] raise SourceLogError
 
+type JobExecutionPlan derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 type JobJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct JobStore {
@@ -375,6 +400,8 @@ pub struct JobStore {
   journal : Wal
   write_lock : @moonbitlang/async.Mutex
   mut journal_offset : Int64
+  work_plans : Map[Int, JobExecutionPlan]
+  supervisor_lock : @moonbitlang/async.Mutex
 }
 pub async fn JobStore::assign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
 pub async fn JobStore::cancel(Self) -> Unit raise JobStoreError
@@ -382,6 +409,7 @@ pub async fn JobStore::checkpoint(Self) -> Unit raise JobStoreError
 pub fn JobStore::checkpoint_path(Self) -> String
 pub fn JobStore::close(Self) -> Unit
 pub async fn JobStore::drain(Self) -> Unit raise JobStoreError
+pub async fn JobStore::drain_partition(Self, Int, String, Int) -> Unit raise JobStoreError
 pub async fn JobStore::fail(Self, String) -> Unit raise JobStoreError
 pub async fn JobStore::fail_partition(Self, Int, String, Int, String) -> Unit raise JobStoreError
 pub fn JobStore::job_id(Self) -> String
@@ -407,6 +435,8 @@ pub fn LivenessPolicy::heartbeat_timeout_ms(Self) -> Int64
 pub fn LivenessPolicy::new(Int64, Int, ArrayView[String]) -> Self raise FrameIoError
 pub fn LivenessPolicy::replacement_workers(Self) -> ArrayView[String]
 pub fn LivenessPolicy::scan_interval_ms(Self) -> Int
+
+type OutputConsumerEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct RetryPolicy {
   max_attempts : Int
@@ -492,10 +522,28 @@ pub fn SupervisorWork::probe(Self) -> @protocol.Probe?
 pub fn SupervisorWork::session_id(Self) -> String
 pub fn SupervisorWork::worker_id(Self) -> String
 
+pub struct TaskOutputConsumer {
+  log : TaskOutputLog
+  journal : Wal
+  binding : OutputConsumerEntry
+  operation_lock : @moonbitlang/async.Mutex
+  mut next_sequence : Int64
+}
+pub async fn TaskOutputConsumer::ack(Self, TaskOutputRecord) -> Unit raise OutputConsumerError
+pub fn TaskOutputConsumer::checkpoint_path(Self) -> String
+pub fn TaskOutputConsumer::close(Self) -> Unit
+pub async fn TaskOutputConsumer::consume(Self, async (TaskOutputRecord) -> Unit, maximum_records? : Int) -> Int
+pub fn TaskOutputConsumer::consumer_id(Self) -> String
+pub fn TaskOutputConsumer::next_sequence(Self) -> Int64
+pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int) -> Self raise OutputConsumerError
+pub fn TaskOutputConsumer::read(Self, maximum_records? : Int) -> Array[TaskOutputRecord] raise OutputConsumerError
+pub fn TaskOutputConsumer::task_id(Self) -> String
+
 pub struct TaskOutputLog {
   wal : Wal
   records : Array[TaskOutputRecord]
   known : Map[String, TaskOutputRecord]
+  next_sequences : Map[String, Int64]
   write_lock : @moonbitlang/async.Mutex
 }
 pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@task.TaskOutput]) -> Unit raise OutputLogError
@@ -516,6 +564,7 @@ pub(all) struct TaskOutputRecord {
   output : @task.TaskOutput
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn TaskOutputRecord::epoch(Self) -> Int
+pub fn TaskOutputRecord::idempotency_key(Self) -> String
 pub fn TaskOutputRecord::output(Self) -> @task.TaskOutput
 pub fn TaskOutputRecord::partition(Self) -> Int
 pub fn TaskOutputRecord::sequence(Self) -> Int64

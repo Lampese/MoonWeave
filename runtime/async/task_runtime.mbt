@@ -146,12 +146,23 @@ pub async fn run_worker_task(
       state_snapshot~,
       output_barrier~,
       requested_partition=task.partition(),
+      drain_handler=() => {
+        task.drain() catch {
+          error => raise FrameIoError::Task(error)
+        }
+        task.stop() catch {
+          error => raise FrameIoError::Task(error)
+        }
+      },
     ),
   ) catch {
     error => Err(error)
   }
   match result {
     Ok(summary) => {
+      if task.phase() == @task.TaskPhase::Stopped {
+        return summary
+      }
       task.drain() catch {
         error => {
           task.fail()

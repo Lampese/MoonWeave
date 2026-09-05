@@ -510,6 +510,7 @@ async fn run_worker_impl(
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
+  drain_handler? : () -> Unit raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -976,6 +977,41 @@ async fn run_worker_impl(
         }
       }
       @protocol.FrameKind::Seal => ()
+      @protocol.FrameKind::DrainRequest => {
+        match output_barrier {
+          None => ()
+          Some(barrier) => barrier()
+        }
+        let pending_events = causal_log.pending_count()
+        if pending_events == 0 {
+          match drain_handler {
+            None => ()
+            Some(finish) => finish()
+          }
+        }
+        let ack = @protocol.DrainAck::new(
+          frame.message_id(),
+          assignment.partition(),
+          assignment.epoch(),
+          session.last_persisted_offset(),
+          session.last_applied_offset(),
+          pending_events,
+          frontier_digest(causal_log.frontier()),
+        ) catch {
+          error => raise FrameIoError::Protocol(error)
+        }
+        let ack_frame = outbound.build(
+          @protocol.FrameKind::DrainAck,
+          ack.to_payload(),
+        ) catch {
+          error => raise FrameIoError::Protocol(error)
+        }
+        write_frame(connection, ack_frame, maximum_frame_bytes~)
+        if pending_events > 0 {
+          raise FrameIoError::PendingEvents(pending_events)
+        }
+        break
+      }
       @protocol.FrameKind::Drain => break
       _ =>
         raise FrameIoError::Session(

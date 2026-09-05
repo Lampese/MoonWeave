@@ -199,3 +199,24 @@ test "job snapshot rejects incomplete or inconsistent partition data" {
     _ => fail("expected incomplete snapshot rejection")
   }
 }
+
+///|
+test "partition completion survives a snapshot while siblings are still running" {
+  let state = JobState::new(job_spec())
+  ignore(state.assign(0, "worker-a", 0, 0L))
+  ignore(state.assign(1, "worker-b", 0, 0L))
+  state.start()
+  state.drain_partition(0, "worker-a", 0)
+  state.stop_partition(0, "worker-a", 0, 0)
+  assert_eq(state.phase(), JobPhase::Running)
+  let restored = JobState::from_snapshot(state.snapshot())
+  assert_eq(
+    restored.partition(0).unwrap().phase(),
+    JobPartitionPhase::Succeeded,
+  )
+  assert_eq(restored.partition(1).unwrap().phase(), JobPartitionPhase::Running)
+  restored.drain_partition(1, "worker-b", 0)
+  assert_eq(restored.phase(), JobPhase::Draining)
+  restored.stop_partition(1, "worker-b", 0, 0)
+  assert_eq(restored.phase(), JobPhase::Succeeded)
+}

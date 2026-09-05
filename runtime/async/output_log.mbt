@@ -57,6 +57,13 @@ pub fn TaskOutputRecord::output(self : TaskOutputRecord) -> @task.TaskOutput {
 }
 
 ///|
+/// Stable identity for an idempotent sink. Task IDs must be unique across jobs
+/// and attempts, as with TaskSpec::from_job.
+pub fn TaskOutputRecord::idempotency_key(self : TaskOutputRecord) -> String {
+  output_key(self.task_id, self.sequence)
+}
+
+///|
 /// Durable, append-only output storage. It is intentionally separate from the
 /// input WAL: consumers may acknowledge or compact outputs independently of
 /// input replay.
@@ -64,6 +71,7 @@ pub struct TaskOutputLog {
   wal : Wal
   records : Array[TaskOutputRecord]
   known : Map[String, TaskOutputRecord]
+  next_sequences : Map[String, Int64]
   write_lock : @async.Mutex
 }
 
@@ -88,7 +96,7 @@ fn validate_output_record(
   if record.epoch < 0 {
     raise OutputLogError::InvalidEpoch(record.epoch)
   }
-  if record.sequence < 0L {
+  if record.sequence < 0L || record.sequence == 9223372036854775807L {
     raise OutputLogError::InvalidSequence(record.sequence)
   }
   {
@@ -114,6 +122,7 @@ pub async fn TaskOutputLog::open(
   errdefer wal.close()
   let records : Array[TaskOutputRecord] = []
   let known : Map[String, TaskOutputRecord] = Map([])
+  let next_sequences : Map[String, Int64] = Map([])
   for encoded in replay.records() {
     let text = @utf8.decode(encoded) catch {
       error => raise OutputLogError::Io(@debug.to_string(error))
@@ -130,8 +139,19 @@ pub async fn TaskOutputLog::open(
           raise OutputLogError::IdentityConflict(key)
         }
       None => {
+        let expected = next_sequences.get(record.task_id).unwrap_or(0L)
+        if record.sequence != expected {
+          raise OutputLogError::SequenceGap(expected~, actual=record.sequence)
+        }
+        check_output_task_identity(
+          known,
+          record.task_id,
+          record.partition,
+          record.epoch,
+        )
         records.push(record)
         known[key] = record
+        next_sequences[record.task_id] = expected + 1L
       }
     }
   }
@@ -143,7 +163,21 @@ pub async fn TaskOutputLog::open(
       task_order
     }
   })
-  { wal, records, known, write_lock: @async.Mutex::Mutex(), }
+  { wal, records, known, next_sequences, write_lock: @async.Mutex::Mutex(), }
+}
+
+///|
+fn check_output_task_identity(
+  known : Map[String, TaskOutputRecord],
+  task_id : String,
+  partition : Int,
+  epoch : Int,
+) -> Unit raise OutputLogError {
+  match known.get(output_key(task_id, 0L)) {
+    Some(first) if first.partition != partition || first.epoch != epoch =>
+      raise OutputLogError::IdentityConflict(task_id)
+    _ => ()
+  }
 }
 
 ///|
@@ -177,11 +211,7 @@ pub fn TaskOutputLog::next_sequence(
   self : TaskOutputLog,
   task_id : String,
 ) -> Int64 {
-  let records = self.records_for(task_id)
-  match records.last() {
-    None => 0L
-    Some(record) => record.sequence() + 1L
-  }
+  self.next_sequences.get(task_id).unwrap_or(0L)
 }
 
 ///|
@@ -226,6 +256,13 @@ pub async fn TaskOutputLog::append(
     error => raise OutputLogError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  self.wal.check_writable() catch {
+    error => raise OutputLogError::Wal(error)
+  }
+  check_output_task_identity(self.known, task_id, partition, epoch)
+  if outputs.length().to_int64() > 9223372036854775807L - first_sequence {
+    raise OutputLogError::InvalidSequence(first_sequence)
+  }
   let mut expected = self.next_sequence(task_id)
   let canonical_records : Array[TaskOutputRecord] = []
   for index, output in outputs {
@@ -264,5 +301,6 @@ pub async fn TaskOutputLog::append(
     )
     self.records.push(canonical)
     self.known[key] = canonical
+    self.next_sequences[task_id] = canonical.sequence + 1L
   }
 }

@@ -201,6 +201,7 @@ pub struct JobState {
 pub fn JobState::assign(Self, Int, String, Int, Int64) -> JobPartition raise JobError
 pub fn JobState::cancel(Self) -> Unit raise JobError
 pub fn JobState::drain(Self) -> Unit raise JobError
+pub fn JobState::drain_partition(Self, Int, String, Int) -> Unit raise JobError
 pub fn JobState::fail(Self, String) -> Unit raise JobError
 pub fn JobState::fail_partition(Self, Int, String, Int, String) -> Unit raise JobError
 pub fn JobState::failure_reason(Self) -> String?

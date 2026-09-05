@@ -6,6 +6,8 @@ pub(all) enum FrameKind {
   Assign
   Revoke
   Drain
+  DrainRequest
+  DrainAck
   Resume
   EventBatch
   DeltaBatch

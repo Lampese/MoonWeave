@@ -111,12 +111,16 @@ pub struct CoordinatorSession {
   mut state : WorkerState?
   mut last_persisted_offset : Int64
   mut last_applied_offset : Int64
+  mut drain_request : (String, DrainRequest)?
+  mut drain_ack : DrainAck?
 }
 pub fn CoordinatorSession::accept_frame(Self, Frame) -> Unit raise SessionError
 pub fn CoordinatorSession::accept_hello(Self, Frame) -> Hello raise SessionError
 pub fn CoordinatorSession::activate(Self, String, assignment? : AssignmentSpec) -> Welcome raise SessionError
+pub fn CoordinatorSession::begin_drain(Self, String, DrainRequest) -> Unit raise SessionError
 pub fn CoordinatorSession::credit_bytes(Self) -> Int64
 pub fn CoordinatorSession::credit_events(Self) -> Int64
+pub fn CoordinatorSession::drain_ack(Self) -> DrainAck?
 pub fn CoordinatorSession::incarnation(Self) -> String
 pub fn CoordinatorSession::last_applied_offset(Self) -> Int64
 pub fn CoordinatorSession::last_persisted_offset(Self) -> Int64
@@ -173,6 +177,28 @@ pub fn DeltaBatch::source_partition(Self) -> Int
 pub fn DeltaBatch::target_epoch(Self) -> Int
 pub fn DeltaBatch::target_partition(Self) -> Int
 pub fn DeltaBatch::to_payload(Self) -> String
+
+pub(all) struct DrainAck {
+  request_id : String
+  partition : Int
+  epoch : Int
+  persisted_offset : Int64
+  applied_offset : Int64
+  pending_events : Int
+  frontier_digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DrainAck::from_payload(String) -> Self raise MessageError
+pub fn DrainAck::new(String, Int, Int, Int64, Int64, Int, String) -> Self raise ProtocolError
+pub fn DrainAck::to_payload(Self) -> String
+
+pub(all) struct DrainRequest {
+  partition : Int
+  epoch : Int
+  target_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DrainRequest::from_payload(String) -> Self raise MessageError
+pub fn DrainRequest::new(Int, Int, Int64) -> Self raise ProtocolError
+pub fn DrainRequest::to_payload(Self) -> String
 
 pub(all) struct EventBatch {
   partition : Int
@@ -253,6 +279,8 @@ pub(all) enum FrameKind {
   Assign
   Revoke
   Drain
+  DrainRequest
+  DrainAck
   Resume
   EventBatch
   DeltaBatch

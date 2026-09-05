@@ -190,7 +190,8 @@ fn WorkerSession::validate_frame(
       actual=frame.message_sequence(),
     )
   }
-  if self.phase is Running && frame.session_id() != self.session_id {
+  if (self.phase == Running || self.phase == Draining) &&
+    frame.session_id() != self.session_id {
     raise SessionError::SessionMismatch
   }
 }
@@ -393,6 +394,23 @@ pub fn WorkerSession::accept_frame(
         )
       }
     }
+    (Running, FrameKind::DrainRequest) => {
+      let request = DrainRequest::from_payload(frame.payload()) catch {
+        error => raise SessionError::Payload(error)
+      }
+      guard self.state.assignment() is Some(assignment) else {
+        raise SessionError::Assignment(ProtocolError::UnknownAssignment)
+      }
+      if request.partition != assignment.partition() ||
+        request.epoch != assignment.epoch() ||
+        frame.assignment_epoch() != request.epoch ||
+        request.target_offset != self.last_applied_offset ||
+        self.last_received_offset != self.last_applied_offset ||
+        self.last_persisted_offset != self.last_applied_offset {
+        raise SessionError::Frame(ProtocolError::InvalidFrameField)
+      }
+      self.phase = Draining
+    }
     (Running, FrameKind::Drain) => self.phase = Draining
     (Draining, FrameKind::Heartbeat) | (Draining, FrameKind::Progress) => ()
     _ =>
@@ -419,6 +437,8 @@ pub struct CoordinatorSession {
   mut state : WorkerState?
   mut last_persisted_offset : Int64
   mut last_applied_offset : Int64
+  mut drain_request : (String, DrainRequest)?
+  mut drain_ack : DrainAck?
 }
 
 ///|
@@ -442,6 +462,8 @@ pub fn CoordinatorSession::new(
     state: None,
     last_persisted_offset: -1L,
     last_applied_offset: -1L,
+    drain_request: None,
+    drain_ack: None,
   }
 }
 
@@ -698,6 +720,9 @@ pub fn CoordinatorSession::reserve_batch(
   events : Int64,
   bytes : Int64,
 ) -> Int64 raise SessionError {
+  if self.phase != Running {
+    raise SessionError::WrongPhase(expected=Running, actual=self.phase)
+  }
   let state = self.check_assignment(partition, epoch)
   guard state.assignment() is Some(assignment) else {
     raise SessionError::Frame(ProtocolError::UnknownAssignment)
@@ -719,6 +744,9 @@ pub fn CoordinatorSession::reserve_delta(
   events : Int64,
   bytes : Int64,
 ) -> Unit raise SessionError {
+  if self.phase != Running {
+    raise SessionError::WrongPhase(expected=Running, actual=self.phase)
+  }
   let state = self.check_assignment(partition, epoch)
   state.reserve_delta(epoch, events, bytes) catch {
     error => raise SessionError::Assignment(error)
@@ -921,6 +949,7 @@ pub fn CoordinatorSession::accept_frame(
         )
       }
     }
+    FrameKind::DrainAck => self.accept_drain_ack(frame)
     FrameKind::Drain => self.phase = Draining
     _ => raise SessionError::WrongPhase(expected=Running, actual=self.phase)
   }

@@ -8,6 +8,8 @@ pub(all) suberror JobStoreError {
   Io(String)
   Job(@control.JobError)
   Wal(WalError)
+  PlanMismatch(Int)
+  AlreadyRunning
 } derive(Debug, Eq)
 
 ///|
@@ -26,6 +28,7 @@ struct JobJournalEntry {
   applied_offset : Int64
   pending_events : Int
   reason : String
+  work_plan : JobExecutionPlan?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -33,6 +36,7 @@ struct JobStoreCheckpoint {
   version : Int
   journal_offset : Int64
   snapshot : @control.JobSnapshot
+  work_plans : Array[JobExecutionPlan]
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -44,6 +48,8 @@ pub struct JobStore {
   journal : Wal
   write_lock : @async.Mutex
   mut journal_offset : Int64
+  work_plans : Map[Int, JobExecutionPlan]
+  supervisor_lock : @async.Mutex
 }
 
 ///|
@@ -105,6 +111,7 @@ fn empty_job_entry(kind : String) -> JobJournalEntry {
     applied_offset: -1L,
     pending_events: -1,
     reason: "",
+    work_plan: None,
   }
 }
 
@@ -152,6 +159,10 @@ fn apply_job_entry(
         error => raise JobStoreError::Job(error)
       }
     "drain" => state.drain() catch { error => raise JobStoreError::Job(error) }
+    "drain_partition" =>
+      state.drain_partition(entry.partition, entry.worker_id, entry.epoch) catch {
+        error => raise JobStoreError::Job(error)
+      }
     "stop_partition" =>
       state.stop_partition(
         entry.partition,
@@ -249,6 +260,7 @@ pub async fn JobStore::open(
   }
   errdefer journal.close()
   let checkpoint = load_job_checkpoint(checkpoint_path)
+  let work_plans : Map[Int, JobExecutionPlan] = Map([])
   let (state, checkpoint_offset) = match checkpoint {
     None => (@control.JobState::new(spec), 0L)
     Some(value) => {
@@ -257,6 +269,13 @@ pub async fn JobStore::open(
       }
       let state = @control.JobState::from_snapshot(value.snapshot) catch {
         error => raise JobStoreError::Job(error)
+      }
+      for plan in value.work_plans {
+        let canonical = validate_job_work_plan(state, plan)
+        if work_plans.contains(canonical.partition) {
+          raise JobStoreError::PlanMismatch(canonical.partition)
+        }
+        work_plans[canonical.partition] = canonical
       }
       (state, value.journal_offset)
     }
@@ -276,7 +295,17 @@ pub async fn JobStore::open(
     let entry : JobJournalEntry = @json.from_json(json) catch {
       _ => raise JobStoreError::Malformed
     }
-    apply_job_entry(state, entry)
+    if entry.kind == "work_plan" {
+      if entry.version != 1 {
+        raise JobStoreError::UnsupportedVersion(entry.version)
+      }
+      guard entry.work_plan is Some(plan) else {
+        raise JobStoreError::Malformed
+      }
+      install_job_work_plan(state, work_plans, plan)
+    } else {
+      apply_job_entry(state, entry)
+    }
   }
   {
     state,
@@ -285,6 +314,8 @@ pub async fn JobStore::open(
     journal,
     write_lock: @async.Mutex::Mutex(),
     journal_offset: replay.valid_bytes(),
+    work_plans,
+    supervisor_lock: @async.Mutex::Mutex(),
   }
 }
 
@@ -308,10 +339,13 @@ pub async fn JobStore::checkpoint(self : JobStore) -> Unit raise JobStoreError {
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  let work_plans = self.work_plans.values().to_array()
+  work_plans.sort_by((left, right) => left.partition.compare(right.partition))
   let checkpoint = JobStoreCheckpoint::{
     version: 1,
     journal_offset: self.journal_offset,
     snapshot: self.state.snapshot(),
+    work_plans,
   }
   let temporary = self.checkpoint_path + ".tmp"
   @fs.write_file(
