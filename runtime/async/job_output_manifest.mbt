@@ -453,6 +453,28 @@ fn verify_job_output_task_proof(
   if output_digest != summary.output_digest {
     raise JobOutputManifestError::InvalidProof(partition)
   }
+  let replayed = @task.Task::new(
+    snapshot.task_id(),
+    snapshot.operator_id(),
+    snapshot.operator(),
+    snapshot.partition(),
+    snapshot.epoch(),
+    start_offset=0L,
+  ) catch {
+    _ => raise JobOutputManifestError::InvalidProof(partition)
+  }
+  replayed.start() catch {
+    _ => raise JobOutputManifestError::InvalidProof(partition)
+  }
+  replayed.restore(snapshot) catch {
+    _ => raise JobOutputManifestError::InvalidProof(partition)
+  }
+  let replayed_outputs = replayed.outputs()
+  let proved_outputs = outputs.map(record => record.output())
+  proved_outputs.sort()
+  if replayed_outputs != proved_outputs {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
   let matched = outputs.any(record => {
     job_output_query_matches(query, record.output())
   })
