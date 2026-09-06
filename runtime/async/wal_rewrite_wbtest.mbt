@@ -35,12 +35,14 @@ async test "wal refuses further mutation after an uncertain append failure" {
     } noraise {
       _ => fail("expected poisoned WAL")
     }
+    assert_eq(wal.lifecycle(), WalLifecycle::Failed)
     try wal.rewrite([b"later"]) catch {
       error => assert_eq(error, WalError::Failed)
     } noraise {
       _ => fail("expected poisoned WAL")
     }
     wal.close()
+    assert_eq(wal.lifecycle(), WalLifecycle::Closed)
     let (restored, replay) = Wal::open(path)
     defer restored.close()
     assert_eq(replay.records(), [])

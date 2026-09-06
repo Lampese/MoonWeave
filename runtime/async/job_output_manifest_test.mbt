@@ -70,7 +70,8 @@ async test "job output manifest persists partition digests and reopens determini
 ///|
 async test "job output manifest binds consumers and a final certificate" {
   with_job_output_paths <| directory => {
-    let log = TaskOutputLog::open(directory + "/task.wal")
+    let output_path = directory + "/task.wal"
+    let log = TaskOutputLog::open(output_path)
     defer log.close()
     log.append("manifest-job/p0/e0", 0, 0, 0L, [manifest_output("B")])
     let manifest = JobOutputManifest::open(
@@ -94,7 +95,8 @@ async test "job output manifest binds consumers and a final certificate" {
     defer consumer.close()
     manifest.sync_consumer(consumer)
     assert_false(manifest.is_fully_consumed())
-    consumer.ack(consumer.read()[0])
+    let acknowledged = consumer.read()[0]
+    consumer.ack(acknowledged)
     manifest.sync_consumer(consumer)
     assert_true(manifest.is_fully_consumed())
     let certificate = JobOutputCertificate::new(
@@ -111,7 +113,32 @@ async test "job output manifest binds consumers and a final certificate" {
     manifest.publish_certificate(certificate)
     assert_true(manifest.certificate() is Some(_))
     assert_true(manifest.final_digest() != manifest.output_digest())
+    let expected_output_digest = log.output_digest("manifest-job/p0/e0")
+    consumer.compact()
+    let barrier = manifest.seal_partition_for_retention(0, log)
+    assert_eq(barrier.retain_from(), 1L)
+    log.compact(barrier)
+    assert_eq(log.records_for("manifest-job/p0/e0"), [])
+    assert_eq(log.retained_from("manifest-job/p0/e0"), 1L)
+    assert_eq(log.output_digest("manifest-job/p0/e0"), expected_output_digest)
+    assert_true(manifest.verify_certificate(certificate))
     let expected_final_digest = manifest.final_digest()
+    consumer.close()
+    log.close()
+    let retained_log = TaskOutputLog::open(output_path)
+    let retained_consumer = TaskOutputConsumer::open(
+      retained_log,
+      directory + "/consumer.wal",
+      "sink",
+      "manifest-job/p0/e0",
+      0,
+      0,
+    )
+    assert_eq(retained_consumer.next_sequence(), 1L)
+    assert_eq(retained_consumer.read(), [])
+    retained_consumer.ack(acknowledged)
+    retained_consumer.close()
+    retained_log.close()
     manifest.close()
     let reopened = JobOutputManifest::open(
       directory + "/job-output.wal",
@@ -123,6 +150,7 @@ async test "job output manifest binds consumers and a final certificate" {
     assert_true(reopened.is_fully_consumed())
     assert_eq(reopened.certificate(), Some(certificate))
     assert_eq(reopened.final_digest(), expected_final_digest)
+    assert_true(reopened.verify_certificate(certificate))
   }
 }
 
@@ -157,6 +185,95 @@ async test "job output manifest can bind a terminal Job and rejects premature co
       job, 0, "manifest-job/p0/e0", log, "frontier-0", "state-0", true,
     )
     assert_true(manifest.is_complete())
+  }
+}
+
+///|
+async test "job output retention requires a certificate and an acknowledged sink" {
+  with_job_output_paths <| directory => {
+    let output_path = directory + "/task.wal"
+    let log = TaskOutputLog::open(output_path)
+    defer log.close()
+    log.append("retention-job/p0/e0", 0, 0, 0L, [manifest_output("B")])
+    let manifest = JobOutputManifest::open(
+      directory + "/job-output.wal",
+      "retention-job",
+      "reachability",
+      1,
+    )
+    defer manifest.close()
+    manifest.record_partition(
+      0, "retention-job/p0/e0", "worker", 0, log, "frontier-0", "state-0", true,
+    )
+    try manifest.seal_partition_for_retention(0, log) catch {
+      error => assert_eq(error, JobOutputManifestError::RetentionNotSafe(0))
+    } noraise {
+      _ => fail("retention was allowed without a certificate and sink")
+    }
+  }
+}
+
+///|
+async test "job output retention waits for every registered consumer" {
+  with_job_output_paths <| directory => {
+    let log = TaskOutputLog::open(directory + "/task.wal")
+    defer log.close()
+    let task_id = "retention-all/p0/e0"
+    log.append(task_id, 0, 0, 0L, [manifest_output("B")])
+    let manifest = JobOutputManifest::open(
+      directory + "/job-output.wal",
+      "retention-all",
+      "reachability",
+      1,
+    )
+    defer manifest.close()
+    manifest.record_partition(
+      0, task_id, "worker", 0, log, "frontier-0", "state-0", true,
+    )
+    let first = TaskOutputConsumer::open(
+      log,
+      directory + "/consumer-a.wal",
+      "sink-a",
+      task_id,
+      0,
+      0,
+    )
+    let second = TaskOutputConsumer::open(
+      log,
+      directory + "/consumer-b.wal",
+      "sink-b",
+      task_id,
+      0,
+      0,
+    )
+    defer first.close()
+    defer second.close()
+    manifest.sync_consumer(first)
+    manifest.sync_consumer(second)
+    first.ack(first.read()[0])
+    manifest.sync_consumer(first)
+    let certificate = JobOutputCertificate::new(
+      "retention-query",
+      "retention-all",
+      "reachability",
+      "Stable",
+      "match:A->B",
+      manifest.frontier_digest(),
+      manifest.output_digest(),
+      manifest.task_state_digest(),
+      Json::null(),
+    )
+    manifest.publish_certificate(certificate)
+    try manifest.seal_partition_for_retention(0, log) catch {
+      error => assert_eq(error, JobOutputManifestError::RetentionNotSafe(0))
+    } noraise {
+      _ => fail("retention ignored a lagging consumer")
+    }
+    second.ack(second.read()[0])
+    manifest.sync_consumer(second)
+    let barrier = manifest.seal_partition_for_retention(0, log)
+    log.compact(barrier)
+    assert_eq(log.records_for(task_id), [])
   }
 }
 

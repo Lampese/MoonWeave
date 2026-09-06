@@ -90,6 +90,7 @@ pub(all) suberror CheckpointError {
 pub(all) suberror CoordinatorStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
+  InvalidJournalGeneration(Int64)
   Malformed
   UnsupportedVersion(Int)
   Io(String)
@@ -164,6 +165,7 @@ pub(all) suberror JobOutputManifestError {
   Job(@control.JobError)
   CursorRegression(String)
   CursorAhead(String)
+  RetentionNotSafe(Int)
   DuplicatePartition(Int)
   Malformed
   UnsupportedVersion(Int)
@@ -174,6 +176,7 @@ pub(all) suberror JobOutputManifestError {
 pub(all) suberror JobStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
+  InvalidJournalGeneration(Int64)
   Malformed
   UnsupportedVersion(Int)
   Io(String)
@@ -217,6 +220,8 @@ pub(all) suberror OutputLogError {
   Malformed
   UnsupportedVersion(Int)
   IdentityConflict(String)
+  InvalidRetention(Int64)
+  RetentionConflict(String)
   Wal(WalError)
   Io(String)
 } derive(Eq, @debug.Debug)
@@ -323,6 +328,8 @@ pub fn Checkpoint::wal_offset(Self) -> Int64
 
 type CoordinatorJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+type CoordinatorJournalGenerationMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub struct CoordinatorRunSummary {
   sent_batches : Int
   sent_deltas : Int
@@ -343,13 +350,16 @@ pub struct CoordinatorStore {
   journal : Wal
   write_lock : @moonbitlang/async.Mutex
   mut journal_offset : Int64
+  mut journal_generation : Int64
 }
 pub async fn CoordinatorStore::assign(Self, Int, String, start_offset? : Int64) -> @control.PartitionAssignment raise CoordinatorStoreError
 pub async fn CoordinatorStore::checkpoint(Self) -> Unit raise CoordinatorStoreError
+pub async fn CoordinatorStore::checkpoint_and_compact(Self) -> Unit raise CoordinatorStoreError
 pub fn CoordinatorStore::checkpoint_path(Self) -> String
 pub fn CoordinatorStore::close(Self) -> Unit
 pub async fn CoordinatorStore::fence_and_reassign(Self, String, @protocol.Incarnation, String) -> Array[@control.PartitionAssignment] raise CoordinatorStoreError
 pub async fn CoordinatorStore::fence_worker(Self, String, @protocol.Incarnation) -> Unit raise CoordinatorStoreError
+pub fn CoordinatorStore::journal_generation(Self) -> Int64
 pub fn CoordinatorStore::journal_offset(Self) -> Int64
 pub fn CoordinatorStore::journal_path(Self) -> String
 pub async fn CoordinatorStore::mark_suspect(Self, String) -> Unit raise CoordinatorStoreError
@@ -455,6 +465,8 @@ type JobExecutionPlan derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type JobJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+type JobJournalGenerationMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub(all) struct JobOutputCertificate {
   query_id : String
   job_id : String
@@ -505,6 +517,7 @@ pub struct JobOutputManifest {
 }
 pub fn JobOutputManifest::certificate(Self) -> JobOutputCertificate?
 pub fn JobOutputManifest::close(Self) -> Unit
+pub async fn JobOutputManifest::compact_partition_for_retention(Self, Int, TaskOutputLog) -> Unit raise JobOutputManifestError
 pub fn JobOutputManifest::consumers(Self) -> Array[JobOutputConsumerSummary]
 pub fn JobOutputManifest::final_digest(Self) -> String
 pub fn JobOutputManifest::frontier_digest(Self) -> String
@@ -524,6 +537,7 @@ pub async fn JobOutputManifest::publish_verified_certificate(Self, String, JobOu
 pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, String, Bool) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::seal_partition_for_retention(Self, Int, TaskOutputLog) -> TaskOutputRetentionBarrier raise JobOutputManifestError
 pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
 pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
 pub fn JobOutputManifest::task_state_digest(Self) -> String
@@ -562,6 +576,7 @@ pub(all) struct JobOutputPartitionSummary {
   task_state_digest : String
   applied_offset : Int64
   complete : Bool
+  retained_from : Int64?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobOutputPartitionSummary::applied_offset(Self) -> Int64
 pub fn JobOutputPartitionSummary::complete(Self) -> Bool
@@ -571,6 +586,7 @@ pub fn JobOutputPartitionSummary::output_count(Self) -> Int64
 pub fn JobOutputPartitionSummary::output_digest(Self) -> String
 pub fn JobOutputPartitionSummary::output_log_path(Self) -> String
 pub fn JobOutputPartitionSummary::partition(Self) -> Int
+pub fn JobOutputPartitionSummary::retained_from(Self) -> Int64?
 pub fn JobOutputPartitionSummary::task_id(Self) -> String
 pub fn JobOutputPartitionSummary::task_state_digest(Self) -> String
 pub fn JobOutputPartitionSummary::worker_id(Self) -> String
@@ -599,12 +615,14 @@ pub struct JobStore {
   journal : Wal
   write_lock : @moonbitlang/async.Mutex
   mut journal_offset : Int64
+  mut journal_generation : Int64
   work_plans : Map[Int, JobExecutionPlan]
   supervisor_lock : @moonbitlang/async.Mutex
 }
 pub async fn JobStore::assign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
 pub async fn JobStore::cancel(Self) -> Unit raise JobStoreError
 pub async fn JobStore::checkpoint(Self) -> Unit raise JobStoreError
+pub async fn JobStore::checkpoint_and_compact(Self) -> Unit raise JobStoreError
 pub fn JobStore::checkpoint_path(Self) -> String
 pub fn JobStore::close(Self) -> Unit
 pub async fn JobStore::drain(Self) -> Unit raise JobStoreError
@@ -612,6 +630,7 @@ pub async fn JobStore::drain_partition(Self, Int, String, Int) -> Unit raise Job
 pub async fn JobStore::fail(Self, String) -> Unit raise JobStoreError
 pub async fn JobStore::fail_partition(Self, Int, String, Int, String) -> Unit raise JobStoreError
 pub fn JobStore::job_id(Self) -> String
+pub fn JobStore::journal_generation(Self) -> Int64
 pub fn JobStore::journal_offset(Self) -> Int64
 pub fn JobStore::journal_path(Self) -> String
 pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String) -> Self raise JobStoreError
@@ -636,6 +655,12 @@ pub fn LivenessPolicy::replacement_workers(Self) -> ArrayView[String]
 pub fn LivenessPolicy::scan_interval_ms(Self) -> Int
 
 type OutputConsumerEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type OutputRetentionMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type OutputRetentionMetadata derive(Eq, @debug.Debug)
+
+type OutputTaskIdentity derive(Eq, @debug.Debug)
 
 type ReconciliationEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
@@ -745,7 +770,9 @@ pub struct TaskOutputConsumer {
 }
 pub async fn TaskOutputConsumer::ack(Self, TaskOutputRecord) -> Unit raise OutputConsumerError
 pub fn TaskOutputConsumer::checkpoint_path(Self) -> String
+pub fn TaskOutputConsumer::checkpoint_stats(Self) -> WalStats
 pub fn TaskOutputConsumer::close(Self) -> Unit
+pub async fn TaskOutputConsumer::compact(Self) -> Unit raise OutputConsumerError
 pub async fn TaskOutputConsumer::consume(Self, async (TaskOutputRecord) -> Unit, maximum_records? : Int) -> Int
 pub fn TaskOutputConsumer::consumer_id(Self) -> String
 pub fn TaskOutputConsumer::epoch(Self) -> Int
@@ -757,13 +784,17 @@ pub fn TaskOutputConsumer::task_id(Self) -> String
 
 pub struct TaskOutputLog {
   wal : Wal
-  records : Array[TaskOutputRecord]
+  mut records : Array[TaskOutputRecord]
   known : Map[String, TaskOutputRecord]
+  identities : Map[String, OutputTaskIdentity]
+  retention : Map[String, OutputRetentionMetadata]
   next_sequences : Map[String, Int64]
   write_lock : @moonbitlang/async.Mutex
 }
 pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@task.TaskOutput]) -> Unit raise OutputLogError
 pub fn TaskOutputLog::close(Self) -> Unit
+pub async fn TaskOutputLog::compact(Self, TaskOutputRetentionBarrier) -> Unit raise OutputLogError
+pub fn TaskOutputLog::is_trimmed(Self, String, Int64) -> Bool
 pub fn TaskOutputLog::next_sequence(Self, String) -> Int64
 pub async fn TaskOutputLog::open(String) -> Self raise OutputLogError
 pub fn TaskOutputLog::output_digest(Self, String) -> String
@@ -771,6 +802,8 @@ pub fn TaskOutputLog::path(Self) -> String
 pub fn TaskOutputLog::records(Self) -> Array[TaskOutputRecord]
 pub fn TaskOutputLog::records_after(Self, String, Int64) -> Array[TaskOutputRecord]
 pub fn TaskOutputLog::records_for(Self, String) -> Array[TaskOutputRecord]
+pub fn TaskOutputLog::retained_from(Self, String) -> Int64
+pub fn TaskOutputLog::stats(Self) -> WalStats
 
 pub(all) struct TaskOutputRecord {
   version : Int
@@ -788,6 +821,21 @@ pub fn TaskOutputRecord::sequence(Self) -> Int64
 pub fn TaskOutputRecord::task_id(Self) -> String
 pub fn TaskOutputRecord::version(Self) -> Int
 
+pub struct TaskOutputRetentionBarrier {
+  task_id : String
+  partition : Int
+  epoch : Int
+  retain_from : Int64
+  output_count : Int64
+  output_digest : String
+} derive(Eq, @debug.Debug)
+pub fn TaskOutputRetentionBarrier::epoch(Self) -> Int
+pub fn TaskOutputRetentionBarrier::output_count(Self) -> Int64
+pub fn TaskOutputRetentionBarrier::output_digest(Self) -> String
+pub fn TaskOutputRetentionBarrier::partition(Self) -> Int
+pub fn TaskOutputRetentionBarrier::retain_from(Self) -> Int64
+pub fn TaskOutputRetentionBarrier::task_id(Self) -> String
+
 pub struct Wal {
   path : String
   lock_path : String
@@ -795,17 +843,28 @@ pub struct Wal {
   lock_file : @fs.File
   maximum_record_bytes : Int
   mut write_offset : Int64
+  mut record_count : Int
+  mut payload_bytes : Int64
+  mut repaired_tail_bytes : Int64
   write_lock : @moonbitlang/async.Mutex
   mut closed : Bool
   mut failed : Bool
 }
 pub async fn Wal::append(Self, Bytes) -> Int64 raise WalError
 pub fn Wal::close(Self) -> Unit
+pub fn Wal::lifecycle(Self) -> WalLifecycle
 pub fn Wal::maximum_record_bytes(Self) -> Int
 pub async fn Wal::open(String, maximum_record_bytes? : Int) -> (Self, WalReplay) raise WalError
 pub fn Wal::path(Self) -> String
 pub async fn Wal::rewrite(Self, ArrayView[Bytes]) -> Unit raise WalError
+pub fn Wal::stats(Self) -> WalStats
 pub fn Wal::write_offset(Self) -> Int64
+
+pub(all) enum WalLifecycle {
+  Open
+  Failed
+  Closed
+} derive(Eq, @debug.Debug)
 
 pub struct WalReplay {
   records : ReadOnlyArray[Bytes]
@@ -818,7 +877,19 @@ pub fn WalReplay::record_count_before(Self, Int64) -> Int raise WalError
 pub fn WalReplay::records(Self) -> ArrayView[Bytes]
 pub fn WalReplay::records_after(Self, Int64) -> Array[Bytes] raise WalError
 pub fn WalReplay::repaired_tail_bytes(Self) -> Int
+pub fn WalReplay::stats(Self) -> WalStats
 pub fn WalReplay::valid_bytes(Self) -> Int64
+
+pub(all) struct WalStats {
+  record_count : Int
+  physical_bytes : Int64
+  payload_bytes : Int64
+  repaired_tail_bytes : Int64
+} derive(Eq, @debug.Debug)
+pub fn WalStats::payload_bytes(Self) -> Int64
+pub fn WalStats::physical_bytes(Self) -> Int64
+pub fn WalStats::record_count(Self) -> Int
+pub fn WalStats::repaired_tail_bytes(Self) -> Int64
 
 pub struct WorkerRunSummary {
   replayed_batches : Int

@@ -15,6 +15,16 @@ pub(all) suberror WalError {
 } derive(Debug, Eq)
 
 ///|
+/// Lifecycle state of a WAL handle. `Failed` is intentionally distinct from
+/// `Closed`: an uncertain write poisons the handle and requires reopening so
+/// recovery can decide which prefix was durable.
+pub(all) enum WalLifecycle {
+  Open
+  Failed
+  Closed
+} derive(Debug, Eq)
+
+///|
 const WAL_MAGIC : Bytes = b"MWAL"
 
 ///|
@@ -22,6 +32,37 @@ const WAL_VERSION : Int = 1
 
 ///|
 const WAL_HEADER_BYTES : Int = 13
+
+///|
+/// A point-in-time view of the verified WAL contents. `physical_bytes` includes
+/// record headers while `payload_bytes` only counts application payloads.
+/// `repaired_tail_bytes` reports bytes discarded during the most recent open.
+pub(all) struct WalStats {
+  record_count : Int
+  physical_bytes : Int64
+  payload_bytes : Int64
+  repaired_tail_bytes : Int64
+} derive(Debug, Eq)
+
+///|
+pub fn WalStats::record_count(self : WalStats) -> Int {
+  self.record_count
+}
+
+///|
+pub fn WalStats::physical_bytes(self : WalStats) -> Int64 {
+  self.physical_bytes
+}
+
+///|
+pub fn WalStats::payload_bytes(self : WalStats) -> Int64 {
+  self.payload_bytes
+}
+
+///|
+pub fn WalStats::repaired_tail_bytes(self : WalStats) -> Int64 {
+  self.repaired_tail_bytes
+}
 
 ///|
 /// Valid records recovered from a WAL file. A nonzero trailing byte count means
@@ -32,6 +73,20 @@ pub struct WalReplay {
   boundaries : ReadOnlyArray[Int64]
   valid_bytes : Int64
   repaired_tail_bytes : Int
+}
+
+///|
+pub fn WalReplay::stats(self : WalReplay) -> WalStats {
+  let mut payload_bytes = 0L
+  for record in self.records {
+    payload_bytes += record.length().to_int64()
+  }
+  {
+    record_count: self.records.length(),
+    physical_bytes: self.valid_bytes,
+    payload_bytes,
+    repaired_tail_bytes: self.repaired_tail_bytes.to_int64(),
+  }
 }
 
 ///|
@@ -97,6 +152,9 @@ pub struct Wal {
   lock_file : @fs.File
   maximum_record_bytes : Int
   mut write_offset : Int64
+  mut record_count : Int
+  mut payload_bytes : Int64
+  mut repaired_tail_bytes : Int64
   write_lock : @async.Mutex
   mut closed : Bool
   mut failed : Bool
@@ -115,6 +173,27 @@ pub fn Wal::write_offset(self : Wal) -> Int64 {
 ///|
 pub fn Wal::maximum_record_bytes(self : Wal) -> Int {
   self.maximum_record_bytes
+}
+
+///|
+pub fn Wal::stats(self : Wal) -> WalStats {
+  {
+    record_count: self.record_count,
+    physical_bytes: self.write_offset,
+    payload_bytes: self.payload_bytes,
+    repaired_tail_bytes: self.repaired_tail_bytes,
+  }
+}
+
+///|
+pub fn Wal::lifecycle(self : Wal) -> WalLifecycle {
+  if self.closed {
+    WalLifecycle::Closed
+  } else if self.failed {
+    WalLifecycle::Failed
+  } else {
+    WalLifecycle::Open
+  }
 }
 
 ///|
@@ -323,6 +402,9 @@ pub async fn Wal::open(
       lock_file,
       maximum_record_bytes,
       write_offset: replay.valid_bytes(),
+      record_count: replay.records().length(),
+      payload_bytes: replay.stats().payload_bytes(),
+      repaired_tail_bytes: replay.repaired_tail_bytes().to_int64(),
       write_lock: @async.Mutex::Mutex(),
       closed: false,
       failed: false,
@@ -345,6 +427,8 @@ pub async fn Wal::append(self : Wal, payload : Bytes) -> Int64 raise WalError {
     self.file.write(record)
     self.file.sync()
     self.write_offset += record.length().to_int64()
+    self.record_count += 1
+    self.payload_bytes += payload.length().to_int64()
   }) catch {
     error => {
       self.failed = true
@@ -393,6 +477,11 @@ pub async fn Wal::rewrite(
     let previous = self.file
     self.file = replacement
     self.write_offset = encoded.length().to_int64()
+    self.record_count = payloads.length()
+    self.payload_bytes = payloads.fold(init=0L, (total, payload) => {
+      total + payload.length().to_int64()
+    })
+    self.repaired_tail_bytes = 0L
     installed = true
     previous.close()
   }) catch {

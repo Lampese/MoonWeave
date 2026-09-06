@@ -27,6 +27,7 @@ pub(all) suberror JobOutputManifestError {
   Job(@control.JobError)
   CursorRegression(String)
   CursorAhead(String)
+  RetentionNotSafe(Int)
   DuplicatePartition(Int)
   Malformed
   UnsupportedVersion(Int)
@@ -47,6 +48,7 @@ pub(all) struct JobOutputPartitionSummary {
   task_state_digest : String
   applied_offset : Int64
   complete : Bool
+  retained_from : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -117,6 +119,15 @@ pub fn JobOutputPartitionSummary::applied_offset(
   self : JobOutputPartitionSummary,
 ) -> Int64 {
   self.applied_offset
+}
+
+///|
+/// First output sequence still retained in the source WAL. `None` means the
+/// complete zero-based proof prefix remains available.
+pub fn JobOutputPartitionSummary::retained_from(
+  self : JobOutputPartitionSummary,
+) -> Int64? {
+  self.retained_from
 }
 
 ///|
@@ -627,6 +638,12 @@ fn validate_partition_summary(
   if value.applied_offset < -1L {
     raise JobOutputManifestError::InvalidSequence(value.applied_offset)
   }
+  match value.retained_from {
+    Some(retained_from) if retained_from < 0L ||
+      retained_from > value.output_count =>
+      raise JobOutputManifestError::InvalidSequence(retained_from)
+    _ => ()
+  }
 }
 
 ///|
@@ -725,7 +742,22 @@ fn apply_manifest_partition(
           value.partition.to_string(),
         )
       }
-      if previous.complete && (!value.complete || previous != value) {
+      match (previous.retained_from, value.retained_from) {
+        (Some(previous_from), Some(value_from)) if previous_from != value_from =>
+          raise JobOutputManifestError::IdentityConflict(
+            value.partition.to_string(),
+          )
+        (Some(_), None) =>
+          raise JobOutputManifestError::IdentityConflict(
+            value.partition.to_string(),
+          )
+        _ => ()
+      }
+      let retention_only = previous.retained_from is None &&
+        value.retained_from is Some(_) &&
+        { ..previous, retained_from: value.retained_from, } == value
+      if previous.complete &&
+        (!value.complete || (previous != value && !retention_only)) {
         raise JobOutputManifestError::IdentityConflict(
           value.partition.to_string(),
         )
@@ -1101,6 +1133,28 @@ pub fn JobOutputManifest::is_fully_consumed(self : JobOutputManifest) -> Bool {
 }
 
 ///|
+fn JobOutputManifest::partition_fully_consumed(
+  self : JobOutputManifest,
+  partition : JobOutputPartitionSummary,
+) -> Bool {
+  if partition.output_count == 0L {
+    return true
+  }
+  let mut found = false
+  for consumer in self.consumers.values() {
+    if consumer.partition == partition.partition &&
+      consumer.task_id == partition.task_id &&
+      consumer.epoch == partition.epoch {
+      found = true
+      if consumer.acked_sequence < partition.output_count - 1L {
+        return false
+      }
+    }
+  }
+  found
+}
+
+///|
 pub fn JobOutputManifest::snapshot(
   self : JobOutputManifest,
 ) -> JobOutputManifestSnapshot {
@@ -1190,6 +1244,7 @@ fn output_partition_from_log(
     task_state_digest,
     applied_offset,
     complete,
+    retained_from: None,
   }
 }
 
@@ -1303,6 +1358,7 @@ pub async fn JobOutputManifest::record_partition_summary(
     task_state_digest,
     applied_offset,
     complete,
+    retained_from: None,
   }
   validate_partition_summary(value, self.partition_count)
   self.write_lock.acquire() catch {
@@ -1348,6 +1404,88 @@ pub async fn JobOutputManifest::sync_consumer(
     ),
     consumer: Some(value),
   })
+}
+
+///|
+/// Seal one local output partition for physical retention. A durable
+/// certificate and a fully acknowledged consumer barrier are required because
+/// the source WAL may no longer contain the records needed to construct a new
+/// proof after compaction. The summary keeps the historical count/digest, so
+/// existing certificate verification remains valid.
+pub async fn JobOutputManifest::seal_partition_for_retention(
+  self : JobOutputManifest,
+  partition : Int,
+  log : TaskOutputLog,
+) -> TaskOutputRetentionBarrier raise JobOutputManifestError {
+  if partition < 0 || partition >= self.partition_count {
+    raise JobOutputManifestError::InvalidPartition(partition)
+  }
+  self.write_lock.acquire() catch {
+    error =>
+      raise JobOutputManifestError::Wal(WalError::Io(@debug.to_string(error)))
+  }
+  defer self.write_lock.release()
+  guard self.partitions.get(partition) is Some(summary) else {
+    raise JobOutputManifestError::MissingSummary(partition)
+  }
+  if !summary.complete || self.certificate is None {
+    raise JobOutputManifestError::RetentionNotSafe(partition)
+  }
+  if !self.partition_fully_consumed(summary) {
+    raise JobOutputManifestError::RetentionNotSafe(partition)
+  }
+  if summary.output_log_path != log.path() ||
+    log.next_sequence(summary.task_id) != summary.output_count ||
+    log.output_digest(summary.task_id) != summary.output_digest {
+    raise JobOutputManifestError::IdentityConflict(summary.task_id)
+  }
+  let retain_from = summary.retained_from.unwrap_or(summary.output_count)
+  if retain_from < 0L || retain_from > summary.output_count {
+    raise JobOutputManifestError::InvalidSequence(retain_from)
+  }
+  if summary.retained_from is Some(_) && retain_from != summary.output_count {
+    raise JobOutputManifestError::RetentionNotSafe(partition)
+  }
+  let barrier = TaskOutputRetentionBarrier::{
+    task_id: summary.task_id,
+    partition: summary.partition,
+    epoch: summary.epoch,
+    retain_from,
+    output_count: summary.output_count,
+    output_digest: summary.output_digest,
+  }
+  if summary.retained_from is Some(_) {
+    return barrier
+  }
+  let retained_summary = JobOutputPartitionSummary::{
+    ..summary,
+    retained_from: Some(summary.output_count),
+  }
+  self.append_entry(JobOutputManifestEntry::{
+    ..empty_manifest_entry(
+      self.job_id,
+      self.operator_id,
+      self.partition_count,
+      "partition",
+    ),
+    partition: Some(retained_summary),
+  })
+  barrier
+}
+
+///|
+/// Seal and physically compact one local output partition. The manifest seal
+/// is committed before the source WAL rewrite; if the rewrite fails, a later
+/// call observes the durable barrier and retries without losing evidence.
+pub async fn JobOutputManifest::compact_partition_for_retention(
+  self : JobOutputManifest,
+  partition : Int,
+  log : TaskOutputLog,
+) -> Unit raise JobOutputManifestError {
+  let barrier = self.seal_partition_for_retention(partition, log)
+  log.compact(barrier) catch {
+    error => raise JobOutputManifestError::OutputLog(error)
+  }
 }
 
 ///|

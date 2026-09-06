@@ -23,6 +23,7 @@ async fn with_wal_path(f : async (String) -> Unit) -> Unit {
 async test "wal appends synchronized records and replays them" {
   with_wal_path <| path => {
     let (wal, initial) = Wal::open(path, maximum_record_bytes=64)
+    assert_eq(wal.lifecycle(), WalLifecycle::Open)
     assert_eq(initial.records(), [])
     assert_eq(initial.valid_bytes(), 0L)
     let first_offset = wal.append(b"alpha")
@@ -33,6 +34,7 @@ async test "wal appends synchronized records and replays them" {
     wal.close()
     let (reopened, replay) = Wal::open(path, maximum_record_bytes=64)
     defer reopened.close()
+    assert_eq(reopened.lifecycle(), WalLifecycle::Open)
     assert_eq(replay.records(), [b"alpha", b"beta"])
     assert_eq(replay.repaired_tail_bytes(), 0)
     assert_eq(reopened.write_offset(), size)
@@ -45,6 +47,29 @@ async test "wal appends synchronized records and replays them" {
     } noraise {
       _ => fail("expected invalid WAL boundary")
     }
+  }
+}
+
+///|
+async test "wal reports record and byte statistics" {
+  with_wal_path <| path => {
+    let (wal, replay) = Wal::open(path, maximum_record_bytes=64)
+    assert_eq(wal.stats(), {
+      record_count: 0,
+      physical_bytes: 0L,
+      payload_bytes: 0L,
+      repaired_tail_bytes: 0L,
+    })
+    assert_eq(replay.stats(), wal.stats())
+    ignore(wal.append(b"alpha"))
+    ignore(wal.append(b"beta"))
+    let stats = wal.stats()
+    assert_eq(stats.record_count(), 2)
+    assert_eq(stats.payload_bytes(), 9L)
+    assert_eq(stats.physical_bytes(), wal.write_offset())
+    assert_eq(stats.physical_bytes(), 35L)
+    assert_eq(stats.repaired_tail_bytes(), 0L)
+    wal.close()
   }
 }
 
@@ -69,6 +94,10 @@ async test "wal repairs an incomplete trailing record" {
       let (reopened, replay) = Wal::open(path)
       assert_eq(replay.records(), [b"committed"])
       assert_true(replay.repaired_tail_bytes() > 0)
+      assert_eq(
+        reopened.stats().repaired_tail_bytes(),
+        replay.repaired_tail_bytes().to_int64(),
+      )
       let tail_replay = reopened.append(b"after-repair")
       assert_eq(tail_replay, replay.valid_bytes())
       reopened.close()

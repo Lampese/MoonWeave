@@ -251,7 +251,7 @@ pub async fn run_managed_coordinator(
 
 ///|
 /// Durable managed driver. It journals source reservations and worker control
-/// events, then compacts the journal into a checkpoint after graceful exit.
+/// events, then rotates the journal into a checkpoint after graceful exit.
 pub async fn run_durable_managed_coordinator(
   connection : @socket.Tcp,
   store : CoordinatorStore,
@@ -273,7 +273,7 @@ pub async fn run_durable_managed_coordinator(
     probe,
     Some(store),
   )
-  store.checkpoint() catch {
+  store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
   }
   summary

@@ -24,6 +24,12 @@ async fn with_job_store_paths(f : async (String, String) -> Unit) -> Unit {
     @fs.remove(journal_path + ".repair") catch {
       _ => ()
     }
+    @fs.remove(journal_path + ".next") catch {
+      _ => ()
+    }
+    @fs.remove(journal_path + ".next.lock") catch {
+      _ => ()
+    }
     @fs.remove(checkpoint_path) catch {
       _ => ()
     }
@@ -114,6 +120,111 @@ async test "job store replays lifecycle commands after a checkpoint" {
     let completed = JobStore::open(spec, journal_path, checkpoint_path~)
     assert_eq(completed.phase(), @control.JobPhase::Succeeded)
     completed.close()
+  })
+}
+
+///|
+async test "job store rotates its journal and reopens the new generation" {
+  with_job_store_paths <| ((journal_path, checkpoint_path) => {
+    let store = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    ignore(store.assign(0, "worker-a", 0, 0L))
+    ignore(store.assign(1, "worker-b", 0, 0L))
+    store.start()
+    let before = @fs.read_file(journal_path).binary().length()
+    let old_generation = store.journal_generation()
+    store.checkpoint_and_compact()
+    assert_eq(store.journal_generation(), old_generation + 1L)
+    let compacted = @fs.read_file(journal_path).binary().length()
+    assert_true(compacted < before)
+    assert_eq(@fs.exists(journal_path + ".next"), false)
+    store.close()
+
+    let restored = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    defer restored.close()
+    assert_eq(restored.journal_generation(), old_generation + 1L)
+    assert_eq(restored.snapshot().partitions()[0].worker_id(), "worker-a")
+    assert_eq(restored.phase(), @control.JobPhase::Running)
+  })
+}
+
+///|
+async test "job store adopts a staged generation after checkpoint commit" {
+  with_job_store_paths <| ((journal_path, checkpoint_path) => {
+    let store = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    ignore(store.assign(0, "worker-a", 0, 0L))
+    ignore(store.assign(1, "worker-b", 0, 0L))
+    store.start()
+    let old_journal = @fs.read_file(journal_path).binary()
+    store.checkpoint_and_compact()
+    let staged_journal = @fs.read_file(journal_path).binary()
+    store.close()
+    @fs.write_file(
+      journal_path + ".next",
+      staged_journal,
+      create_mode=@fs.CreateOrTruncate,
+      sync=@fs.Full,
+    )
+    @fs.write_file(
+      journal_path,
+      old_journal,
+      create_mode=@fs.CreateOrTruncate,
+      sync=@fs.Full,
+    )
+    let restored = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    defer restored.close()
+    assert_eq(restored.journal_generation(), 1L)
+    assert_eq(restored.phase(), @control.JobPhase::Running)
+    assert_eq(@fs.exists(journal_path + ".next"), false)
+  })
+}
+
+///|
+async test "job store accepts a legacy checkpoint without a generation" {
+  with_job_store_paths <| ((journal_path, checkpoint_path) => {
+    let store = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    ignore(store.assign(0, "worker-a", 0, 0L))
+    ignore(store.assign(1, "worker-b", 0, 0L))
+    store.start()
+    store.checkpoint()
+    store.close()
+    let json = @json.parse(@fs.read_file(checkpoint_path).text())
+    guard json is Object(fields) else { fail("checkpoint was not an object") }
+    fields["version"] = Json::number(1.0)
+    fields.remove("journal_generation")
+    @fs.write_file(
+      checkpoint_path,
+      @utf8.encode(json.stringify()),
+      create_mode=@fs.CreateOrTruncate,
+      sync=@fs.Full,
+    )
+    let restored = JobStore::open(
+      durable_job_spec(),
+      journal_path,
+      checkpoint_path~,
+    )
+    defer restored.close()
+    assert_eq(restored.journal_generation(), 0L)
+    assert_eq(restored.phase(), @control.JobPhase::Running)
   })
 }
 

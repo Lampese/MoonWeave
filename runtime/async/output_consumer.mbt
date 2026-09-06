@@ -60,7 +60,7 @@ pub async fn TaskOutputConsumer::open(
   log.wal.check_writable() catch {
     error => raise OutputConsumerError::Source(OutputLogError::Wal(error))
   }
-  check_output_task_identity(log.known, task_id, partition, epoch) catch {
+  log.check_identity(task_id, partition, epoch) catch {
     _ => raise OutputConsumerError::IdentityMismatch
   }
   let binding = OutputConsumerEntry::{
@@ -70,6 +70,7 @@ pub async fn TaskOutputConsumer::open(
     partition,
     epoch,
     record: None,
+    compacted: None,
   }
   let (journal, replay) = Wal::open(checkpoint_path) catch {
     error => raise OutputConsumerError::Wal(error)
@@ -123,6 +124,14 @@ pub fn TaskOutputConsumer::checkpoint_path(self : TaskOutputConsumer) -> String 
 }
 
 ///|
+/// Return the consumer checkpoint WAL's current lifecycle statistics.
+pub fn TaskOutputConsumer::checkpoint_stats(
+  self : TaskOutputConsumer,
+) -> WalStats {
+  self.journal.stats()
+}
+
+///|
 /// The first output not yet durably acknowledged. This is a consumption cursor,
 /// not a proof that the Task or its Job has finished producing results.
 pub fn TaskOutputConsumer::next_sequence(self : TaskOutputConsumer) -> Int64 {
@@ -168,7 +177,12 @@ async fn TaskOutputConsumer::commit_ack(
   record : TaskOutputRecord,
 ) -> Unit raise OutputConsumerError {
   self.check_open()
-  validate_consumer_record(self.log, self.binding, record)
+  validate_consumer_record(
+    self.log,
+    self.binding,
+    record,
+    allow_trimmed=record.sequence < self.next_sequence,
+  )
   if record.sequence < self.next_sequence {
     return
   }
@@ -200,6 +214,46 @@ pub async fn TaskOutputConsumer::ack(
   }
   defer self.operation_lock.release()
   self.commit_ack(record)
+}
+
+///|
+/// Compact an acknowledged consumer checkpoint while preserving its binding
+/// and latest output proof. Unacknowledged output is never discarded: the
+/// source TaskOutputLog remains the authoritative stream and the next cursor
+/// is recovered from the retained ACK.
+pub async fn TaskOutputConsumer::compact(
+  self : TaskOutputConsumer,
+) -> Unit raise OutputConsumerError {
+  if !self.operation_lock.try_acquire() {
+    raise OutputConsumerError::Busy
+  }
+  defer self.operation_lock.release()
+  self.check_open()
+  let compacted_binding = OutputConsumerEntry::{
+    ..self.binding,
+    compacted: Some(true),
+  }
+  let entries : Array[Bytes] = [
+    @utf8.encode(@json.to_json(compacted_binding).stringify()),
+  ]
+  if self.next_sequence > 0L {
+    let latest = output_consumer_record(
+      self.log,
+      self.binding,
+      self.next_sequence - 1L,
+    )
+    entries.push(
+      @utf8.encode(
+        @json.to_json(OutputConsumerEntry::{
+          ..compacted_binding,
+          record: Some(latest),
+        }).stringify(),
+      ),
+    )
+  }
+  self.journal.rewrite(entries[:]) catch {
+    error => raise OutputConsumerError::Wal(error)
+  }
 }
 
 ///|

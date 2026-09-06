@@ -515,12 +515,12 @@ async fn run_job_supervisor_impl(
           error => raise FrameIoError::Reconciliation(error)
         },
       )
-      coordinator_store.checkpoint() catch {
+      coordinator_store.checkpoint_and_compact() catch {
         error => raise FrameIoError::CoordinatorStore(error)
       }
     }
   }
-  job_store.checkpoint() catch {
+  job_store.checkpoint_and_compact() catch {
     error => raise FrameIoError::JobStore(error)
   }
   summary

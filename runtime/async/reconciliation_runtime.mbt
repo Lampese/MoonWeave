@@ -507,6 +507,7 @@ pub async fn reconcile_job_coordinator(
   }
   let plan = build_reconciliation_plan(coordinator, job)
   if plan.partitions.is_empty() {
+    log.compact()
     return {
       repaired_transactions: 0,
       recovered_transactions,
@@ -520,5 +521,6 @@ pub async fn reconcile_job_coordinator(
     repaired_partitions += 1
   }
   log.commit(transaction_id)
+  log.compact()
   { repaired_transactions: 1, recovered_transactions, repaired_partitions, }
 }

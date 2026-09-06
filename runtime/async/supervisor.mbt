@@ -824,7 +824,7 @@ pub async fn run_supervisor_with_retry(
 
 ///|
 /// Durable Supervisor variant. All per-worker control events and send intents
-/// share one CoordinatorStore, then a checkpoint is written after completion.
+/// share one CoordinatorStore, then the journal is rotated after completion.
 pub async fn run_durable_supervisor(
   server : @socket.TcpServer,
   store : CoordinatorStore,
@@ -842,7 +842,7 @@ pub async fn run_durable_supervisor(
     Some(store),
     retry_policy,
   )
-  store.checkpoint() catch {
+  store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
   }
   summary
@@ -865,7 +865,7 @@ pub async fn run_durable_supervisor_with_retry(
     Some(store),
     retry_policy,
   )
-  store.checkpoint() catch {
+  store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
   }
   summary

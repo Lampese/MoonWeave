@@ -4,6 +4,7 @@
 pub(all) suberror CoordinatorStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
+  InvalidJournalGeneration(Int64)
   Malformed
   UnsupportedVersion(Int)
   Io(String)
@@ -37,6 +38,16 @@ struct CoordinatorStoreCheckpoint {
   version : Int
   journal_offset : Int64
   snapshot : @control.CoordinatorSnapshot
+  journal_generation : Int64?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// First record of a rotated Coordinator journal. The state snapshot in the
+/// checkpoint covers all records before this marker.
+struct CoordinatorJournalGenerationMarker {
+  version : Int
+  kind : String
+  generation : Int64
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -49,6 +60,7 @@ pub struct CoordinatorStore {
   journal : Wal
   write_lock : @async.Mutex
   mut journal_offset : Int64
+  mut journal_generation : Int64
 }
 
 ///|
@@ -80,6 +92,11 @@ pub fn CoordinatorStore::checkpoint_path(self : CoordinatorStore) -> String {
 ///|
 pub fn CoordinatorStore::journal_offset(self : CoordinatorStore) -> Int64 {
   self.journal_offset
+}
+
+///|
+pub fn CoordinatorStore::journal_generation(self : CoordinatorStore) -> Int64 {
+  self.journal_generation
 }
 
 ///|
@@ -265,13 +282,140 @@ async fn load_store_checkpoint(
   let checkpoint : CoordinatorStoreCheckpoint = @json.from_json(json) catch {
     _ => raise CoordinatorStoreError::Malformed
   }
-  if checkpoint.version != 1 {
+  if checkpoint.version != 1 && checkpoint.version != 2 {
     raise CoordinatorStoreError::UnsupportedVersion(checkpoint.version)
   }
   if checkpoint.journal_offset < 0L {
     raise CoordinatorStoreError::InvalidJournalOffset(checkpoint.journal_offset)
   }
+  match checkpoint.journal_generation {
+    Some(value) if value < 0L =>
+      raise CoordinatorStoreError::InvalidJournalGeneration(value)
+    _ => ()
+  }
   Some(checkpoint)
+}
+
+///|
+fn coordinator_checkpoint_generation(
+  checkpoint : CoordinatorStoreCheckpoint,
+) -> Int64 {
+  checkpoint.journal_generation.unwrap_or(0L)
+}
+
+///|
+fn coordinator_generation_marker(generation : Int64) -> Bytes {
+  @utf8.encode(
+    @json.to_json(CoordinatorJournalGenerationMarker::{
+      version: 1,
+      kind: "generation",
+      generation,
+    }).stringify(),
+  )
+}
+
+///|
+fn decode_coordinator_generation_marker(
+  encoded : Bytes,
+) -> Int64? raise CoordinatorStoreError {
+  let text = @utf8.decode(encoded) catch { _ => return None }
+  let json = @json.parse(text) catch { _ => return None }
+  guard json is Object(fields) else { return None }
+  guard fields.get("kind") is Some(String(kind)) else { return None }
+  if kind != "generation" {
+    return None
+  }
+  let marker : CoordinatorJournalGenerationMarker = @json.from_json(json) catch {
+    _ => raise CoordinatorStoreError::Malformed
+  }
+  if marker.version != 1 || marker.generation < 0L {
+    raise CoordinatorStoreError::InvalidJournalGeneration(marker.generation)
+  }
+  Some(marker.generation)
+}
+
+///|
+fn coordinator_replay_generation(
+  replay : WalReplay,
+) -> Int64 raise CoordinatorStoreError {
+  if replay.records().is_empty() {
+    return 0L
+  }
+  let generation = match
+    decode_coordinator_generation_marker(replay.records()[0]) {
+    Some(value) => value
+    None => 0L
+  }
+  for index, encoded in replay.records() {
+    if index > 0 && decode_coordinator_generation_marker(encoded) is Some(_) {
+      raise CoordinatorStoreError::Malformed
+    }
+  }
+  generation
+}
+
+///|
+async fn cleanup_coordinator_candidate(
+  path : String,
+) -> Unit raise CoordinatorStoreError {
+  let exists = @fs.exists(path) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  if exists {
+    @fs.remove(path) catch {
+      error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+    }
+  }
+  let lock_exists = @fs.exists(path + ".lock") catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  if lock_exists {
+    @fs.remove(path + ".lock") catch {
+      error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+    }
+  }
+}
+
+///|
+async fn recover_coordinator_journal_candidate(
+  journal : Wal,
+  journal_path : String,
+  replay : WalReplay,
+  expected_generation : Int64,
+) -> (WalReplay, Int64) raise CoordinatorStoreError {
+  let canonical_generation = coordinator_replay_generation(replay)
+  if canonical_generation > expected_generation {
+    raise CoordinatorStoreError::InvalidJournalGeneration(canonical_generation)
+  }
+  let candidate_path = journal_path + ".next"
+  let candidate_exists = @fs.exists(candidate_path) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  if canonical_generation == expected_generation {
+    if candidate_exists {
+      // The canonical marker already matches the checkpoint. Any staged file
+      // is unreferenced debris, so a corrupt candidate must not block startup.
+      cleanup_coordinator_candidate(candidate_path)
+    }
+    return (replay, canonical_generation)
+  }
+  if !candidate_exists {
+    raise CoordinatorStoreError::InvalidJournalGeneration(expected_generation)
+  }
+  let (candidate, candidate_replay) = Wal::open(candidate_path) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  let candidate_generation = coordinator_replay_generation(candidate_replay)
+  let candidate_records = candidate_replay.records().to_owned()
+  candidate.close()
+  if candidate_generation != expected_generation {
+    raise CoordinatorStoreError::InvalidJournalGeneration(candidate_generation)
+  }
+  journal.rewrite(candidate_records[:]) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  cleanup_coordinator_candidate(candidate_path)
+  (candidate_replay, candidate_generation)
 }
 
 ///|
@@ -291,11 +435,18 @@ pub async fn CoordinatorStore::open(
     Some(_) => raise CoordinatorStoreError::EmptyPath
     None => journal_path + ".checkpoint"
   }
-  let (journal, replay) = Wal::open(journal_path) catch {
+  let checkpoint = load_store_checkpoint(checkpoint_path)
+  let expected_generation = match checkpoint {
+    Some(value) => coordinator_checkpoint_generation(value)
+    None => 0L
+  }
+  let (journal, initial_replay) = Wal::open(journal_path) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   errdefer journal.close()
-  let checkpoint = load_store_checkpoint(checkpoint_path)
+  let (replay, journal_generation) = recover_coordinator_journal_candidate(
+    journal, journal_path, initial_replay, expected_generation,
+  )
   let (state, checkpoint_offset) = match checkpoint {
     None => {
       let state = @control.CoordinatorState::new(cluster_id, coordinator_id) catch {
@@ -340,6 +491,7 @@ pub async fn CoordinatorStore::open(
     journal,
     write_lock: @async.Mutex::Mutex(),
     journal_offset: replay.valid_bytes(),
+    journal_generation,
   }
 }
 
@@ -465,9 +617,10 @@ pub async fn CoordinatorStore::checkpoint(
   }
   defer self.write_lock.release()
   let checkpoint = CoordinatorStoreCheckpoint::{
-    version: 1,
+    version: 2,
     journal_offset: self.journal_offset,
     snapshot: self.state.snapshot(),
+    journal_generation: Some(self.journal_generation),
   }
   let encoded = @utf8.encode(@json.to_json(checkpoint).stringify())
   let temporary = self.checkpoint_path + ".tmp"
@@ -482,6 +635,64 @@ pub async fn CoordinatorStore::checkpoint(
   @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
+}
+
+///|
+/// Persist a complete Coordinator snapshot and rotate its journal through a
+/// staged generation. The `.next` file is durable before the checkpoint is
+/// committed; startup can therefore finish the rotation after any crash
+/// between the two atomic replacements.
+pub async fn CoordinatorStore::checkpoint_and_compact(
+  self : CoordinatorStore,
+) -> Unit raise CoordinatorStoreError {
+  self.write_lock.acquire() catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  self.journal.check_writable() catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  if self.journal_generation == 9223372036854775807L {
+    raise CoordinatorStoreError::InvalidJournalGeneration(
+      self.journal_generation,
+    )
+  }
+  let generation = self.journal_generation + 1L
+  let marker = coordinator_generation_marker(generation)
+  let candidate_path = self.journal_path + ".next"
+  let (candidate, _) = Wal::open(candidate_path) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  errdefer candidate.close()
+  candidate.rewrite([marker]) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  let candidate_offset = candidate.write_offset()
+  candidate.close()
+  let checkpoint = CoordinatorStoreCheckpoint::{
+    version: 2,
+    journal_offset: candidate_offset,
+    snapshot: self.state.snapshot(),
+    journal_generation: Some(generation),
+  }
+  let temporary = self.checkpoint_path + ".tmp"
+  @fs.write_file(
+    temporary,
+    @utf8.encode(@json.to_json(checkpoint).stringify()),
+    create_mode=@fs.CreateOrTruncate,
+    sync=@fs.Full,
+  ) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  self.journal.rewrite([marker]) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  self.journal_generation = generation
+  self.journal_offset = self.journal.write_offset()
+  cleanup_coordinator_candidate(candidate_path)
 }
 
 ///|

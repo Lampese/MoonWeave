@@ -24,6 +24,7 @@ async fn with_reconciliation_paths(
         reconcile,
         reconcile + ".lock",
         reconcile + ".repair",
+        reconcile + ".compact",
       ] {
       @fs.remove(path) catch {
         _ => ()
@@ -120,8 +121,41 @@ async test "reconciliation advances the lagging Coordinator after a Job-side sen
     assert_eq(summary.repaired_partitions(), 1)
     assert_eq(coordinator.snapshot().assignments()[0].next_offset(), 1L)
     assert_eq(job.snapshot().partitions()[0].next_offset(), 1L)
+    assert_eq(@fs.read_file(reconcile).binary().length(), 0)
     job.close()
     coordinator.close()
+  })
+}
+
+///|
+async test "reconciliation compaction retains an unfinished prepare" {
+  with_reconciliation_paths <| ((
+    _coordinator_journal,
+    _coordinator_checkpoint,
+    _job_journal,
+    _job_checkpoint,
+    reconcile,
+  ) => {
+    let target = ReconciliationPartition::{
+      partition: 0,
+      worker_id: "worker",
+      epoch: 0,
+      start_offset: 0L,
+      next_offset: 1L,
+      persisted_offset: -1L,
+      applied_offset: -1L,
+    }
+    let plan = ReconciliationPlan::{
+      job_id: "job-reconcile-pending",
+      partitions: [target],
+    }
+    let log = ReconciliationLog::open(reconcile)
+    log.prepare("pending-prepare", plan)
+    log.compact()
+    log.close()
+    let reopened = ReconciliationLog::open(reconcile)
+    defer reopened.close()
+    assert_eq(reopened.pending_ids(), ["pending-prepare"])
   })
 }
 

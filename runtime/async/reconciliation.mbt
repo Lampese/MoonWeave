@@ -59,7 +59,7 @@ struct ReconciliationEntry {
 priv struct ReconciliationLog {
   wal : Wal
   pending : Map[String, ReconciliationPlan]
-  committed : Set[String]
+  mut committed : Set[String]
 }
 
 ///|
@@ -223,6 +223,32 @@ async fn ReconciliationLog::open(
 ///|
 fn ReconciliationLog::close(self : ReconciliationLog) -> Unit {
   self.wal.close()
+}
+
+///|
+/// Remove completed transactions while retaining every prepared intent that
+/// still needs replay. A completed transaction has already been applied to
+/// both stores, so its commit marker carries no recovery value. The rewrite is
+/// atomic under the sidecar WAL lock; in-memory committed state is cleared only
+/// after the replacement is installed successfully.
+async fn ReconciliationLog::compact(
+  self : ReconciliationLog,
+) -> Unit raise ReconciliationError {
+  let entries : Array[Bytes] = []
+  for transaction_id in self.pending_ids() {
+    guard self.pending.get(transaction_id) is Some(plan) else {
+      raise ReconciliationError::Malformed
+    }
+    entries.push(
+      @utf8.encode(
+        @json.to_json(reconciliation_entry_prepare(transaction_id, plan)).stringify(),
+      ),
+    )
+  }
+  self.wal.rewrite(entries[:]) catch {
+    error => raise ReconciliationError::Wal(error)
+  }
+  self.committed = Set([])
 }
 
 ///|

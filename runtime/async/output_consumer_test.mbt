@@ -240,3 +240,70 @@ async test "output consumer binds its checkpoint and detects source replacement"
     }
   }
 }
+
+///|
+async test "output consumer compaction keeps the latest proof and resumes" {
+  with_output_consumer_directory <| directory => {
+    let output_path = directory + "/outputs.wal"
+    let checkpoint_path = directory + "/consumer.wal"
+    let log = TaskOutputLog::open(output_path)
+    log.append("task", 0, 0, 0L, [
+      consumer_output("B"),
+      consumer_output("C"),
+      consumer_output("D"),
+    ])
+    let consumer = TaskOutputConsumer::open(
+      log, checkpoint_path, "sink", "task", 0, 0,
+    )
+    let records = consumer.read()
+    consumer.ack(records[0])
+    consumer.ack(records[1])
+    assert_eq(consumer.checkpoint_stats().record_count(), 3)
+    let original_bytes = @fs.read_file(checkpoint_path).binary().length()
+    consumer.compact()
+    let compacted_bytes = @fs.read_file(checkpoint_path).binary().length()
+    assert_true(compacted_bytes < original_bytes)
+    assert_eq(consumer.checkpoint_stats().record_count(), 2)
+    consumer.close()
+
+    let restored = TaskOutputConsumer::open(
+      log, checkpoint_path, "sink", "task", 0, 0,
+    )
+    assert_eq(restored.next_sequence(), 2L)
+    assert_eq(restored.checkpoint_stats().record_count(), 2)
+    assert_eq(restored.read().map(record => record.sequence()), [2L])
+    restored.ack(restored.read()[0])
+    restored.compact()
+    restored.close()
+
+    let resumed = TaskOutputConsumer::open(
+      log, checkpoint_path, "sink", "task", 0, 0,
+    )
+    defer resumed.close()
+    assert_eq(resumed.next_sequence(), 3L)
+    log.append("task", 0, 0, 3L, [consumer_output("E")])
+    assert_eq(resumed.read()[0].sequence(), 3L)
+  }
+}
+
+///|
+async test "empty output consumer compaction keeps a zero cursor" {
+  with_output_consumer_directory <| directory => {
+    let output_path = directory + "/outputs.wal"
+    let checkpoint_path = directory + "/consumer.wal"
+    let log = TaskOutputLog::open(output_path)
+    defer log.close()
+    let consumer = TaskOutputConsumer::open(
+      log, checkpoint_path, "sink", "task", 0, 0,
+    )
+    consumer.compact()
+    consumer.close()
+    log.append("task", 0, 0, 0L, [consumer_output("B")])
+    let resumed = TaskOutputConsumer::open(
+      log, checkpoint_path, "sink", "task", 0, 0,
+    )
+    defer resumed.close()
+    assert_eq(resumed.next_sequence(), 0L)
+    assert_eq(resumed.read()[0].sequence(), 0L)
+  }
+}

@@ -3,6 +3,7 @@
 pub(all) suberror JobStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
+  InvalidJournalGeneration(Int64)
   Malformed
   UnsupportedVersion(Int)
   Io(String)
@@ -37,6 +38,18 @@ struct JobStoreCheckpoint {
   journal_offset : Int64
   snapshot : @control.JobSnapshot
   work_plans : Array[JobExecutionPlan]
+  journal_generation : Int64?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// A generation marker is the first record of a rotated journal. It is not a
+/// state-machine command; the checkpoint snapshot carries the state covered by
+/// the marker. Keeping the marker inside the checksummed WAL lets recovery
+/// distinguish an old canonical file from a staged replacement.
+struct JobJournalGenerationMarker {
+  version : Int
+  kind : String
+  generation : Int64
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -48,6 +61,7 @@ pub struct JobStore {
   journal : Wal
   write_lock : @async.Mutex
   mut journal_offset : Int64
+  mut journal_generation : Int64
   work_plans : Map[Int, JobExecutionPlan]
   supervisor_lock : @async.Mutex
 }
@@ -80,6 +94,11 @@ pub fn JobStore::checkpoint_path(self : JobStore) -> String {
 ///|
 pub fn JobStore::journal_offset(self : JobStore) -> Int64 {
   self.journal_offset
+}
+
+///|
+pub fn JobStore::journal_generation(self : JobStore) -> Int64 {
+  self.journal_generation
 }
 
 ///|
@@ -221,13 +240,132 @@ async fn load_job_checkpoint(
   let checkpoint : JobStoreCheckpoint = @json.from_json(json) catch {
     _ => raise JobStoreError::Malformed
   }
-  if checkpoint.version != 1 {
+  if checkpoint.version != 1 && checkpoint.version != 2 {
     raise JobStoreError::UnsupportedVersion(checkpoint.version)
   }
   if checkpoint.journal_offset < 0L {
     raise JobStoreError::InvalidJournalOffset(checkpoint.journal_offset)
   }
+  match checkpoint.journal_generation {
+    Some(value) if value < 0L =>
+      raise JobStoreError::InvalidJournalGeneration(value)
+    _ => ()
+  }
   Some(checkpoint)
+}
+
+///|
+fn job_checkpoint_generation(checkpoint : JobStoreCheckpoint) -> Int64 {
+  checkpoint.journal_generation.unwrap_or(0L)
+}
+
+///|
+fn job_generation_marker(generation : Int64) -> Bytes {
+  @utf8.encode(
+    @json.to_json(JobJournalGenerationMarker::{
+      version: 1,
+      kind: "generation",
+      generation,
+    }).stringify(),
+  )
+}
+
+///|
+fn decode_job_generation_marker(encoded : Bytes) -> Int64? raise JobStoreError {
+  let text = @utf8.decode(encoded) catch { _ => return None }
+  let json = @json.parse(text) catch { _ => return None }
+  guard json is Object(fields) else { return None }
+  guard fields.get("kind") is Some(String(kind)) else { return None }
+  if kind != "generation" {
+    return None
+  }
+  let marker : JobJournalGenerationMarker = @json.from_json(json) catch {
+    _ => raise JobStoreError::Malformed
+  }
+  if marker.version != 1 || marker.generation < 0L {
+    raise JobStoreError::InvalidJournalGeneration(marker.generation)
+  }
+  Some(marker.generation)
+}
+
+///|
+fn job_replay_generation(replay : WalReplay) -> Int64 raise JobStoreError {
+  if replay.records().is_empty() {
+    return 0L
+  }
+  let generation = match decode_job_generation_marker(replay.records()[0]) {
+    Some(value) => value
+    None => 0L
+  }
+  for index, encoded in replay.records() {
+    if index > 0 && decode_job_generation_marker(encoded) is Some(_) {
+      raise JobStoreError::Malformed
+    }
+  }
+  generation
+}
+
+///|
+async fn cleanup_job_candidate(path : String) -> Unit raise JobStoreError {
+  let exists = @fs.exists(path) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  if exists {
+    @fs.remove(path) catch {
+      error => raise JobStoreError::Io(@debug.to_string(error))
+    }
+  }
+  let lock_exists = @fs.exists(path + ".lock") catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  if lock_exists {
+    @fs.remove(path + ".lock") catch {
+      error => raise JobStoreError::Io(@debug.to_string(error))
+    }
+  }
+}
+
+///|
+async fn recover_job_journal_candidate(
+  journal : Wal,
+  journal_path : String,
+  replay : WalReplay,
+  expected_generation : Int64,
+) -> (WalReplay, Int64) raise JobStoreError {
+  let canonical_generation = job_replay_generation(replay)
+  if canonical_generation > expected_generation {
+    raise JobStoreError::InvalidJournalGeneration(canonical_generation)
+  }
+  let candidate_path = journal_path + ".next"
+  let candidate_exists = @fs.exists(candidate_path) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  if canonical_generation == expected_generation {
+    if candidate_exists {
+      // The canonical marker already matches the checkpoint. Any staged file
+      // is unreferenced debris, so do not let a corrupt stale candidate block
+      // recovery of the authoritative journal.
+      cleanup_job_candidate(candidate_path)
+    }
+    return (replay, canonical_generation)
+  }
+  if !candidate_exists {
+    raise JobStoreError::InvalidJournalGeneration(expected_generation)
+  }
+  let (candidate, candidate_replay) = Wal::open(candidate_path) catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  let candidate_generation = job_replay_generation(candidate_replay)
+  let candidate_records = candidate_replay.records().to_owned()
+  candidate.close()
+  if candidate_generation != expected_generation {
+    raise JobStoreError::InvalidJournalGeneration(candidate_generation)
+  }
+  journal.rewrite(candidate_records[:]) catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  cleanup_job_candidate(candidate_path)
+  (candidate_replay, candidate_generation)
 }
 
 ///|
@@ -255,11 +393,18 @@ pub async fn JobStore::open(
     Some(_) => raise JobStoreError::EmptyPath
     None => journal_path + ".checkpoint"
   }
-  let (journal, replay) = Wal::open(journal_path) catch {
+  let checkpoint = load_job_checkpoint(checkpoint_path)
+  let expected_generation = match checkpoint {
+    Some(value) => job_checkpoint_generation(value)
+    None => 0L
+  }
+  let (journal, initial_replay) = Wal::open(journal_path) catch {
     error => raise JobStoreError::Wal(error)
   }
   errdefer journal.close()
-  let checkpoint = load_job_checkpoint(checkpoint_path)
+  let (replay, journal_generation) = recover_job_journal_candidate(
+    journal, journal_path, initial_replay, expected_generation,
+  )
   let work_plans : Map[Int, JobExecutionPlan] = Map([])
   let (state, checkpoint_offset) = match checkpoint {
     None => (@control.JobState::new(spec), 0L)
@@ -314,6 +459,7 @@ pub async fn JobStore::open(
     journal,
     write_lock: @async.Mutex::Mutex(),
     journal_offset: replay.valid_bytes(),
+    journal_generation,
     work_plans,
     supervisor_lock: @async.Mutex::Mutex(),
   }
@@ -437,10 +583,11 @@ pub async fn JobStore::checkpoint(self : JobStore) -> Unit raise JobStoreError {
   let work_plans = self.work_plans.values().to_array()
   work_plans.sort_by((left, right) => left.partition.compare(right.partition))
   let checkpoint = JobStoreCheckpoint::{
-    version: 1,
+    version: 2,
     journal_offset: self.journal_offset,
     snapshot: self.state.snapshot(),
     work_plans,
+    journal_generation: Some(self.journal_generation),
   }
   let temporary = self.checkpoint_path + ".tmp"
   @fs.write_file(
@@ -454,6 +601,66 @@ pub async fn JobStore::checkpoint(self : JobStore) -> Unit raise JobStoreError {
   @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
+}
+
+///|
+/// Persist a complete state snapshot and rotate the journal to a single
+/// generation marker. The staged `.next` WAL is synced before the checkpoint
+/// is renamed. Recovery adopts that candidate if the process stops before the
+/// canonical journal is replaced, so no checkpoint offset is reused against a
+/// different WAL generation.
+pub async fn JobStore::checkpoint_and_compact(
+  self : JobStore,
+) -> Unit raise JobStoreError {
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  self.journal.check_writable() catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  if self.journal_generation == 9223372036854775807L {
+    raise JobStoreError::InvalidJournalGeneration(self.journal_generation)
+  }
+  let generation = self.journal_generation + 1L
+  let marker = job_generation_marker(generation)
+  let candidate_path = self.journal_path + ".next"
+  let (candidate, _) = Wal::open(candidate_path) catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  errdefer candidate.close()
+  candidate.rewrite([marker]) catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  let candidate_offset = candidate.write_offset()
+  candidate.close()
+  let work_plans = self.work_plans.values().to_array()
+  work_plans.sort_by((left, right) => left.partition.compare(right.partition))
+  let checkpoint = JobStoreCheckpoint::{
+    version: 2,
+    journal_offset: candidate_offset,
+    snapshot: self.state.snapshot(),
+    work_plans,
+    journal_generation: Some(generation),
+  }
+  let temporary = self.checkpoint_path + ".tmp"
+  @fs.write_file(
+    temporary,
+    @utf8.encode(@json.to_json(checkpoint).stringify()),
+    create_mode=@fs.CreateOrTruncate,
+    sync=@fs.Full,
+  ) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  self.journal.rewrite([marker]) catch {
+    error => raise JobStoreError::Wal(error)
+  }
+  self.journal_generation = generation
+  self.journal_offset = self.journal.write_offset()
+  cleanup_job_candidate(candidate_path)
 }
 
 ///|
