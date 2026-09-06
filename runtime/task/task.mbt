@@ -24,6 +24,7 @@ pub(all) suberror TaskError {
   PendingEvents(Int)
   WrongPhase(expected~ : TaskPhase, actual~ : TaskPhase)
   InvalidTransition
+  Aggregation(@aggregation.AggregationError)
   Reachability(@reachability.EngineError)
   Security(@security.SecurityError)
   Causal(@causal.CausalError)
@@ -51,6 +52,7 @@ pub fn TaskInput::event(self : TaskInput) -> @protocol.EventRecord {
 /// A newly emitted operator result. Facts and alerts are intentionally separate
 /// so callers cannot confuse a security alert with a graph reachability fact.
 pub(all) enum TaskOutput {
+  KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
 } derive(Debug, Eq, Compare, ToJson, FromJson)
@@ -116,6 +118,7 @@ pub struct Task {
   mut offset : Int64
   mut frontier : @causal.Frontier
   mut emitted_outputs : Int
+  mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
 }
@@ -150,6 +153,15 @@ pub fn Task::new(
   if start_offset < 0L {
     raise TaskError::InvalidOffset(start_offset)
   }
+  let aggregation = match operator {
+    OperatorKind::KeyedSum =>
+      Some(
+        @aggregation.Engine::new() catch {
+          error => raise TaskError::Causal(error)
+        },
+      )
+    OperatorKind::Reachability | OperatorKind::SecurityChain => None
+  }
   let reachability = match operator {
     OperatorKind::Reachability =>
       Some(
@@ -157,10 +169,10 @@ pub fn Task::new(
           error => raise TaskError::Causal(error)
         },
       )
-    OperatorKind::SecurityChain => None
+    OperatorKind::KeyedSum | OperatorKind::SecurityChain => None
   }
   let security = match operator {
-    OperatorKind::Reachability => None
+    OperatorKind::KeyedSum | OperatorKind::Reachability => None
     OperatorKind::SecurityChain =>
       Some(
         @security.Engine::new() catch {
@@ -179,6 +191,7 @@ pub fn Task::new(
     offset: start_offset - 1L,
     frontier: @causal.Frontier::empty(),
     emitted_outputs: 0,
+    aggregation,
     reachability,
     security,
   }
@@ -288,6 +301,7 @@ pub fn Task::frontier(self : Task) -> @causal.Frontier {
 ///|
 pub fn Task::event_count(self : Task) -> Int {
   match self.operator {
+    OperatorKind::KeyedSum => self.aggregation.unwrap().event_count()
     OperatorKind::Reachability => self.reachability.unwrap().event_count()
     OperatorKind::SecurityChain => self.security.unwrap().event_count()
   }
@@ -296,6 +310,7 @@ pub fn Task::event_count(self : Task) -> Int {
 ///|
 pub fn Task::pending_count(self : Task) -> Int {
   match self.operator {
+    OperatorKind::KeyedSum => self.aggregation.unwrap().pending_count()
     OperatorKind::Reachability => self.reachability.unwrap().pending_count()
     OperatorKind::SecurityChain => self.security.unwrap().pending_count()
   }
@@ -305,6 +320,11 @@ pub fn Task::pending_count(self : Task) -> Int {
 /// Return the current monotone operator outputs in deterministic order.
 pub fn Task::outputs(self : Task) -> Array[TaskOutput] {
   let outputs = match self.operator {
+    OperatorKind::KeyedSum =>
+      self.aggregation
+      .unwrap()
+      .outputs()
+      .map(value => TaskOutput::KeyedSum(value))
     OperatorKind::Reachability =>
       self.reachability
       .unwrap()
@@ -352,6 +372,29 @@ fn task_snapshot_event(
 pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
   let events : Array[@protocol.EventRecord] = []
   match self.operator {
+    OperatorKind::KeyedSum => {
+      let engine = self.aggregation.unwrap()
+      for event in engine.events() {
+        events.push(
+          task_snapshot_event(
+            event.id(),
+            event.parents(),
+            event.key(),
+            event.payload().to_json(),
+          ),
+        )
+      }
+      for event in engine.pending_events() {
+        events.push(
+          task_snapshot_event(
+            event.id(),
+            event.parents(),
+            event.key(),
+            event.payload().to_json(),
+          ),
+        )
+      }
+    }
     OperatorKind::Reachability => {
       let engine = self.reachability.unwrap()
       for event in engine.events() {
@@ -455,6 +498,7 @@ pub fn Task::restore(
   }
   candidate.offset = snapshot.offset()
   candidate.emitted_outputs = snapshot.emitted_outputs()
+  self.aggregation = candidate.aggregation
   self.reachability = candidate.reachability
   self.security = candidate.security
   self.offset = candidate.offset
@@ -513,6 +557,23 @@ fn Task::apply_input(
   input : TaskInput,
 ) -> Array[TaskOutput] raise TaskError {
   match self.operator {
+    OperatorKind::KeyedSum => {
+      let engine = match self.aggregation {
+        Some(value) => value
+        None => raise TaskError::InvalidTransition
+      }
+      let record = input.event()
+      self.operator.validate_payload(record.payload())
+      let sums = engine.apply_json_event(
+        record.id(),
+        record.parents(),
+        record.key(),
+        record.payload(),
+      ) catch {
+        error => raise TaskError::Aggregation(error)
+      }
+      sums.map(value => TaskOutput::KeyedSum(value))
+    }
     OperatorKind::Reachability => {
       let engine = match self.reachability {
         Some(value) => value
@@ -553,6 +614,7 @@ fn Task::apply_input(
 ///|
 fn Task::refresh_frontier(self : Task) -> Unit {
   self.frontier = match self.operator {
+    OperatorKind::KeyedSum => self.aggregation.unwrap().frontier()
     OperatorKind::Reachability => self.reachability.unwrap().frontier()
     OperatorKind::SecurityChain => self.security.unwrap().frontier()
   }
@@ -571,6 +633,7 @@ fn Task::copy(self : Task) -> Task {
     offset: self.offset,
     frontier: self.frontier,
     emitted_outputs: self.emitted_outputs,
+    aggregation: self.aggregation.map(engine => engine.copy()),
     reachability: self.reachability.map(engine => engine.copy()),
     security: self.security.map(engine => engine.copy()),
   }
@@ -578,6 +641,7 @@ fn Task::copy(self : Task) -> Task {
 
 ///|
 fn Task::commit(self : Task, candidate : Task) -> Unit {
+  self.aggregation = candidate.aggregation
   self.reachability = candidate.reachability
   self.security = candidate.security
   self.offset = candidate.offset

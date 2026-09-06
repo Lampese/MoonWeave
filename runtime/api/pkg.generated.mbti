@@ -5,6 +5,7 @@ import {
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
   "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/aggregation",
   "moonweave/moonweave/operator/reachability",
   "moonweave/moonweave/operator/security",
   "moonweave/moonweave/protocol",
@@ -99,6 +100,7 @@ pub struct Event {
 } derive(Eq, @debug.Debug)
 pub fn Event::id(Self) -> @causal.EventId
 pub fn Event::key(Self) -> String
+pub fn Event::keyed_sum(@causal.EventId, String, Int64) -> Self raise ApiError
 pub fn Event::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ApiError
 pub fn Event::payload(Self) -> Json
 
@@ -122,6 +124,7 @@ pub fn JobDefinition::partition_count(Self) -> Int
 pub fn JobDefinition::partitioning(Self) -> Partitioning
 pub fn JobDefinition::routes(Self) -> ArrayView[@plan.ExchangeRoute]
 pub fn JobDefinition::run_local(Self) -> LocalRun raise ApiError
+pub async fn JobDefinition::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
 pub fn JobDefinition::sink(Self) -> SinkSpec
 pub fn JobDefinition::source(Self) -> SourceSpec
 pub fn JobDefinition::with_artifact(Self, OperatorArtifact) -> Self
@@ -132,6 +135,73 @@ pub fn JobDefinition::with_sink(Self, SinkSpec) -> Self
 pub fn JobDefinition::with_source(Self, SourceSpec) -> Self
 pub fn JobDefinition::with_workers(Self, ArrayView[String]) -> Self raise ApiError
 pub fn JobDefinition::workers(Self) -> ArrayView[String]
+
+pub(all) struct KeyedSumEvent {
+  event : Event
+  value : Int64
+} derive(Eq, @debug.Debug)
+pub fn KeyedSumEvent::id(Self) -> @causal.EventId
+pub fn KeyedSumEvent::key(Self) -> String
+pub fn KeyedSumEvent::new(@causal.EventId, String, Int64) -> Self raise ApiError
+pub fn KeyedSumEvent::new_with_parents(@causal.EventId, ArrayView[@causal.EventId], String, Int64) -> Self raise ApiError
+pub fn KeyedSumEvent::value(Self) -> Int64
+
+pub struct KeyedSumJob {
+  definition : JobDefinition
+} derive(Eq, @debug.Debug)
+pub fn KeyedSumJob::compile(Self) -> KeyedSumPlan raise ApiError
+pub fn KeyedSumJob::job_id(Self) -> String
+pub fn KeyedSumJob::new(String) -> Self raise ApiError
+pub fn KeyedSumJob::run_local(Self) -> KeyedSumRun raise ApiError
+pub async fn KeyedSumJob::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError
+pub fn KeyedSumJob::with_durable_sink(Self, String) -> Self raise ApiError
+pub fn KeyedSumJob::with_partition_count(Self, Int) -> Self raise ApiError
+pub fn KeyedSumJob::with_workers(Self, ArrayView[String]) -> Self raise ApiError
+pub fn KeyedSumJob::without_sink(Self) -> Self
+
+pub struct KeyedSumPlan {
+  compiled : CompiledJob
+}
+pub fn KeyedSumPlan::job_id(Self) -> String
+pub fn KeyedSumPlan::partition_count(Self) -> Int
+pub fn KeyedSumPlan::partition_for_key(Self, String) -> Int
+pub fn KeyedSumPlan::plan_digest(Self) -> String
+pub fn KeyedSumPlan::run_local(Self) -> KeyedSumRun raise ApiError
+pub async fn KeyedSumPlan::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError
+
+pub struct KeyedSumRun {
+  run : LocalRun
+  updates : Array[KeyedSumUpdate]
+}
+pub fn KeyedSumRun::close(Self) -> Unit raise ApiError
+pub fn KeyedSumRun::job_id(Self) -> String
+pub fn KeyedSumRun::phase(Self) -> LocalRunPhase
+pub fn KeyedSumRun::plan_digest(Self) -> String
+pub fn KeyedSumRun::progresses(Self) -> Array[LocalProgress]
+pub fn KeyedSumRun::submit(Self, ArrayView[KeyedSumEvent]) -> Array[KeyedSumUpdate] raise ApiError
+pub fn KeyedSumRun::totals(Self) -> Array[KeyedSumUpdate]
+pub fn KeyedSumRun::updates(Self) -> ArrayView[KeyedSumUpdate]
+
+pub struct KeyedSumRunSummary {
+  job_id : String
+  summary : ClusterRunSummary
+} derive(Eq, @debug.Debug)
+pub fn KeyedSumRunSummary::completed_partitions(Self) -> Int
+pub fn KeyedSumRunSummary::failed_partitions(Self) -> Int
+pub fn KeyedSumRunSummary::failures(Self) -> ArrayView[String]
+pub fn KeyedSumRunSummary::job_id(Self) -> String
+pub fn KeyedSumRunSummary::plan_digest(Self) -> String
+pub fn KeyedSumRunSummary::sent_batches(Self) -> Int
+pub fn KeyedSumRunSummary::totals(Self) -> Array[KeyedSumUpdate] raise ApiError
+pub fn KeyedSumRunSummary::updates(Self) -> Array[KeyedSumUpdate] raise ApiError
+
+pub(all) struct KeyedSumUpdate {
+  key : String
+  total : Int64
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn KeyedSumUpdate::key(Self) -> String
+pub fn KeyedSumUpdate::new(String, Int64) -> Self
+pub fn KeyedSumUpdate::total(Self) -> Int64
 
 pub(all) struct LocalProgress {
   job_id : String
@@ -225,6 +295,7 @@ pub struct OperatorRef {
   version : Int
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn OperatorRef::id(Self) -> String
+pub fn OperatorRef::keyed_sum() -> Self
 pub fn OperatorRef::new(String, Int) -> Self raise ApiError
 pub fn OperatorRef::reachability() -> Self
 pub fn OperatorRef::security_chain() -> Self
@@ -242,11 +313,14 @@ pub fn OperatorRegistry::resolve(Self, OperatorRef) -> OperatorDescriptor raise 
 pub fn OperatorRegistry::resolve_artifact(Self, OperatorArtifact) -> OperatorDescriptor raise ApiError
 
 pub(all) enum Output {
+  KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Output::as_keyed_sum(Self) -> @aggregation.KeyedSum?
 pub fn Output::as_reachable(Self) -> @reachability.Reachable?
 pub fn Output::as_security_alert(Self) -> @security.SecurityAlert?
+pub fn Output::keyed_sum(@aggregation.KeyedSum) -> Self
 pub fn Output::reachable(@reachability.Reachable) -> Self
 pub fn Output::security_alert(@security.SecurityAlert) -> Self
 

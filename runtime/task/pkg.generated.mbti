@@ -5,6 +5,7 @@ import {
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
   "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/aggregation",
   "moonweave/moonweave/operator/reachability",
   "moonweave/moonweave/operator/security",
   "moonweave/moonweave/protocol",
@@ -27,6 +28,7 @@ pub(all) suberror TaskError {
   PendingEvents(Int)
   WrongPhase(expected~ : TaskPhase, actual~ : TaskPhase)
   InvalidTransition
+  Aggregation(@aggregation.AggregationError)
   Reachability(@reachability.EngineError)
   Security(@security.SecurityError)
   Causal(@causal.CausalError)
@@ -47,6 +49,7 @@ pub(all) suberror TaskSetError {
 
 // Types and methods
 pub(all) enum OperatorKind {
+  KeyedSum
   Reachability
   SecurityChain
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
@@ -74,6 +77,7 @@ pub struct Task {
   mut offset : Int64
   mut frontier : @causal.Frontier
   mut emitted_outputs : Int
+  mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
 }
@@ -122,6 +126,7 @@ pub fn TaskInput::event(Self) -> @protocol.EventRecord
 pub fn TaskInput::new(@protocol.EventRecord) -> Self
 
 pub(all) enum TaskOutput {
+  KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)

@@ -593,6 +593,7 @@ pub fn JobOutputPartitionSummary::task_state_digest(Self) -> String
 pub fn JobOutputPartitionSummary::worker_id(Self) -> String
 
 pub(all) enum JobOutputQuery {
+  KeyedSum(String, Int64)
   Reachable(String, String)
   SecurityAlert(String)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)

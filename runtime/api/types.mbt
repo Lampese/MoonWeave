@@ -245,6 +245,20 @@ pub fn Event::new(
 }
 
 ///|
+pub fn Event::keyed_sum(
+  id : @causal.EventId,
+  key : String,
+  value : Int64,
+) -> Event raise ApiError {
+  Event::new(
+    id,
+    [],
+    key,
+    Json::object({ "value": Json::string(value.to_string()) }),
+  )
+}
+
+///|
 pub fn Event::id(self : Event) -> @causal.EventId {
   self.record.id()
 }
@@ -263,6 +277,7 @@ pub fn Event::payload(self : Event) -> Json {
 /// User-facing built-in outputs. The operator-specific payload types remain
 /// typed, but Task/transport types do not leak through this API.
 pub(all) enum Output {
+  KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
 } derive(Debug, Eq, Compare, ToJson, FromJson)
@@ -273,6 +288,11 @@ pub fn Output::reachable(value : @reachability.Reachable) -> Output {
 }
 
 ///|
+pub fn Output::keyed_sum(value : @aggregation.KeyedSum) -> Output {
+  Output::KeyedSum(value)
+}
+
+///|
 pub fn Output::security_alert(value : @security.SecurityAlert) -> Output {
   Output::SecurityAlert(value)
 }
@@ -280,6 +300,7 @@ pub fn Output::security_alert(value : @security.SecurityAlert) -> Output {
 ///|
 pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
   match self {
+    Output::KeyedSum(_) => None
     Output::Reachable(value) => Some(value)
     Output::SecurityAlert(_) => None
   }
@@ -288,8 +309,17 @@ pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
 ///|
 pub fn Output::as_security_alert(self : Output) -> @security.SecurityAlert? {
   match self {
+    Output::KeyedSum(_) => None
     Output::Reachable(_) => None
     Output::SecurityAlert(value) => Some(value)
+  }
+}
+
+///|
+pub fn Output::as_keyed_sum(self : Output) -> @aggregation.KeyedSum? {
+  match self {
+    Output::KeyedSum(value) => Some(value)
+    Output::Reachable(_) | Output::SecurityAlert(_) => None
   }
 }
 

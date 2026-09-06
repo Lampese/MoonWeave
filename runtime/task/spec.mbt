@@ -15,6 +15,7 @@ pub fn OperatorKind::from_id(
   operator_id : String,
 ) -> OperatorKind raise TaskError {
   match operator_id {
+    "keyed-sum" => OperatorKind::KeyedSum
     "reachability" => OperatorKind::Reachability
     "security-chain" => OperatorKind::SecurityChain
     _ => raise TaskError::UnknownOperator(operator_id)

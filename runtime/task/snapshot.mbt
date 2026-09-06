@@ -12,7 +12,8 @@ pub(all) struct TaskSnapshot {
   frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
-  // 旧 checkpoint 不含此字段；新 checkpoint 必须保存所用实现与 schema。
+  // Legacy checkpoints omit this field; new checkpoints record implementation
+  // and schema identity.
   operator_capability : String?
 } derive(Debug, Eq, ToJson, FromJson)
 

@@ -93,6 +93,7 @@ pub fn LocalRun::progresses(self : LocalRun) -> Array[LocalProgress] {
 ///|
 fn local_output(output : @task.TaskOutput) -> Output {
   match output {
+    @task.TaskOutput::KeyedSum(value) => Output::KeyedSum(value)
     @task.TaskOutput::Reachable(value) => Output::Reachable(value)
     @task.TaskOutput::SecurityAlert(value) => Output::SecurityAlert(value)
   }

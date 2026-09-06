@@ -1,0 +1,72 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/operator/aggregation"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/causal",
+}
+
+// Values
+
+// Errors
+pub(all) suberror AggregationError {
+  EmptyKey
+  MalformedPayload
+  Overflow(String)
+  Causal(@causal.CausalError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub(all) struct Contribution {
+  key : String
+  value : Int64
+} derive(Eq, @debug.Debug)
+pub fn Contribution::from_json(String, Json) -> Self raise AggregationError
+pub fn Contribution::key(Self) -> String
+pub fn Contribution::new(String, Int64) -> Self raise AggregationError
+pub fn Contribution::to_json(Self) -> Json
+pub fn Contribution::value(Self) -> Int64
+
+pub struct Engine {
+  mut log : @causal.CausalLog[Contribution]
+  mut state : State
+  mut history : Array[KeyedSum]
+}
+pub fn Engine::apply(Self, @causal.Event[Contribution]) -> Array[KeyedSum] raise AggregationError
+pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[KeyedSum] raise AggregationError
+pub fn Engine::copy(Self) -> Self
+pub fn Engine::event_count(Self) -> Int
+pub fn Engine::events(Self) -> Array[@causal.Event[Contribution]]
+pub fn Engine::frontier(Self) -> @causal.Frontier
+pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
+pub fn Engine::outputs(Self) -> Array[KeyedSum]
+pub fn Engine::pending_count(Self) -> Int
+pub fn Engine::pending_events(Self) -> Array[@causal.Event[Contribution]]
+pub fn Engine::total(Self, String) -> Int64?
+pub fn Engine::totals(Self) -> Array[KeyedSum]
+
+pub(all) struct KeyedSum {
+  key : String
+  total : Int64
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
+pub fn KeyedSum::key(Self) -> String
+pub fn KeyedSum::new(String, Int64) -> Self
+pub fn KeyedSum::total(Self) -> Int64
+
+pub struct State {
+  totals : Map[String, Int64]
+} derive(Eq, @debug.Debug)
+pub fn State::apply(Self, Contribution) -> KeyedSum raise AggregationError
+pub fn State::copy(Self) -> Self
+pub fn State::new() -> Self
+pub fn State::total(Self, String) -> Int64?
+pub fn State::totals(Self) -> Array[KeyedSum]
+
+pub(all) struct SumPayload {
+  value : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+// Type aliases
+
+// Traits

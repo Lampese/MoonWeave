@@ -27,6 +27,11 @@ pub fn OperatorRef::reachability() -> OperatorRef {
 }
 
 ///|
+pub fn OperatorRef::keyed_sum() -> OperatorRef {
+  { id: "keyed-sum", version: 1, }
+}
+
+///|
 pub fn OperatorRef::security_chain() -> OperatorRef {
   { id: "security-chain", version: 1, }
 }
@@ -142,7 +147,8 @@ fn operator_registry_key(reference : OperatorRef) -> String {
 }
 
 ///|
-/// 创建空的 Worker 允许列表；注册的 descriptor 必须对应本二进制中的实现。
+/// Create an empty Worker allow-list. Registered descriptors must correspond to
+/// implementations in this binary.
 pub fn OperatorRegistry::new() -> OperatorRegistry {
   { descriptors: Map([]), }
 }
@@ -156,7 +162,8 @@ fn builtin_descriptor(kind : @task.OperatorKind) -> OperatorDescriptor {
     input_schema: kind.input_schema(),
     output_schema: kind.output_schema(),
     runtime_abi: kind.runtime_abi(),
-    // 这是 native 用户层执行器的标签，不限制纯 Task 的后端。
+    // This labels the native user-layer executor; it does not constrain the
+    // backend used by the pure Task package.
     target: "native",
     dependency_digest: kind.dependency_digest(),
     deterministic: true,
@@ -166,7 +173,8 @@ fn builtin_descriptor(kind : @task.OperatorKind) -> OperatorDescriptor {
 }
 
 ///|
-/// 注册预编译实现的 descriptor，不加载外来机器码，也不序列化函数。
+/// Register a precompiled implementation descriptor. This does not load
+/// foreign machine code or serialize functions.
 pub fn OperatorRegistry::register(
   self : OperatorRegistry,
   descriptor : OperatorDescriptor,
@@ -184,6 +192,7 @@ pub fn OperatorRegistry::builtins() -> OperatorRegistry {
   let registry = OperatorRegistry::new()
   for
     kind in [
+      @task.OperatorKind::KeyedSum,
       @task.OperatorKind::Reachability,
       @task.OperatorKind::SecurityChain,
     ] {
@@ -194,7 +203,8 @@ pub fn OperatorRegistry::builtins() -> OperatorRegistry {
 }
 
 ///|
-/// 返回独立数组，顺序与注册顺序无关。
+/// Return an independent array whose order is independent of registration
+/// order.
 pub fn OperatorRegistry::entries(
   self : OperatorRegistry,
 ) -> Array[OperatorDescriptor] {
@@ -241,7 +251,8 @@ pub fn OperatorDescriptor::capability(self : OperatorDescriptor) -> String {
 }
 
 ///|
-/// 使用算子自己的解析器验证输入结构，不能仅凭 schema 名字宣称匹配。
+/// Validate input structure with the operator parser; a schema name alone is
+/// not sufficient to claim compatibility.
 pub fn OperatorDescriptor::validate_event(
   self : OperatorDescriptor,
   event : Event,

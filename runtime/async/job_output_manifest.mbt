@@ -320,6 +320,7 @@ pub fn JobOutputCertificate::digest(self : JobOutputCertificate) -> String {
 /// certificate can therefore be derived from verified Task outputs instead of
 /// accepting an arbitrary result string supplied by a caller.
 pub(all) enum JobOutputQuery {
+  KeyedSum(String, Int64)
   Reachable(String, String)
   SecurityAlert(String)
 } derive(Debug, Eq, ToJson, FromJson)
@@ -329,6 +330,8 @@ fn validate_job_output_query(
   query : JobOutputQuery,
 ) -> Unit raise JobOutputManifestError {
   match query {
+    JobOutputQuery::KeyedSum(key, _) if key.is_empty() =>
+      raise JobOutputManifestError::InvalidQuery
     JobOutputQuery::Reachable(source, target) if source.is_empty() ||
       target.is_empty() => raise JobOutputManifestError::InvalidQuery
     JobOutputQuery::SecurityAlert(user_id) if user_id.is_empty() =>
@@ -343,6 +346,8 @@ fn job_output_query_matches(
   output : @task.TaskOutput,
 ) -> Bool {
   match (query, output) {
+    (JobOutputQuery::KeyedSum(key, total), @task.TaskOutput::KeyedSum(value)) =>
+      value.key() == key && value.total() == total
     (
       JobOutputQuery::Reachable(source, target),
       @task.TaskOutput::Reachable(value),
@@ -362,6 +367,8 @@ fn job_output_query_result_digest(
 ) -> String {
   let prefix = if matched { "match:" } else { "no-match:" }
   match query {
+    JobOutputQuery::KeyedSum(key, total) =>
+      prefix + "keyed-sum:" + key + "=" + total.to_string()
     JobOutputQuery::Reachable(source, target) => prefix + source + "->" + target
     JobOutputQuery::SecurityAlert(user_id) =>
       prefix + "security-alert:" + user_id

@@ -1,5 +1,6 @@
 import {
   "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/aggregation",
   "moonweave/moonweave/operator/reachability",
   "moonweave/moonweave/operator/security",
   "moonweave/moonweave/protocol",

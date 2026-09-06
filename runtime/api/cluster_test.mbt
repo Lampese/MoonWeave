@@ -85,3 +85,83 @@ async test "high-level cluster runner routes an explicit exchange edge" {
     assert_true(summary.outputs().length() >= 2)
   })
 }
+
+///|
+fn distinct_key(job : CompiledJob, first : String) -> String {
+  let candidates = ["store-b", "store-c", "store-d", "store-e"]
+  let mut selected = candidates[0]
+  for candidate in candidates {
+    if job.partition_for_key(first) != job.partition_for_key(candidate) {
+      selected = candidate
+      break
+    }
+  }
+  selected
+}
+
+///|
+async test "high-level cluster runner computes keyed totals on two workers" {
+  let directory = @fs.tmpdir(prefix="moonweave-api-keyed-sum")
+  defer {
+    for name in @fs.readdir(directory) {
+      @fs.remove(directory + "/" + name) catch {
+        _ => ()
+      }
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  @async_runtime.with_timeout(30000, () => {
+    let compiled = JobDefinition::new("sales-totals", OperatorRef::keyed_sum())
+      .with_partition_count(2)
+      .with_workers(["worker-a", "worker-b"])
+      .with_sink(SinkSpec::durable("sales-output"))
+      .compile()
+    let first_key = "store-a"
+    let second_key = distinct_key(compiled, first_key)
+    assert_true(
+      compiled.partition_for_key(first_key) !=
+      compiled.partition_for_key(second_key),
+    )
+    let events = [
+      Event::new(
+        @causal.EventId::new("sales", 0),
+        [],
+        first_key,
+        Json::object({ "value": Json::string("120") }),
+      ),
+      Event::new(
+        @causal.EventId::new("sales", 1),
+        [],
+        second_key,
+        Json::object({ "value": Json::string("50") }),
+      ),
+      Event::new(
+        @causal.EventId::new("sales", 2),
+        [],
+        first_key,
+        Json::object({ "value": Json::string("80") }),
+      ),
+      Event::new(
+        @causal.EventId::new("sales", 3),
+        [],
+        second_key,
+        Json::object({ "value": Json::string("70") }),
+      ),
+    ]
+    let config = ClusterConfig::new("sales-cluster", "coordinator", directory)
+    let summary = compiled.run_local_cluster(config, events) catch {
+      error => fail(@debug.to_string(error))
+    }
+    assert_eq(summary.completed_partitions(), 2)
+    assert_eq(summary.failed_partitions(), 0)
+    assert_eq(summary.sent_batches(), 2)
+    assert_eq(summary.outputs(), [
+      Output::KeyedSum(@aggregation.KeyedSum::new(first_key, 120L)),
+      Output::KeyedSum(@aggregation.KeyedSum::new(first_key, 200L)),
+      Output::KeyedSum(@aggregation.KeyedSum::new(second_key, 50L)),
+      Output::KeyedSum(@aggregation.KeyedSum::new(second_key, 120L)),
+    ])
+  })
+}

@@ -35,6 +35,21 @@ fn security_event(
 }
 
 ///|
+fn sum_event(
+  origin : String,
+  sequence : Int,
+  key : String,
+  value : Int64,
+) -> @protocol.EventRecord raise {
+  @protocol.EventRecord::new(
+    @causal.EventId::new(origin, sequence),
+    [],
+    key,
+    Json::object({ "value": Json::string(value.to_string()) }),
+  )
+}
+
+///|
 test "task lifecycle and reachability outputs are deterministic" {
   let task = Task::new(
     "task-graph",
@@ -68,6 +83,37 @@ test "task lifecycle and reachability outputs are deterministic" {
   task.drain()
   task.stop()
   assert_eq(task.phase(), TaskPhase::Stopped)
+}
+
+///|
+test "task runs a keyed sum and snapshots its running totals" {
+  let task = Task::new("task-sum", "keyed-sum", OperatorKind::KeyedSum, 0, 0)
+  task.start()
+  let outputs = task.process_batch(
+    @protocol.EventBatch::new(0, 0, 0L, [
+      sum_event("sales", 0, "north", 10L),
+      sum_event("sales", 1, "north", 5L),
+      sum_event("sales", 2, "south", 7L),
+    ]),
+  )
+  assert_eq(outputs, [
+    TaskOutput::KeyedSum(@aggregation.KeyedSum::new("north", 10L)),
+    TaskOutput::KeyedSum(@aggregation.KeyedSum::new("north", 15L)),
+    TaskOutput::KeyedSum(@aggregation.KeyedSum::new("south", 7L)),
+  ])
+  assert_eq(task.event_count(), 3)
+  assert_eq(task.outputs(), outputs)
+  let snapshot = task.snapshot()
+  let restored = Task::new(
+    "task-sum",
+    "keyed-sum",
+    OperatorKind::KeyedSum,
+    0,
+    0,
+  )
+  restored.start()
+  restored.restore(snapshot)
+  assert_eq(restored.outputs(), outputs)
 }
 
 ///|

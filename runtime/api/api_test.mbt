@@ -29,7 +29,7 @@ test "builtin operator registry exposes stable execution metadata" {
   assert_true(descriptor.deterministic())
   assert_true(descriptor.supports_proof())
   assert_true(descriptor.capability().has_prefix("moonweave-operator:"))
-  assert_eq(registry.capabilities().length(), 2)
+  assert_eq(registry.capabilities().length(), 3)
   let isolated = OperatorRegistry::new()
   isolated.register(descriptor)
   assert_eq(isolated.entries().length(), 1)
@@ -113,6 +113,17 @@ test "operator descriptors validate payloads before transport" {
   } noraise {
     _ => fail("expected operator input schema rejection")
   }
+}
+
+///|
+test "typed keyed sum events hide the wire payload" {
+  let event = Event::keyed_sum(
+    @causal.EventId::new("sales", 0),
+    "store-a",
+    120L,
+  )
+  assert_eq(event.key(), "store-a")
+  assert_eq(event.payload(), Json::object({ "value": Json::string("120") }))
 }
 
 ///|

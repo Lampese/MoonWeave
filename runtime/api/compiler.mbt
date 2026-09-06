@@ -51,7 +51,8 @@ pub fn JobDefinition::compile(
   routes.sort()
   let workers = self.workers.copy()
   workers.sort()
-  // 显式 artifact 与默认内置引用统一成相同实现身份；签名不参与执行计划。
+  // Normalize explicit artifacts and default built-in references to the same
+  // implementation identity; signatures do not affect the execution plan.
   let canonical = JobDefinition::{
     ..self,
     workers,
@@ -87,6 +88,16 @@ pub fn JobDefinition::run_local(
   self : JobDefinition,
 ) -> LocalRun raise ApiError {
   self.compile().run_local()
+}
+
+///|
+/// Compile and execute a finite job through the local real-TCP cluster runner.
+pub async fn JobDefinition::run_local_cluster(
+  self : JobDefinition,
+  config : ClusterConfig,
+  events : ArrayView[Event],
+) -> ClusterRunSummary raise ApiError {
+  self.compile().run_local_cluster(config, events)
 }
 
 ///|
