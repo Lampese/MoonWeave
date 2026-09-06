@@ -131,6 +131,7 @@ test "drain acknowledgement optionally carries a durable Task output summary" {
     task_id="task/p2/e3",
     output_count=4L,
     output_digest="manifest-output",
+    task_state_digest="manifest-state",
   )
   assert_eq(@protocol.DrainAck::from_payload(ack.to_payload()), ack)
   assert_eq(ack.task_id(), Some("task/p2/e3"))

@@ -511,7 +511,7 @@ async fn run_worker_impl(
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
   drain_handler? : () -> Unit raise FrameIoError,
-  output_summary? : () -> (String, Int64, String) raise FrameIoError,
+  output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -1004,7 +1004,7 @@ async fn run_worker_impl(
               error => raise FrameIoError::Protocol(error)
             }
           Some(make_summary) => {
-            let (task_id, output_count, output_digest) = make_summary()
+            let (task_id, output_count, output_digest, task_state_digest) = make_summary()
             @protocol.DrainAck::new(
               frame.message_id(),
               assignment.partition(),
@@ -1016,6 +1016,7 @@ async fn run_worker_impl(
               task_id~,
               output_count~,
               output_digest~,
+              task_state_digest~,
             ) catch {
               error => raise FrameIoError::Protocol(error)
             }

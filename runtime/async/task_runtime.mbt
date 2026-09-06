@@ -79,16 +79,21 @@ pub async fn run_worker_task(
         }
     }
   }
-  let output_summary : () -> (String, Int64, String) raise FrameIoError = () => {
+  let output_summary : () -> (String, Int64, String, String) raise FrameIoError = () => {
     match output_log {
       None =>
         raise FrameIoError::Handler("output summary requires an output log")
-      Some(log) =>
+      Some(log) => {
+        let snapshot = task.snapshot() catch {
+          error => raise FrameIoError::Task(error)
+        }
         (
           task.task_id(),
           log.next_sequence(task.task_id()),
           log.output_digest(task.task_id()),
+          task_snapshot_digest(snapshot),
         )
+      }
     }
   }
   let primary_handler : (@protocol.EventBatch) -> Unit raise = batch => {

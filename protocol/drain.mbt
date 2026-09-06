@@ -47,6 +47,7 @@ pub(all) struct DrainAck {
   task_id : String?
   output_count : Int64?
   output_digest : String?
+  task_state_digest : String?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -61,6 +62,7 @@ pub fn DrainAck::new(
   task_id? : String,
   output_count? : Int64,
   output_digest? : String,
+  task_state_digest? : String,
 ) -> DrainAck raise ProtocolError {
   if request_id.is_empty() ||
     partition < 0 ||
@@ -74,16 +76,23 @@ pub fn DrainAck::new(
       (
         task_id is Some(_) ||
         output_count is Some(_) ||
-        output_digest is Some(_)
+        output_digest is Some(_) ||
+        task_state_digest is Some(_)
       ) &&
-      (task_id is None || output_count is None || output_digest is None)
+      (
+        task_id is None ||
+        output_count is None ||
+        output_digest is None ||
+        task_state_digest is None
+      )
     ) {
     raise ProtocolError::InvalidFrameField
   }
-  match (task_id, output_count, output_digest) {
-    (Some(id), Some(count), Some(digest)) if id.is_empty() ||
+  match (task_id, output_count, output_digest, task_state_digest) {
+    (Some(id), Some(count), Some(digest), Some(state_digest)) if id.is_empty() ||
       count < 0L ||
-      digest.is_empty() => raise ProtocolError::InvalidFrameField
+      digest.is_empty() ||
+      state_digest.is_empty() => raise ProtocolError::InvalidFrameField
     _ => ()
   }
   {
@@ -97,6 +106,7 @@ pub fn DrainAck::new(
     task_id,
     output_count,
     output_digest,
+    task_state_digest,
   }
 }
 
@@ -113,6 +123,11 @@ pub fn DrainAck::output_count(self : DrainAck) -> Int64? {
 ///|
 pub fn DrainAck::output_digest(self : DrainAck) -> String? {
   self.output_digest
+}
+
+///|
+pub fn DrainAck::task_state_digest(self : DrainAck) -> String? {
+  self.task_state_digest
 }
 
 ///|
@@ -134,6 +149,7 @@ pub fn DrainAck::from_payload(text : String) -> DrainAck raise MessageError {
     task_id?=value.task_id,
     output_count?=value.output_count,
     output_digest?=value.output_digest,
+    task_state_digest?=value.task_state_digest,
   ) catch {
     error => raise protocol_error(error)
   }

@@ -189,12 +189,14 @@ pub(all) struct DrainAck {
   task_id : String?
   output_count : Int64?
   output_digest : String?
+  task_state_digest : String?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn DrainAck::from_payload(String) -> Self raise MessageError
-pub fn DrainAck::new(String, Int, Int, Int64, Int64, Int, String, task_id? : String, output_count? : Int64, output_digest? : String) -> Self raise ProtocolError
+pub fn DrainAck::new(String, Int, Int, Int64, Int64, Int, String, task_id? : String, output_count? : Int64, output_digest? : String, task_state_digest? : String) -> Self raise ProtocolError
 pub fn DrainAck::output_count(Self) -> Int64?
 pub fn DrainAck::output_digest(Self) -> String?
 pub fn DrainAck::task_id(Self) -> String?
+pub fn DrainAck::task_state_digest(Self) -> String?
 pub fn DrainAck::to_payload(Self) -> String
 
 pub(all) struct DrainRequest {

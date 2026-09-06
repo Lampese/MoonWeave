@@ -73,6 +73,8 @@ pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.Task
 
 pub async fn serve_echo(@socket.Tcp, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
+pub fn task_snapshot_digest(@task.TaskSnapshot) -> String
+
 pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn[W : @io.Writer] write_frame(W, @protocol.Frame, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
@@ -151,6 +153,9 @@ pub(all) suberror JobOutputManifestError {
   InvalidSequence(Int64)
   InvalidDigest
   InvalidCertificate
+  InvalidProof(Int)
+  InvalidQuery
+  DigestMismatch
   NotComplete
   FrontierMismatch
   UnknownPartition(Int)
@@ -452,20 +457,26 @@ type JobJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct JobOutputCertificate {
   query_id : String
+  job_id : String
   operator_id : String
   status : String
   result_digest : String
   frontier_digest : String
+  output_digest : String
+  task_state_digest : String
   payload : Json
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobOutputCertificate::digest(Self) -> String
 pub fn JobOutputCertificate::frontier_digest(Self) -> String
-pub fn JobOutputCertificate::new(String, String, String, String, String, Json) -> Self raise JobOutputManifestError
+pub fn JobOutputCertificate::job_id(Self) -> String
+pub fn JobOutputCertificate::new(String, String, String, String, String, String, String, String, Json) -> Self raise JobOutputManifestError
 pub fn JobOutputCertificate::operator_id(Self) -> String
+pub fn JobOutputCertificate::output_digest(Self) -> String
 pub fn JobOutputCertificate::payload(Self) -> Json
 pub fn JobOutputCertificate::query_id(Self) -> String
 pub fn JobOutputCertificate::result_digest(Self) -> String
 pub fn JobOutputCertificate::status(Self) -> String
+pub fn JobOutputCertificate::task_state_digest(Self) -> String
 
 pub(all) struct JobOutputConsumerSummary {
   consumer_id : String
@@ -509,11 +520,14 @@ pub fn JobOutputManifest::partition_count(Self) -> Int
 pub fn JobOutputManifest::partitions(Self) -> Array[JobOutputPartitionSummary]
 pub fn JobOutputManifest::path(Self) -> String
 pub async fn JobOutputManifest::publish_certificate(Self, JobOutputCertificate) -> Unit raise JobOutputManifestError
-pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
-pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, Bool) -> Unit raise JobOutputManifestError
-pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, Bool) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::publish_verified_certificate(Self, String, JobOutputQuery, ArrayView[JobOutputTaskProof]) -> JobOutputCertificate raise JobOutputManifestError
+pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, String, Bool) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
 pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
 pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
+pub fn JobOutputManifest::task_state_digest(Self) -> String
+pub fn JobOutputManifest::verify_certificate(Self, JobOutputCertificate) -> Bool
 
 type JobOutputManifestEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
@@ -545,8 +559,11 @@ pub(all) struct JobOutputPartitionSummary {
   output_count : Int64
   output_digest : String
   frontier_digest : String
+  task_state_digest : String
+  applied_offset : Int64
   complete : Bool
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputPartitionSummary::applied_offset(Self) -> Int64
 pub fn JobOutputPartitionSummary::complete(Self) -> Bool
 pub fn JobOutputPartitionSummary::epoch(Self) -> Int
 pub fn JobOutputPartitionSummary::frontier_digest(Self) -> String
@@ -555,7 +572,25 @@ pub fn JobOutputPartitionSummary::output_digest(Self) -> String
 pub fn JobOutputPartitionSummary::output_log_path(Self) -> String
 pub fn JobOutputPartitionSummary::partition(Self) -> Int
 pub fn JobOutputPartitionSummary::task_id(Self) -> String
+pub fn JobOutputPartitionSummary::task_state_digest(Self) -> String
 pub fn JobOutputPartitionSummary::worker_id(Self) -> String
+
+pub(all) enum JobOutputQuery {
+  Reachable(String, String)
+  SecurityAlert(String)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct JobOutputTaskProof {
+  partition : Int
+  task_id : String
+  snapshot : @task.TaskSnapshot
+  outputs : Array[TaskOutputRecord]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobOutputTaskProof::new(Int, String, @task.TaskSnapshot, ArrayView[TaskOutputRecord]) -> Self
+pub fn JobOutputTaskProof::outputs(Self) -> ArrayView[TaskOutputRecord]
+pub fn JobOutputTaskProof::partition(Self) -> Int
+pub fn JobOutputTaskProof::snapshot(Self) -> @task.TaskSnapshot
+pub fn JobOutputTaskProof::task_id(Self) -> String
 
 pub struct JobStore {
   state : @control.JobState

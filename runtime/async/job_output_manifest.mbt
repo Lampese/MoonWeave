@@ -16,6 +16,9 @@ pub(all) suberror JobOutputManifestError {
   InvalidSequence(Int64)
   InvalidDigest
   InvalidCertificate
+  InvalidProof(Int)
+  InvalidQuery
+  DigestMismatch
   NotComplete
   FrontierMismatch
   UnknownPartition(Int)
@@ -41,6 +44,8 @@ pub(all) struct JobOutputPartitionSummary {
   output_count : Int64
   output_digest : String
   frontier_digest : String
+  task_state_digest : String
+  applied_offset : Int64
   complete : Bool
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -99,6 +104,22 @@ pub fn JobOutputPartitionSummary::frontier_digest(
 ) -> String {
   self.frontier_digest
 }
+
+///|
+pub fn JobOutputPartitionSummary::task_state_digest(
+  self : JobOutputPartitionSummary,
+) -> String {
+  self.task_state_digest
+}
+
+///|
+pub fn JobOutputPartitionSummary::applied_offset(
+  self : JobOutputPartitionSummary,
+) -> Int64 {
+  self.applied_offset
+}
+
+///|
 
 ///|
 pub fn JobOutputPartitionSummary::complete(
@@ -179,36 +200,60 @@ fn valid_certificate_status(status : String) -> Bool {
 /// identity and frontier binding, while the operator validates its semantics.
 pub(all) struct JobOutputCertificate {
   query_id : String
+  job_id : String
   operator_id : String
   status : String
   result_digest : String
   frontier_digest : String
+  output_digest : String
+  task_state_digest : String
   payload : Json
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 pub fn JobOutputCertificate::new(
   query_id : String,
+  job_id : String,
   operator_id : String,
   status : String,
   result_digest : String,
   frontier_digest : String,
+  output_digest : String,
+  task_state_digest : String,
   payload : Json,
 ) -> JobOutputCertificate raise JobOutputManifestError {
   if query_id.is_empty() ||
+    job_id.is_empty() ||
     operator_id.is_empty() ||
     !valid_certificate_status(status) ||
     result_digest.is_empty() ||
     frontier_digest.is_empty() ||
+    output_digest.is_empty() ||
+    task_state_digest.is_empty() ||
     status == "Tentative" {
     raise JobOutputManifestError::InvalidCertificate
   }
-  { query_id, operator_id, status, result_digest, frontier_digest, payload, }
+  {
+    query_id,
+    job_id,
+    operator_id,
+    status,
+    result_digest,
+    frontier_digest,
+    output_digest,
+    task_state_digest,
+    payload,
+  }
 }
 
 ///|
 pub fn JobOutputCertificate::query_id(self : JobOutputCertificate) -> String {
   self.query_id
+}
+
+///|
+pub fn JobOutputCertificate::job_id(self : JobOutputCertificate) -> String {
+  self.job_id
 }
 
 ///|
@@ -236,6 +281,20 @@ pub fn JobOutputCertificate::frontier_digest(
 }
 
 ///|
+pub fn JobOutputCertificate::output_digest(
+  self : JobOutputCertificate,
+) -> String {
+  self.output_digest
+}
+
+///|
+pub fn JobOutputCertificate::task_state_digest(
+  self : JobOutputCertificate,
+) -> String {
+  self.task_state_digest
+}
+
+///|
 pub fn JobOutputCertificate::payload(self : JobOutputCertificate) -> Json {
   self.payload
 }
@@ -243,6 +302,168 @@ pub fn JobOutputCertificate::payload(self : JobOutputCertificate) -> Json {
 ///|
 pub fn JobOutputCertificate::digest(self : JobOutputCertificate) -> String {
   manifest_json_digest(@json.to_json(self))
+}
+
+///|
+/// The v1 certificate query language is intentionally small and typed. A
+/// certificate can therefore be derived from verified Task outputs instead of
+/// accepting an arbitrary result string supplied by a caller.
+pub(all) enum JobOutputQuery {
+  Reachable(String, String)
+  SecurityAlert(String)
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+fn validate_job_output_query(
+  query : JobOutputQuery,
+) -> Unit raise JobOutputManifestError {
+  match query {
+    JobOutputQuery::Reachable(source, target) if source.is_empty() ||
+      target.is_empty() => raise JobOutputManifestError::InvalidQuery
+    JobOutputQuery::SecurityAlert(user_id) if user_id.is_empty() =>
+      raise JobOutputManifestError::InvalidQuery
+    _ => ()
+  }
+}
+
+///|
+fn job_output_query_matches(
+  query : JobOutputQuery,
+  output : @task.TaskOutput,
+) -> Bool {
+  match (query, output) {
+    (
+      JobOutputQuery::Reachable(source, target),
+      @task.TaskOutput::Reachable(value),
+    ) => value.source() == source && value.target() == target
+    (
+      JobOutputQuery::SecurityAlert(user_id),
+      @task.TaskOutput::SecurityAlert(value),
+    ) => value.user_id() == user_id
+    _ => false
+  }
+}
+
+///|
+fn job_output_query_result_digest(
+  query : JobOutputQuery,
+  matched : Bool,
+) -> String {
+  let prefix = if matched { "match:" } else { "no-match:" }
+  match query {
+    JobOutputQuery::Reachable(source, target) => prefix + source + "->" + target
+    JobOutputQuery::SecurityAlert(user_id) =>
+      prefix + "security-alert:" + user_id
+  }
+}
+
+///|
+pub(all) struct JobOutputTaskProof {
+  partition : Int
+  task_id : String
+  snapshot : @task.TaskSnapshot
+  outputs : Array[TaskOutputRecord]
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobOutputTaskProof::new(
+  partition : Int,
+  task_id : String,
+  snapshot : @task.TaskSnapshot,
+  outputs : ArrayView[TaskOutputRecord],
+) -> JobOutputTaskProof {
+  { partition, task_id, snapshot, outputs: outputs.to_owned(), }
+}
+
+///|
+pub fn JobOutputTaskProof::partition(self : JobOutputTaskProof) -> Int {
+  self.partition
+}
+
+///|
+pub fn JobOutputTaskProof::task_id(self : JobOutputTaskProof) -> String {
+  self.task_id
+}
+
+///|
+pub fn JobOutputTaskProof::snapshot(
+  self : JobOutputTaskProof,
+) -> @task.TaskSnapshot {
+  self.snapshot
+}
+
+///|
+pub fn JobOutputTaskProof::outputs(
+  self : JobOutputTaskProof,
+) -> ArrayView[TaskOutputRecord] {
+  self.outputs[:]
+}
+
+///|
+/// Verify one complete Task proof against the durable partition summary. The
+/// proof must carry the exact snapshot and output prefix that produced the
+/// Worker drain digest; reordering or omitting a record is rejected.
+fn verify_job_output_task_proof(
+  manifest : JobOutputManifest,
+  query : JobOutputQuery,
+  proof : JobOutputTaskProof,
+  seen : Set[Int],
+) -> (Bool, Json) raise JobOutputManifestError {
+  let partition = proof.partition
+  if partition < 0 || partition >= manifest.partition_count {
+    raise JobOutputManifestError::InvalidPartition(partition)
+  }
+  if !seen.add_and_check(partition) {
+    raise JobOutputManifestError::DuplicatePartition(partition)
+  }
+  guard manifest.partitions.get(partition) is Some(summary) else {
+    raise JobOutputManifestError::UnknownPartition(partition)
+  }
+  let snapshot = proof.snapshot
+  if proof.task_id != summary.task_id ||
+    snapshot.task_id() != summary.task_id ||
+    snapshot.operator_id() != manifest.operator_id ||
+    snapshot.partition() != partition ||
+    snapshot.epoch() != summary.epoch ||
+    snapshot.frontier_digest() != summary.frontier_digest ||
+    snapshot.emitted_outputs().to_int64() != summary.output_count {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
+  let snapshot_digest = task_snapshot_digest(snapshot)
+  if snapshot_digest != summary.task_state_digest {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
+  if snapshot.offset() != summary.applied_offset {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
+  let outputs = proof.outputs.copy()
+  outputs.sort_by((left, right) => left.sequence().compare(right.sequence()))
+  if outputs.length().to_int64() != summary.output_count {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
+  for index, output in outputs {
+    if output.task_id() != summary.task_id ||
+      output.partition() != partition ||
+      output.epoch() != summary.epoch ||
+      output.sequence() != index.to_int64() {
+      raise JobOutputManifestError::InvalidProof(partition)
+    }
+  }
+  let output_digest = manifest_records_digest(outputs)
+  if output_digest != summary.output_digest {
+    raise JobOutputManifestError::InvalidProof(partition)
+  }
+  let matched = outputs.any(record => {
+    job_output_query_matches(query, record.output())
+  })
+  let proof_json = Json::object({
+    "partition": Json::number(partition.to_double()),
+    "task_id": Json::string(summary.task_id),
+    "epoch": Json::number(summary.epoch.to_double()),
+    "snapshot_digest": Json::string(snapshot_digest),
+    "output_digest": Json::string(output_digest),
+  })
+  (matched, proof_json)
 }
 
 ///|
@@ -345,6 +566,12 @@ fn manifest_json_digest(value : Json) -> String {
 }
 
 ///|
+/// Canonical digest used in Worker DrainAck for a Task snapshot.
+pub fn task_snapshot_digest(snapshot : @task.TaskSnapshot) -> String {
+  manifest_json_digest(@json.to_json(snapshot))
+}
+
+///|
 fn manifest_records_digest(records : Array[TaskOutputRecord]) -> String {
   manifest_json_digest(
     Json::array(records.map(record => @json.to_json(record))),
@@ -371,8 +598,12 @@ fn validate_partition_summary(
   if value.output_log_path.is_empty() ||
     value.output_count < 0L ||
     value.output_digest.is_empty() ||
-    value.frontier_digest.is_empty() {
+    value.frontier_digest.is_empty() ||
+    value.task_state_digest.is_empty() {
     raise JobOutputManifestError::InvalidDigest
+  }
+  if value.applied_offset < -1L {
+    raise JobOutputManifestError::InvalidSequence(value.applied_offset)
   }
 }
 
@@ -564,10 +795,14 @@ fn apply_manifest_entry(
         raise JobOutputManifestError::Malformed
       }
       if value.operator_id != manifest.operator_id ||
+        value.job_id != manifest.job_id ||
         !valid_certificate_status(value.status) ||
         value.query_id.is_empty() ||
         value.result_digest.is_empty() ||
-        value.frontier_digest.is_empty() {
+        value.frontier_digest.is_empty() ||
+        value.output_digest != manifest.output_digest() ||
+        value.frontier_digest != manifest.frontier_digest() ||
+        value.task_state_digest != manifest.task_state_digest() {
         raise JobOutputManifestError::InvalidCertificate
       }
       if manifest.certificate is Some(previous) && previous != value {
@@ -726,6 +961,26 @@ pub fn JobOutputManifest::certificate(
 }
 
 ///|
+/// Verify that a certificate is bound to this complete manifest. Operator
+/// semantics for the certificate payload remain the responsibility of the
+/// operator package; this method verifies the durable Job identity and all
+/// aggregate evidence digests.
+pub fn JobOutputManifest::verify_certificate(
+  self : JobOutputManifest,
+  certificate : JobOutputCertificate,
+) -> Bool {
+  self.is_complete() &&
+  certificate.job_id == self.job_id &&
+  certificate.operator_id == self.operator_id &&
+  valid_certificate_status(certificate.status) &&
+  !certificate.query_id.is_empty() &&
+  !certificate.result_digest.is_empty() &&
+  certificate.frontier_digest == self.frontier_digest() &&
+  certificate.output_digest == self.output_digest() &&
+  certificate.task_state_digest == self.task_state_digest()
+}
+
+///|
 pub fn JobOutputManifest::is_complete(self : JobOutputManifest) -> Bool {
   self.partitions.length() == self.partition_count &&
   self.partitions.values().all(value => value.complete)
@@ -763,6 +1018,27 @@ pub fn JobOutputManifest::output_digest(self : JobOutputManifest) -> String {
 }
 
 ///|
+/// Aggregate digest of the exact Task snapshots reported at drain. This is
+/// distinct from frontier/output digests so certificate verifiers can tell
+/// whether the operator state itself changed.
+pub fn JobOutputManifest::task_state_digest(self : JobOutputManifest) -> String {
+  let partitions = self.partitions()
+  manifest_json_digest(
+    Json::array(
+      partitions.map(value => {
+        Json::object({
+          "partition": Json::number(value.partition.to_double()),
+          "task_id": Json::string(value.task_id),
+          "epoch": Json::number(value.epoch.to_double()),
+          "task_state_digest": Json::string(value.task_state_digest),
+          "applied_offset": Json::number(value.applied_offset.to_double()),
+        })
+      }),
+    ),
+  )
+}
+
+///|
 pub fn JobOutputManifest::final_digest(self : JobOutputManifest) -> String {
   manifest_json_digest(
     Json::object({
@@ -770,6 +1046,7 @@ pub fn JobOutputManifest::final_digest(self : JobOutputManifest) -> String {
       "operator_id": Json::string(self.operator_id),
       "frontier_digest": Json::string(self.frontier_digest()),
       "output_digest": Json::string(self.output_digest()),
+      "task_state_digest": Json::string(self.task_state_digest()),
       "certificate": match self.certificate {
         None => Json::null()
         Some(value) => @json.to_json(value)
@@ -852,7 +1129,9 @@ fn output_partition_from_log(
   epoch : Int,
   log : TaskOutputLog,
   frontier_digest : String,
+  task_state_digest : String,
   complete : Bool,
+  applied_offset? : Int64 = -1L,
 ) -> JobOutputPartitionSummary raise JobOutputManifestError {
   if task_id.is_empty() {
     raise JobOutputManifestError::EmptyTaskId
@@ -886,6 +1165,8 @@ fn output_partition_from_log(
     output_count: records.length().to_int64(),
     output_digest: manifest_records_digest(records),
     frontier_digest,
+    task_state_digest,
+    applied_offset,
     complete,
   }
 }
@@ -899,10 +1180,20 @@ pub async fn JobOutputManifest::record_partition(
   epoch : Int,
   log : TaskOutputLog,
   frontier_digest : String,
+  task_state_digest : String,
   complete : Bool,
+  applied_offset? : Int64 = -1L,
 ) -> Unit raise JobOutputManifestError {
   let value = output_partition_from_log(
-    partition, task_id, worker_id, epoch, log, frontier_digest, complete,
+    partition,
+    task_id,
+    worker_id,
+    epoch,
+    log,
+    frontier_digest,
+    task_state_digest,
+    complete,
+    applied_offset~,
   )
   self.write_lock.acquire() catch {
     error =>
@@ -931,6 +1222,7 @@ pub async fn JobOutputManifest::record_job_partition(
   task_id : String,
   log : TaskOutputLog,
   frontier_digest : String,
+  task_state_digest : String,
   complete : Bool,
 ) -> Unit raise JobOutputManifestError {
   let snapshot = job.snapshot()
@@ -954,6 +1246,7 @@ pub async fn JobOutputManifest::record_job_partition(
     job_partition.epoch(),
     log,
     frontier_digest,
+    task_state_digest,
     complete,
   )
 }
@@ -972,7 +1265,9 @@ pub async fn JobOutputManifest::record_partition_summary(
   output_count : Int64,
   output_digest : String,
   frontier_digest : String,
+  task_state_digest : String,
   complete : Bool,
+  applied_offset? : Int64 = -1L,
 ) -> Unit raise JobOutputManifestError {
   let value = JobOutputPartitionSummary::{
     partition,
@@ -983,6 +1278,8 @@ pub async fn JobOutputManifest::record_partition_summary(
     output_count,
     output_digest,
     frontier_digest,
+    task_state_digest,
+    applied_offset,
     complete,
   }
   validate_partition_summary(value, self.partition_count)
@@ -1032,22 +1329,29 @@ pub async fn JobOutputManifest::sync_consumer(
 }
 
 ///|
-pub async fn JobOutputManifest::publish_certificate(
+async fn JobOutputManifest::append_certificate(
   self : JobOutputManifest,
   certificate : JobOutputCertificate,
 ) -> Unit raise JobOutputManifestError {
   if !self.is_complete() {
     raise JobOutputManifestError::NotComplete
   }
-  if certificate.operator_id != self.operator_id ||
+  if certificate.job_id != self.job_id ||
+    certificate.operator_id != self.operator_id ||
     !valid_certificate_status(certificate.status) ||
     certificate.query_id.is_empty() ||
     certificate.result_digest.is_empty() ||
-    certificate.frontier_digest.is_empty() {
+    certificate.frontier_digest.is_empty() ||
+    certificate.output_digest.is_empty() ||
+    certificate.task_state_digest.is_empty() {
     raise JobOutputManifestError::InvalidCertificate
   }
   if certificate.frontier_digest != self.frontier_digest() {
     raise JobOutputManifestError::FrontierMismatch
+  }
+  if certificate.output_digest != self.output_digest() ||
+    certificate.task_state_digest != self.task_state_digest() {
+    raise JobOutputManifestError::DigestMismatch
   }
   self.write_lock.acquire() catch {
     error =>
@@ -1068,4 +1372,66 @@ pub async fn JobOutputManifest::publish_certificate(
     ),
     certificate: Some(certificate),
   })
+}
+
+///|
+/// Publish a certificate after checking that it is bound to this Job's
+/// durable aggregate digests. For typed, replayable evidence use
+/// `publish_verified_certificate`.
+pub async fn JobOutputManifest::publish_certificate(
+  self : JobOutputManifest,
+  certificate : JobOutputCertificate,
+) -> Unit raise JobOutputManifestError {
+  self.append_certificate(certificate)
+}
+
+///|
+/// Verify every Task snapshot/output prefix, derive the result state from the
+/// typed query, and persist the resulting certificate. This is the only API
+/// that claims a certificate is backed by replayable Task evidence.
+pub async fn JobOutputManifest::publish_verified_certificate(
+  self : JobOutputManifest,
+  query_id : String,
+  query : JobOutputQuery,
+  proofs : ArrayView[JobOutputTaskProof],
+) -> JobOutputCertificate raise JobOutputManifestError {
+  if query_id.is_empty() {
+    raise JobOutputManifestError::InvalidCertificate
+  }
+  validate_job_output_query(query)
+  if !self.is_complete() || proofs.length() != self.partition_count {
+    raise JobOutputManifestError::NotComplete
+  }
+  let seen : Set[Int] = Set([])
+  let proof_records : Array[Json] = []
+  let mut matched = false
+  for proof in proofs {
+    let (proof_matched, proof_json) = verify_job_output_task_proof(
+      self, query, proof, seen,
+    )
+    if proof_matched {
+      matched = true
+    }
+    proof_records.push(proof_json)
+  }
+  if seen.length() != self.partition_count {
+    raise JobOutputManifestError::InvalidProof(-1)
+  }
+  let status = if matched { "Stable" } else { "ResolvedNoMatch" }
+  let certificate = JobOutputCertificate::new(
+    query_id,
+    self.job_id,
+    self.operator_id,
+    status,
+    job_output_query_result_digest(query, matched),
+    self.frontier_digest(),
+    self.output_digest(),
+    self.task_state_digest(),
+    Json::object({
+      "query": @json.to_json(query),
+      "proofs": Json::array(proof_records),
+    }),
+  )
+  self.append_certificate(certificate)
+  certificate
 }

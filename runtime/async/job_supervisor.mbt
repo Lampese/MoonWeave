@@ -184,8 +184,18 @@ async fn wait_job_drain(
         match output_manifest {
           None => ()
           Some(manifest) => {
-            guard (ack.task_id, ack.output_count, ack.output_digest)
-              is (Some(task_id), Some(output_count), Some(output_digest)) else {
+            guard (
+                ack.task_id,
+                ack.output_count,
+                ack.output_digest,
+                ack.task_state_digest,
+              )
+              is (
+                Some(task_id),
+                Some(output_count),
+                Some(output_digest),
+                Some(task_state_digest),
+              ) else {
               raise FrameIoError::DrainMismatch
             }
             manifest.record_partition_summary(
@@ -196,7 +206,9 @@ async fn wait_job_drain(
               output_count,
               output_digest,
               ack.frontier_digest,
+              task_state_digest,
               true,
+              applied_offset=ack.applied_offset,
             ) catch {
               error => raise FrameIoError::JobOutputManifest(error)
             }
