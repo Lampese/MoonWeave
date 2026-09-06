@@ -9,6 +9,7 @@ pub struct SupervisorWork {
   batches : Array[@protocol.EventBatch]
   deltas : Array[@protocol.DeltaBatch]
   probe : @protocol.Probe?
+  required_capability : String?
 }
 
 ///|
@@ -23,6 +24,7 @@ pub(all) suberror SupervisorPlanError {
   DuplicatePartition(Int)
   DuplicateSession(String)
   DuplicateDelta(String)
+  MissingCapability(worker~ : String, capability~ : String)
 } derive(Debug, Eq)
 
 ///|
@@ -33,8 +35,17 @@ pub fn SupervisorWork::new(
   batches : Array[@protocol.EventBatch],
   probe? : @protocol.Probe,
   deltas? : Array[@protocol.DeltaBatch] = [],
+  required_capability? : String,
 ) -> SupervisorWork {
-  { worker_id, session_id, partition, batches, deltas, probe, }
+  {
+    worker_id,
+    session_id,
+    partition,
+    batches,
+    deltas,
+    probe,
+    required_capability,
+  }
 }
 
 ///|
@@ -69,6 +80,11 @@ pub fn SupervisorWork::deltas(
   self : SupervisorWork,
 ) -> ArrayView[@protocol.DeltaBatch] {
   self.deltas[:]
+}
+
+///|
+pub fn SupervisorWork::required_capability(self : SupervisorWork) -> String? {
+  self.required_capability
 }
 
 ///|
@@ -224,7 +240,19 @@ fn validate_supervisor_plan(
     }
     // Validate ownership and epoch before accepting any socket. This also
     // makes a plan with an unknown partition fail synchronously.
-    let (_, assignment, spec) = validate_supervisor_work(control, work)
+    let (worker, assignment, spec) = validate_supervisor_work(control, work)
+    match work.required_capability() {
+      Some(capability) if !worker
+        .capabilities()
+        .any(value => value == capability) =>
+        raise FrameIoError::SupervisorPlan(
+          SupervisorPlanError::MissingCapability(
+            worker=worker.worker_id(),
+            capability~,
+          ),
+        )
+      _ => ()
+    }
     validate_batch_plan(spec, work.batches())
     for delta in work.deltas() {
       if delta.target_partition() != assignment.partition() ||
@@ -694,6 +722,18 @@ async fn supervise_one_connection(
         raise FrameIoError::Coordinator(
           @control.CoordinatorError::StaleIncarnation,
         )
+      }
+      match work.required_capability() {
+        Some(capability) if !hello
+          .capabilities()
+          .any(value => value == capability) =>
+          raise FrameIoError::SupervisorPlan(
+            SupervisorPlanError::MissingCapability(
+              worker=hello.worker_id(),
+              capability~,
+            ),
+          )
+        _ => ()
       }
       let validator = @protocol.CoordinatorSession::new(
         control.cluster_id(),

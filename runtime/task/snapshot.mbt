@@ -12,6 +12,8 @@ pub(all) struct TaskSnapshot {
   frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
+  // 旧 checkpoint 不含此字段；新 checkpoint 必须保存所用实现与 schema。
+  operator_capability : String?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -27,6 +29,11 @@ pub fn TaskSnapshot::operator_id(self : TaskSnapshot) -> String {
 ///|
 pub fn TaskSnapshot::operator(self : TaskSnapshot) -> OperatorKind {
   self.operator
+}
+
+///|
+pub fn TaskSnapshot::operator_capability(self : TaskSnapshot) -> String? {
+  self.operator_capability
 }
 
 ///|

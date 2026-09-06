@@ -1,5 +1,6 @@
 ///|
 async fn main {
+  // 这个 demo 使用真实的本机 TCP 连接，并为 Worker 创建临时 WAL。
   let directory = @fs.tmpdir(prefix="moonweave-demo")
   let wal_path = directory + "/worker.wal"
   defer {
@@ -14,6 +15,7 @@ async fn main {
     }
   }
 
+  // 构造两个事件组成的因果链，并故意先发送子事件。
   let root_id = @causal.EventId::new("auth", 0)
   let child_id = @causal.EventId::new("admin", 0)
   let root = @protocol.EventRecord::new(
@@ -28,6 +30,7 @@ async fn main {
     "user-42",
     Json::object({ "source": Json::string("B"), "target": Json::string("C") }),
   )
+  // Coordinator 负责维护成员、分区分配和 epoch fencing。
   let control = @control.CoordinatorState::new("demo-cluster", "coordinator")
   let incarnation = @protocol.Incarnation::new("demo-1")
   ignore(control.register_worker("worker-1", incarnation, ["reachability"]))
@@ -36,8 +39,7 @@ async fn main {
   let query = @reachability.Query::new("reach-A-C", "A", "C", [0])
   engine.set_query(query)
   let batches = [
-    // Transport offsets remain contiguous, while event causality is released
-    // only when the root arrives in the second batch.
+    // 传输 offset 仍然连续，但只有第二个 batch 到达 root 后，因果依赖才会释放。
     @protocol.EventBatch::new(0, assignment.epoch(), 0L, [child]),
     @protocol.EventBatch::new(0, assignment.epoch(), 1L, [root]),
   ]
@@ -47,6 +49,8 @@ async fn main {
     assignment.epoch(),
     1L,
   )
+  // 绑定临时 loopback 端口，让 Coordinator 和 Worker 走与独立进程相同的
+  // framed TCP 传输路径。
   let server = @socket.TcpServer(
     @socket.Addr::parse("127.0.0.1:0"),
     reuse_addr=true,
@@ -57,6 +61,7 @@ async fn main {
   let mut probe_verified = false
   let mut probe_reply : @protocol.ProbeReply? = None
   @async.with_task_group <| group => {
+    // Coordinator 发送 batch，并且只有收到 ProbeReply 后才关闭查询义务。
     group.spawn_bg() <| () => {
       let (connection, _) = server.accept()
       let summary = @transport.run_managed_coordinator(
@@ -75,6 +80,8 @@ async fn main {
       )
     }
     let connection = @socket.Tcp::connect(addr)
+    // Worker 通过因果引擎处理事件。缺少父事件时先放入 pending，
+    // 后续 batch 到达后再释放。
     let handler : (@protocol.EventBatch) -> Unit raise = batch => {
       for record in batch.events() {
         let facts = engine.apply_json_event(
@@ -88,6 +95,7 @@ async fn main {
         )
       }
     }
+    // credit 限制实时发送量；WAL 让 Worker 重启后可以重放已接收的 batch。
     let summary = @transport.run_worker(
       connection,
       "demo-cluster",
@@ -118,10 +126,12 @@ async fn main {
     fail("demo query missing after coordination")
   }
   if probe_verified {
+    // frontier 验证通过后，Tentative 查询结果才能变成 Stable。
     ignore(query_state.close_partition(0))
   }
   match probe_reply {
     Some(reply) => {
+      // certificate 将查询结果绑定到两个因果事件的身份和 frontier。
       let certificate = query_state.certificate(reply.frontier_digest(), [
         root_id, child_id,
       ])

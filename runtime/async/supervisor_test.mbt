@@ -292,3 +292,104 @@ async test "supervisor rejects ambiguous plans before accepting sockets" {
     _ => fail("expected duplicate worker plan rejection")
   }
 }
+
+///|
+async test "supervisor rejects a worker without the registered operator capability" {
+  let control = @control.CoordinatorState::new(
+    "cluster-capability", "coordinator",
+  )
+  let boot = @protocol.Incarnation::new("boot-capability")
+  ignore(control.register_worker("worker", boot, ["reachability"]))
+  let assignment = control.assign(0, "worker")
+  let required_capability = @task.OperatorKind::Reachability.capability()
+  let work = SupervisorWork::new(
+    "worker",
+    "capability-session",
+    0,
+    [],
+    required_capability~,
+  )
+  let server = @socket.TcpServer(
+    @socket.Addr::parse("127.0.0.1:0"),
+    reuse_addr=true,
+  )
+  defer server.close()
+  // The control table lacks the full capability token, so the supervisor
+  // fails before accepting a socket.
+  try run_supervisor(server, control, [work]) catch {
+    FrameIoError::SupervisorPlan(
+      SupervisorPlanError::MissingCapability(worker~, capability=reported)
+    ) => {
+      assert_eq(worker, "worker")
+      assert_eq(reported, required_capability)
+    }
+    _ => fail("expected missing operator capability")
+  } noraise {
+    _ => fail("expected missing operator capability")
+  }
+  ignore(assignment)
+}
+
+///|
+async test "supervisor checks the capability advertised in the Hello frame" {
+  let directory = @fs.tmpdir(prefix="moonweave-supervisor-hello-capability")
+  let wal = directory + "/worker.wal"
+  defer {
+    @fs.remove(wal) catch {
+      _ => ()
+    }
+    @fs.remove(wal + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let control = @control.CoordinatorState::new(
+    "cluster-hello-capability", "coordinator",
+  )
+  let boot = @protocol.Incarnation::new("boot-hello-capability")
+  let required = @task.OperatorKind::Reachability.capability()
+  ignore(control.register_worker("worker", boot, [required]))
+  let assignment = control.assign(0, "worker")
+  let work = SupervisorWork::new(
+    "worker",
+    "hello-capability-session",
+    0,
+    [],
+    required_capability=required,
+  )
+  let server = @socket.TcpServer(
+    @socket.Addr::parse("127.0.0.1:0"),
+    reuse_addr=true,
+  )
+  defer server.close()
+  @async_runtime.with_timeout(10000, () => {
+    @async_runtime.with_task_group <| group => {
+      let supervisor = group.spawn() <| () => {
+        run_supervisor(server, control, [work])
+      }
+      let worker = group.spawn(allow_failure=true) <| () => {
+        let connection = @socket.Tcp::connect(server.addr)
+        run_worker(
+          connection,
+          "cluster-hello-capability",
+          "coordinator",
+          "worker",
+          boot.value(),
+          ["reachability"],
+          wal,
+          _ => (),
+        )
+      }
+      let summary = supervisor.wait()
+      assert_eq(summary.failed_workers(), 1)
+      try worker.wait() catch {
+        _ => ()
+      } noraise {
+        summary => ignore(summary)
+      }
+      ignore(assignment)
+    }
+  })
+}

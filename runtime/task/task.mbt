@@ -1,11 +1,4 @@
 ///|
-/// Built-in operators supported by the first Task execution layer.
-pub(all) enum OperatorKind {
-  Reachability
-  SecurityChain
-} derive(Debug, Eq, Compare, ToJson, FromJson)
-
-///|
 /// Lifecycle of one deterministic task. Transport and persistence adapters may
 /// drive these transitions, but cannot bypass them.
 pub(all) enum TaskPhase {
@@ -22,6 +15,8 @@ pub(all) suberror TaskError {
   EmptyTaskId
   EmptyOperatorId
   UnknownOperator(String)
+  OperatorMismatch(expected~ : String, actual~ : String)
+  OperatorContractMismatch
   InvalidPartition(Int)
   PartitionMismatch(expected~ : Int, actual~ : Int)
   InvalidEpoch(Int)
@@ -139,6 +134,12 @@ pub fn Task::new(
   }
   if operator_id.is_empty() {
     raise TaskError::EmptyOperatorId
+  }
+  if operator_id != operator.id() {
+    raise TaskError::OperatorMismatch(
+      expected=operator.id(),
+      actual=operator_id,
+    )
   }
   if partition < 0 {
     raise TaskError::InvalidPartition(partition)
@@ -409,6 +410,7 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
     frontier_digest: self.frontier.digest(),
     emitted_outputs: self.emitted_outputs,
     events,
+    operator_capability: Some(self.operator.capability()),
   }
 }
 
@@ -420,6 +422,11 @@ pub fn Task::restore(
   self : Task,
   snapshot : TaskSnapshot,
 ) -> Unit raise TaskError {
+  match snapshot.operator_capability {
+    Some(capability) if capability != self.operator.capability() =>
+      raise TaskError::OperatorContractMismatch
+    _ => ()
+  }
   if snapshot.task_id() != self.task_id ||
     snapshot.operator_id() != self.operator_id ||
     snapshot.operator() != self.operator ||
@@ -512,6 +519,7 @@ fn Task::apply_input(
         None => raise TaskError::InvalidTransition
       }
       let record = input.event()
+      self.operator.validate_payload(record.payload())
       let facts = engine.apply_json_event(
         record.id(),
         record.parents(),
@@ -528,6 +536,7 @@ fn Task::apply_input(
         None => raise TaskError::InvalidTransition
       }
       let record = input.event()
+      self.operator.validate_payload(record.payload())
       let alerts = engine.apply_json_event(
         record.id(),
         record.parents(),

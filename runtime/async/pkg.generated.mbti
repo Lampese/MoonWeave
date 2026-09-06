@@ -285,6 +285,7 @@ pub(all) suberror SupervisorPlanError {
   DuplicatePartition(Int)
   DuplicateSession(String)
   DuplicateDelta(String)
+  MissingCapability(worker~ : String, capability~ : String)
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror WalError {
@@ -752,12 +753,14 @@ pub struct SupervisorWork {
   batches : Array[@protocol.EventBatch]
   deltas : Array[@protocol.DeltaBatch]
   probe : @protocol.Probe?
+  required_capability : String?
 }
 pub fn SupervisorWork::batches(Self) -> ArrayView[@protocol.EventBatch]
 pub fn SupervisorWork::deltas(Self) -> ArrayView[@protocol.DeltaBatch]
-pub fn SupervisorWork::new(String, String, Int, Array[@protocol.EventBatch], probe? : @protocol.Probe, deltas? : Array[@protocol.DeltaBatch]) -> Self
+pub fn SupervisorWork::new(String, String, Int, Array[@protocol.EventBatch], probe? : @protocol.Probe, deltas? : Array[@protocol.DeltaBatch], required_capability? : String) -> Self
 pub fn SupervisorWork::partition(Self) -> Int
 pub fn SupervisorWork::probe(Self) -> @protocol.Probe?
+pub fn SupervisorWork::required_capability(Self) -> String?
 pub fn SupervisorWork::session_id(Self) -> String
 pub fn SupervisorWork::worker_id(Self) -> String
 

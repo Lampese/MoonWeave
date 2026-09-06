@@ -43,3 +43,43 @@ async test "job work identity replays from the journal without a checkpoint" {
   }
   assert_eq(restored.journal_offset(), offset)
 }
+
+///|
+async test "job work plan binds the registered operator capability" {
+  let directory = @fs.tmpdir(prefix="moonweave-job-capability")
+  let journal = directory + "/job.wal"
+  defer {
+    @fs.remove(journal) catch {
+      _ => ()
+    }
+    @fs.remove(journal + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let spec = @plan.JobSpec::new(
+    "capability-job",
+    "reachability",
+    1,
+    ["worker"],
+    [],
+  )
+  let store = JobStore::open(spec, journal)
+  ignore(store.assign(0, "worker", 0, 0L))
+  let wrong = SupervisorWork::new(
+    "worker",
+    "capability-session",
+    0,
+    [],
+    required_capability="operator:wrong",
+  )
+  try store.bind_work(wrong) catch {
+    JobStoreError::PlanMismatch(partition) => assert_eq(partition, 0)
+    _ => fail("expected capability plan mismatch")
+  } noraise {
+    _ => fail("expected capability plan mismatch")
+  }
+  store.close()
+}

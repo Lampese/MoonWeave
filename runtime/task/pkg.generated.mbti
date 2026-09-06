@@ -18,6 +18,8 @@ pub(all) suberror TaskError {
   EmptyTaskId
   EmptyOperatorId
   UnknownOperator(String)
+  OperatorMismatch(expected~ : String, actual~ : String)
+  OperatorContractMismatch
   InvalidPartition(Int)
   PartitionMismatch(expected~ : Int, actual~ : Int)
   InvalidEpoch(Int)
@@ -48,7 +50,18 @@ pub(all) enum OperatorKind {
   Reachability
   SecurityChain
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn OperatorKind::capability(Self) -> String
+pub fn OperatorKind::code_digest(Self) -> String
+pub fn OperatorKind::dependency_digest(Self) -> String
 pub fn OperatorKind::from_id(String) -> Self raise TaskError
+pub fn OperatorKind::id(Self) -> String
+pub fn OperatorKind::input_schema(Self) -> String
+pub fn OperatorKind::output_schema(Self) -> String
+pub fn OperatorKind::runtime_abi(Self) -> String
+pub fn OperatorKind::state_schema(Self) -> String
+pub fn OperatorKind::supports_proof(Self) -> Bool
+pub fn OperatorKind::validate_payload(Self, Json) -> Unit raise TaskError
+pub fn OperatorKind::version(Self) -> Int
 
 pub struct Task {
   task_id : String
@@ -182,6 +195,7 @@ pub(all) struct TaskSnapshot {
   frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
+  operator_capability : String?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn TaskSnapshot::emitted_outputs(Self) -> Int
 pub fn TaskSnapshot::epoch(Self) -> Int
@@ -189,6 +203,7 @@ pub fn TaskSnapshot::events(Self) -> ArrayView[@protocol.EventRecord]
 pub fn TaskSnapshot::frontier_digest(Self) -> String
 pub fn TaskSnapshot::offset(Self) -> Int64
 pub fn TaskSnapshot::operator(Self) -> OperatorKind
+pub fn TaskSnapshot::operator_capability(Self) -> String?
 pub fn TaskSnapshot::operator_id(Self) -> String
 pub fn TaskSnapshot::partition(Self) -> Int
 pub fn TaskSnapshot::task_id(Self) -> String

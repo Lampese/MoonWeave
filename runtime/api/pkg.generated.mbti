@@ -1,0 +1,272 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/runtime/api"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/reachability",
+  "moonweave/moonweave/operator/security",
+  "moonweave/moonweave/protocol",
+  "moonweave/moonweave/runtime/plan",
+  "moonweave/moonweave/runtime/task",
+}
+
+// Values
+
+// Errors
+pub(all) suberror ApiError {
+  EmptyJobId
+  EmptyOperatorId
+  InvalidOperatorVersion(Int)
+  UnsupportedOperator(String)
+  UnsupportedOperatorVersion(id~ : String, version~ : Int)
+  DuplicateOperator(String)
+  InvalidPartitionCount(Int)
+  EmptyWorkerList
+  EmptyWorkerId
+  DuplicateWorker(String)
+  EmptySinkId
+  InvalidRoute(source~ : Int, target~ : Int)
+  InvalidArtifact(String)
+  ArtifactMismatch(String)
+  SubmissionMismatch(String)
+  LocalModeUnsupported
+  InvalidEvent(String)
+  TaskFailed(String)
+  Closed
+  Cluster(String)
+  Plan(@plan.PlanError)
+} derive(Eq, @debug.Debug)
+
+// Types and methods
+pub struct ClusterConfig {
+  cluster_id : String
+  coordinator_id : String
+  storage_dir : String
+} derive(Eq, @debug.Debug)
+pub fn ClusterConfig::cluster_id(Self) -> String
+pub fn ClusterConfig::coordinator_id(Self) -> String
+pub fn ClusterConfig::new(String, String, String) -> Self raise ApiError
+pub fn ClusterConfig::storage_dir(Self) -> String
+
+pub(all) struct ClusterRunSummary {
+  plan_digest : String
+  completed_partitions : Int
+  failed_partitions : Int
+  sent_batches : Int
+  outputs : Array[Output]
+  failures : Array[String]
+} derive(Eq, @debug.Debug)
+pub fn ClusterRunSummary::completed_partitions(Self) -> Int
+pub fn ClusterRunSummary::failed_partitions(Self) -> Int
+pub fn ClusterRunSummary::failures(Self) -> ArrayView[String]
+pub fn ClusterRunSummary::outputs(Self) -> ArrayView[Output]
+pub fn ClusterRunSummary::plan_digest(Self) -> String
+pub fn ClusterRunSummary::sent_batches(Self) -> Int
+
+pub(all) struct ClusterSubmission {
+  definition : JobDefinition
+  plan_digest : String
+  operator : OperatorArtifact
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn ClusterSubmission::compile(Self) -> CompiledJob raise ApiError
+pub fn ClusterSubmission::definition(Self) -> JobDefinition
+pub fn ClusterSubmission::operator(Self) -> OperatorArtifact
+pub fn ClusterSubmission::plan_digest(Self) -> String
+
+pub struct CompiledJob {
+  definition : JobDefinition
+  spec : @plan.JobSpec
+  descriptor : OperatorDescriptor
+  plan_digest : String
+}
+pub fn CompiledJob::definition(Self) -> JobDefinition
+pub fn CompiledJob::job_id(Self) -> String
+pub fn CompiledJob::operator(Self) -> OperatorRef
+pub fn CompiledJob::operator_descriptor(Self) -> OperatorDescriptor
+pub fn CompiledJob::partition_count(Self) -> Int
+pub fn CompiledJob::partition_for_key(Self, String) -> Int
+pub fn CompiledJob::partitioning(Self) -> Partitioning
+pub fn CompiledJob::plan_digest(Self) -> String
+pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
+pub async fn CompiledJob::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
+pub fn CompiledJob::sink(Self) -> SinkSpec
+pub fn CompiledJob::submission(Self) -> ClusterSubmission
+
+pub struct Event {
+  record : @protocol.EventRecord
+} derive(Eq, @debug.Debug)
+pub fn Event::id(Self) -> @causal.EventId
+pub fn Event::key(Self) -> String
+pub fn Event::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ApiError
+pub fn Event::payload(Self) -> Json
+
+pub struct JobDefinition {
+  job_id : String
+  operator : OperatorRef
+  partition_count : Int
+  workers : Array[String]
+  routes : Array[@plan.ExchangeRoute]
+  source : SourceSpec
+  partitioning : Partitioning
+  sink : SinkSpec
+  artifact : OperatorArtifact?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobDefinition::artifact(Self) -> OperatorArtifact?
+pub fn JobDefinition::compile(Self, registry? : OperatorRegistry) -> CompiledJob raise ApiError
+pub fn JobDefinition::job_id(Self) -> String
+pub fn JobDefinition::new(String, OperatorRef) -> Self raise ApiError
+pub fn JobDefinition::operator(Self) -> OperatorRef
+pub fn JobDefinition::partition_count(Self) -> Int
+pub fn JobDefinition::partitioning(Self) -> Partitioning
+pub fn JobDefinition::routes(Self) -> ArrayView[@plan.ExchangeRoute]
+pub fn JobDefinition::run_local(Self) -> LocalRun raise ApiError
+pub fn JobDefinition::sink(Self) -> SinkSpec
+pub fn JobDefinition::source(Self) -> SourceSpec
+pub fn JobDefinition::with_artifact(Self, OperatorArtifact) -> Self
+pub fn JobDefinition::with_partition_count(Self, Int) -> Self raise ApiError
+pub fn JobDefinition::with_partitioning(Self, Partitioning) -> Self
+pub fn JobDefinition::with_routes(Self, ArrayView[@plan.ExchangeRoute]) -> Self
+pub fn JobDefinition::with_sink(Self, SinkSpec) -> Self
+pub fn JobDefinition::with_source(Self, SourceSpec) -> Self
+pub fn JobDefinition::with_workers(Self, ArrayView[String]) -> Self raise ApiError
+pub fn JobDefinition::workers(Self) -> ArrayView[String]
+
+pub(all) struct LocalProgress {
+  job_id : String
+  task_id : String
+  partition : Int
+  epoch : Int
+  offset : Int64
+  frontier_digest : String
+  emitted_outputs : Int
+  phase : LocalRunPhase
+} derive(Eq, @debug.Debug)
+pub fn LocalProgress::emitted_outputs(Self) -> Int
+pub fn LocalProgress::epoch(Self) -> Int
+pub fn LocalProgress::frontier_digest(Self) -> String
+pub fn LocalProgress::job_id(Self) -> String
+pub fn LocalProgress::offset(Self) -> Int64
+pub fn LocalProgress::partition(Self) -> Int
+pub fn LocalProgress::phase(Self) -> LocalRunPhase
+pub fn LocalProgress::task_id(Self) -> String
+
+pub struct LocalRun {
+  compiled : CompiledJob
+  task_set : @task.TaskSet
+  next_offsets : Map[Int, Int64]
+  mut closed : Bool
+}
+pub fn LocalRun::close(Self) -> Unit raise ApiError
+pub fn LocalRun::job_id(Self) -> String
+pub fn LocalRun::phase(Self) -> LocalRunPhase
+pub fn LocalRun::plan_digest(Self) -> String
+pub fn LocalRun::progress(Self) -> LocalProgress
+pub fn LocalRun::progresses(Self) -> Array[LocalProgress]
+pub fn LocalRun::submit(Self, ArrayView[Event]) -> Array[Output] raise ApiError
+
+pub(all) enum LocalRunPhase {
+  Created
+  Running
+  Draining
+  Stopped
+  Failed
+  Mixed
+} derive(Compare, Eq, @debug.Debug)
+
+pub struct OperatorArtifact {
+  reference : OperatorRef
+  code_digest : String
+  runtime_abi : String
+  target : String
+  state_schema : String
+  dependency_digest : String
+  signature : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn OperatorArtifact::code_digest(Self) -> String
+pub fn OperatorArtifact::dependency_digest(Self) -> String
+pub fn OperatorArtifact::new(OperatorRef, String, String, String, String, String, signature? : String) -> Self raise ApiError
+pub fn OperatorArtifact::reference(Self) -> OperatorRef
+pub fn OperatorArtifact::runtime_abi(Self) -> String
+pub fn OperatorArtifact::signature(Self) -> String?
+pub fn OperatorArtifact::state_schema(Self) -> String
+pub fn OperatorArtifact::target(Self) -> String
+
+pub struct OperatorDescriptor {
+  reference : OperatorRef
+  code_digest : String
+  state_schema : String
+  input_schema : String
+  output_schema : String
+  runtime_abi : String
+  target : String
+  dependency_digest : String
+  deterministic : Bool
+  supports_proof : Bool
+  operator_kind : @task.OperatorKind
+} derive(Eq, @debug.Debug)
+pub fn OperatorDescriptor::artifact(Self) -> OperatorArtifact
+pub fn OperatorDescriptor::capability(Self) -> String
+pub fn OperatorDescriptor::code_digest(Self) -> String
+pub fn OperatorDescriptor::dependency_digest(Self) -> String
+pub fn OperatorDescriptor::deterministic(Self) -> Bool
+pub fn OperatorDescriptor::input_schema(Self) -> String
+pub fn OperatorDescriptor::output_schema(Self) -> String
+pub fn OperatorDescriptor::reference(Self) -> OperatorRef
+pub fn OperatorDescriptor::runtime_abi(Self) -> String
+pub fn OperatorDescriptor::state_schema(Self) -> String
+pub fn OperatorDescriptor::supports_proof(Self) -> Bool
+pub fn OperatorDescriptor::target(Self) -> String
+pub fn OperatorDescriptor::validate_event(Self, Event) -> Unit raise ApiError
+
+pub struct OperatorRef {
+  id : String
+  version : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn OperatorRef::id(Self) -> String
+pub fn OperatorRef::new(String, Int) -> Self raise ApiError
+pub fn OperatorRef::reachability() -> Self
+pub fn OperatorRef::security_chain() -> Self
+pub fn OperatorRef::version(Self) -> Int
+
+pub struct OperatorRegistry {
+  descriptors : Map[String, OperatorDescriptor]
+}
+pub fn OperatorRegistry::builtins() -> Self
+pub fn OperatorRegistry::capabilities(Self) -> Array[String]
+pub fn OperatorRegistry::entries(Self) -> Array[OperatorDescriptor]
+pub fn OperatorRegistry::new() -> Self
+pub fn OperatorRegistry::register(Self, OperatorDescriptor) -> Unit raise ApiError
+pub fn OperatorRegistry::resolve(Self, OperatorRef) -> OperatorDescriptor raise ApiError
+pub fn OperatorRegistry::resolve_artifact(Self, OperatorArtifact) -> OperatorDescriptor raise ApiError
+
+pub(all) enum Output {
+  Reachable(@reachability.Reachable)
+  SecurityAlert(@security.SecurityAlert)
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Output::as_reachable(Self) -> @reachability.Reachable?
+pub fn Output::as_security_alert(Self) -> @security.SecurityAlert?
+pub fn Output::reachable(@reachability.Reachable) -> Self
+pub fn Output::security_alert(@security.SecurityAlert) -> Self
+
+pub(all) enum Partitioning {
+  ByKey
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Partitioning::by_key() -> Self
+
+pub(all) enum SinkSpec {
+  Discard
+  Durable(String)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SinkSpec::discard() -> Self
+pub fn SinkSpec::durable(String) -> Self raise ApiError
+
+pub(all) enum SourceSpec {
+  Events
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SourceSpec::events() -> Self
+
+// Type aliases
+
+// Traits

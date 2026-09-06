@@ -10,6 +10,7 @@ struct JobExecutionPlan {
   batches : Array[@protocol.EventBatch]
   deltas : Array[@protocol.DeltaBatch]
   probe : @protocol.Probe?
+  required_capability : String?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -17,6 +18,17 @@ fn validate_job_work_plan(
   state : @control.JobState,
   plan : JobExecutionPlan,
 ) -> JobExecutionPlan raise JobStoreError {
+  if plan.required_capability is Some(capability) && capability.is_empty() {
+    raise JobStoreError::PlanMismatch(plan.partition)
+  }
+  let expected_capability = @task.OperatorKind::from_id(state.operator_id()) catch {
+    _ => raise JobStoreError::PlanMismatch(plan.partition)
+  }
+  match plan.required_capability {
+    Some(value) if value != expected_capability.capability() =>
+      raise JobStoreError::PlanMismatch(plan.partition)
+    _ => ()
+  }
   if plan.job_id != state.job_id() ||
     plan.partition < 0 ||
     plan.partition >= state.partition_count() ||
@@ -100,7 +112,8 @@ fn install_job_work_plan(
     raise JobStoreError::PlanMismatch(plan.partition)
   }
   match plans.get(plan.partition) {
-    Some(previous) if previous.epoch > plan.epoch ||
+    Some(previous) if previous.required_capability != plan.required_capability ||
+      previous.epoch > plan.epoch ||
       (previous.epoch == plan.epoch && previous != plan) =>
       raise JobStoreError::PlanMismatch(plan.partition)
     _ => ()
@@ -125,6 +138,7 @@ fn JobStore::check_work(
     batches: work.batches().to_owned(),
     deltas: work.deltas().to_owned(),
     probe: work.probe(),
+    required_capability: work.required_capability(),
   }
   let plan = validate_job_work_plan(self.state, candidate)
   let preview = self.work_plans.copy()

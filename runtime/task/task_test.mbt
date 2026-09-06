@@ -71,6 +71,27 @@ test "task lifecycle and reachability outputs are deterministic" {
 }
 
 ///|
+test "task identity rejects an operator implementation mismatch" {
+  try
+    Task::new(
+      "mismatched-operator",
+      "security-chain",
+      OperatorKind::Reachability,
+      0,
+      0,
+    )
+  catch {
+    TaskError::OperatorMismatch(expected~, actual~) => {
+      assert_eq(expected, "reachability")
+      assert_eq(actual, "security-chain")
+    }
+    _ => fail("expected operator identity mismatch")
+  } noraise {
+    _ => fail("expected operator identity mismatch")
+  }
+}
+
+///|
 test "task routes security alerts through the same execution contract" {
   let task = Task::new(
     "task-security",
@@ -298,6 +319,26 @@ test "task snapshot preserves pending causal state and resumes deterministically
   let snapshot = task.snapshot()
   assert_eq(snapshot.offset(), 0L)
   assert_eq(snapshot.events().length(), 1)
+  assert_true(snapshot.operator_capability() is Some(_))
+
+  let forged = TaskSnapshot::{
+    ..snapshot,
+    operator_capability: Some("forged-operator-capability"),
+  }
+  let forged_restore = Task::new(
+    "snapshot-task",
+    "reachability",
+    OperatorKind::Reachability,
+    0,
+    0,
+  )
+  forged_restore.start()
+  try forged_restore.restore(forged) catch {
+    TaskError::OperatorContractMismatch => ()
+    _ => fail("expected operator contract mismatch")
+  } noraise {
+    _ => fail("expected operator contract mismatch")
+  }
 
   let restored = Task::new(
     "snapshot-task",

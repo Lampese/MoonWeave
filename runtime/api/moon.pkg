@@ -1,0 +1,18 @@
+import {
+  "moonweave/moonweave/causal",
+  "moonweave/moonweave/operator/reachability",
+  "moonweave/moonweave/operator/security",
+  "moonweave/moonweave/protocol",
+  "moonweave/moonweave/runtime/async" @runtime,
+  "moonweave/moonweave/runtime/control",
+  "moonweave/moonweave/runtime/plan",
+  "moonweave/moonweave/runtime/task",
+  "moonbitlang/async" @async_runtime,
+  "moonbitlang/async/fs",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/json",
+}
+
+supported_targets = "+native"

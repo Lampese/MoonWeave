@@ -435,6 +435,7 @@ async fn run_job_supervisor_impl(
       plan.batches,
       deltas=plan.deltas,
       probe?=plan.probe,
+      required_capability?=plan.required_capability,
     )
     frozen_works.push(frozen)
     let partition = job_store_partition(job_store, work.partition())
