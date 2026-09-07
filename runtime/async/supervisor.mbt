@@ -651,6 +651,15 @@ priv struct SupervisedAttemptResult {
 }
 
 ///|
+/// Identity learned from the Hello frame. It lets the outer task collector
+/// report an accept/read failure without inventing a Worker or partition.
+priv struct SupervisedAttemptIdentity {
+  mut worker_id : String
+  mut partition : Int?
+  mut attempts : Int
+}
+
+///|
 async fn release_supervisor_claim(
   claimed : Set[String],
   claim_lock : @async.Mutex,
@@ -694,6 +703,7 @@ async fn supervise_one_connection(
   job_store : JobStore?,
   output_manifest : JobOutputManifest?,
   drain_timeout_ms : Int,
+  identity : SupervisedAttemptIdentity,
 ) -> SupervisedAttemptResult raise FrameIoError {
   let mut attempt = 1
   for ;; {
@@ -709,6 +719,7 @@ async fn supervise_one_connection(
         error => raise FrameIoError::Message(error)
       }
       claimed_worker_id = hello.worker_id()
+      identity.worker_id = claimed_worker_id
       let work = match
         supervisor_work(works, hello.worker_id(), hello.requested_partition()) {
         Some(value) => value
@@ -718,6 +729,7 @@ async fn supervise_one_connection(
           )
       }
       claimed_partition = Some(work.partition())
+      identity.partition = claimed_partition
       let claim_key = hello.worker_id() + "#" + work.partition().to_string()
       claim_lock.acquire() catch {
         error => raise FrameIoError::Io(@debug.to_string(error))
@@ -795,9 +807,20 @@ async fn supervise_one_connection(
       Ok(summary) =>
         return { attempts: attempt, summary: Some(summary), failure: None, }
       Err(error) => {
-        release_supervisor_claim(claimed, claim_lock, claimed_id)
+        let mut claim_release_error : String? = None
+        release_supervisor_claim(claimed, claim_lock, claimed_id) catch {
+          release_error =>
+            claim_release_error = Some(@debug.to_string(release_error))
+        }
+        let reason = match claim_release_error {
+          None => @debug.to_string(error)
+          Some(release_error) =>
+            @debug.to_string(error) + "; release claim: " + release_error
+        }
         let transient = error is FrameIoError::Io(_)
-        if transient && attempt < retry_policy.max_attempts() {
+        if claim_release_error is None &&
+          transient &&
+          attempt < retry_policy.max_attempts() {
           let delay = retry_policy.backoff_ms(attempt)
           if delay > 0 {
             @async.sleep(delay) catch {
@@ -805,6 +828,7 @@ async fn supervise_one_connection(
             }
           }
           attempt += 1
+          identity.attempts = attempt
           continue
         }
         match (job_store, active_assignment) {
@@ -813,9 +837,13 @@ async fn supervise_one_connection(
               assignment.partition(),
               assignment.worker_id(),
               assignment.epoch(),
-              @debug.to_string(error),
+              reason,
             ) catch {
-              error => raise FrameIoError::JobStore(error)
+              // The failure record is best effort here. The typed result
+              // below remains authoritative for recovery and retains the
+              // Worker/partition identity even if JobStore is already
+              // terminal or concurrently reconciled.
+              _ => ()
             }
           _ => ()
         }
@@ -826,7 +854,7 @@ async fn supervise_one_connection(
             worker_id: claimed_worker_id,
             partition: claimed_partition,
             attempts: attempt,
-            reason: @debug.to_string(error),
+            reason,
           }),
         }
       }
@@ -942,7 +970,14 @@ async fn run_supervisor_impl(
     let claim_lock = @async.Mutex::Mutex()
     let accept_lock = @async.Mutex::Mutex()
     let tasks : Array[@async.Task[SupervisedAttemptResult]] = []
+    let identities : Array[SupervisedAttemptIdentity] = []
     for _ in works {
+      let identity : SupervisedAttemptIdentity = {
+        worker_id: "",
+        partition: None,
+        attempts: 1,
+      }
+      identities.push(identity)
       let task = group.spawn(allow_failure=true) <| () => {
         supervise_one_connection(
           server,
@@ -957,6 +992,7 @@ async fn run_supervisor_impl(
           job_store,
           output_manifest,
           drain_timeout_ms,
+          identity,
         )
       }
       tasks.push(task)
@@ -965,13 +1001,14 @@ async fn run_supervisor_impl(
     let mut sent_deltas = 0
     let failures : Array[SupervisorFailure] = []
     let mut retried_connections = 0
-    for task in tasks {
+    for index, task in tasks {
       let outcome : SupervisedAttemptResult? = Some(task.wait()) catch {
         error => {
+          let identity = identities[index]
           failures.push({
-            worker_id: "",
-            partition: None,
-            attempts: 1,
+            worker_id: identity.worker_id,
+            partition: identity.partition,
+            attempts: identity.attempts,
             reason: @debug.to_string(error),
           })
           None
