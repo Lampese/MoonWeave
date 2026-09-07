@@ -602,7 +602,7 @@ pub async fn DriverClient::await_completion(
   self : DriverClient,
   poll_interval_ms? : Int = 100,
   timeout_ms? : Int = 30000,
-) -> JobRunStatus {
+) -> JobRunStatus raise ApiError {
   if poll_interval_ms <= 0 || timeout_ms <= 0 {
     raise ApiError::Cluster("poll interval and timeout must be positive")
   }
@@ -615,7 +615,12 @@ pub async fn DriverClient::await_completion(
         _ => @async_runtime.sleep(poll_interval_ms)
       }
     }
-  })
+  }) catch {
+    error =>
+      raise ApiError::Cluster(
+        "Driver completion wait: " + @debug.to_string(error),
+      )
+  }
 }
 
 ///|

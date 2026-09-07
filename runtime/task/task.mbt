@@ -22,6 +22,7 @@ pub(all) suberror TaskError {
   InvalidEpoch(Int)
   InvalidOffset(Int64)
   PendingEvents(Int)
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   WrongPhase(expected~ : TaskPhase, actual~ : TaskPhase)
   InvalidTransition
   Aggregation(@aggregation.AggregationError)
@@ -121,6 +122,7 @@ pub struct Task {
   mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
+  max_state_events : Int
 }
 
 ///|
@@ -131,6 +133,7 @@ pub fn Task::new(
   partition : Int,
   epoch : Int,
   start_offset? : Int64 = 0L,
+  max_state_events? : Int = 0,
 ) -> Task raise TaskError {
   if task_id.is_empty() {
     raise TaskError::EmptyTaskId
@@ -152,6 +155,9 @@ pub fn Task::new(
   }
   if start_offset < 0L {
     raise TaskError::InvalidOffset(start_offset)
+  }
+  if max_state_events < 0 {
+    raise TaskError::StateLimitExceeded(limit=max_state_events, actual=0)
   }
   let aggregation = match operator {
     OperatorKind::KeyedSum =>
@@ -194,6 +200,7 @@ pub fn Task::new(
     aggregation,
     reachability,
     security,
+    max_state_events,
   }
 }
 
@@ -335,6 +342,22 @@ pub fn Task::pending_count(self : Task) -> Int {
     OperatorKind::KeyedSum => self.aggregation.unwrap().pending_count()
     OperatorKind::Reachability => self.reachability.unwrap().pending_count()
     OperatorKind::SecurityChain => self.security.unwrap().pending_count()
+  }
+}
+
+///|
+pub fn Task::state_event_count(self : Task) -> Int {
+  self.event_count() + self.pending_count()
+}
+
+///|
+fn Task::check_state_limit(self : Task) -> Unit raise TaskError {
+  if self.max_state_events > 0 &&
+    self.state_event_count() > self.max_state_events {
+    raise TaskError::StateLimitExceeded(
+      limit=self.max_state_events,
+      actual=self.state_event_count(),
+    )
   }
 }
 
@@ -509,6 +532,7 @@ pub fn Task::restore(
     self.partition,
     self.epoch,
     start_offset=self.start_offset,
+    max_state_events=self.max_state_events,
   )
   for event in snapshot.events() {
     let restored_outputs = candidate.apply_input(TaskInput::new(event))
@@ -658,6 +682,7 @@ fn Task::copy(self : Task) -> Task {
     aggregation: self.aggregation.map(engine => engine.copy()),
     reachability: self.reachability.map(engine => engine.copy()),
     security: self.security.map(engine => engine.copy()),
+    max_state_events: self.max_state_events,
   }
 }
 
@@ -672,9 +697,9 @@ fn Task::commit(self : Task, candidate : Task) -> Unit {
 }
 
 ///|
-/// Apply one contiguous input. A Task never advances its offset when the
-/// selected operator rejects the event, so the caller can retry or fail closed.
-pub fn Task::process(
+/// Apply one input to a private candidate. The public wrapper commits this
+/// candidate only after operator and state-limit validation succeeds.
+fn Task::process_unchecked(
   self : Task,
   offset : Int64,
   input : TaskInput,
@@ -684,9 +709,24 @@ pub fn Task::process(
   }
   self.validate_next_offset(offset)
   let outputs = self.apply_input(input)
+  self.check_state_limit()
   self.advance_offset(offset)
   self.refresh_frontier()
   self.emitted_outputs += outputs.length()
+  outputs
+}
+
+///|
+/// Apply one contiguous input atomically. A Task never advances its offset or
+/// mutates operator state when validation or the state limit rejects the event.
+pub fn Task::process(
+  self : Task,
+  offset : Int64,
+  input : TaskInput,
+) -> Array[TaskOutput] raise TaskError {
+  let candidate = self.copy()
+  let outputs = candidate.process_unchecked(offset, input)
+  self.commit(candidate)
   outputs
 }
 
@@ -715,7 +755,9 @@ pub fn Task::process_batch(
   let outputs = []
   let mut offset = batch.first_offset()
   for event in batch.events() {
-    outputs.push_iter(candidate.process(offset, TaskInput::new(event)).iter())
+    outputs.push_iter(
+      candidate.process_unchecked(offset, TaskInput::new(event)).iter(),
+    )
     offset += 1L
   }
   outputs.sort()
@@ -752,6 +794,7 @@ pub fn Task::process_delta(
   for event in delta.events() {
     outputs.push_iter(candidate.apply_input(TaskInput::new(event)).iter())
   }
+  candidate.check_state_limit()
   candidate.refresh_frontier()
   candidate.emitted_outputs += outputs.length()
   outputs.sort()

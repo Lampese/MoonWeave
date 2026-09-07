@@ -26,6 +26,7 @@ pub(all) suberror TaskError {
   InvalidEpoch(Int)
   InvalidOffset(Int64)
   PendingEvents(Int)
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   WrongPhase(expected~ : TaskPhase, actual~ : TaskPhase)
   InvalidTransition
   Aggregation(@aggregation.AggregationError)
@@ -80,6 +81,7 @@ pub struct Task {
   mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
+  max_state_events : Int
 }
 pub fn Task::adopt_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
 pub fn Task::drain(Self) -> Unit raise TaskError
@@ -89,7 +91,7 @@ pub fn Task::fail(Self) -> Unit
 pub fn Task::from_assignment(String, String, OperatorKind, @protocol.AssignmentSpec) -> Self raise TaskError
 pub fn Task::from_spec(TaskSpec) -> Self raise TaskError
 pub fn Task::frontier(Self) -> @causal.Frontier
-pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64) -> Self raise TaskError
+pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
 pub fn Task::offset(Self) -> Int64
 pub fn Task::operator(Self) -> OperatorKind
 pub fn Task::operator_id(Self) -> String
@@ -105,6 +107,7 @@ pub fn Task::restore(Self, TaskSnapshot) -> Unit raise TaskError
 pub fn Task::snapshot(Self) -> TaskSnapshot raise TaskError
 pub fn Task::start(Self) -> Unit raise TaskError
 pub fn Task::start_offset(Self) -> Int64
+pub fn Task::state_event_count(Self) -> Int
 pub fn Task::stop(Self) -> Unit raise TaskError
 pub fn Task::task_id(Self) -> String
 pub fn Task::validate_assignment(Self, @protocol.Assignment) -> Unit raise TaskError

@@ -273,6 +273,7 @@ fn OperatorDescriptor::create_task(
   partition : Int,
   epoch : Int,
   start_offset : Int64,
+  max_state_events : Int,
 ) -> @task.Task raise ApiError {
   self.validate()
   @task.Task::new(
@@ -282,6 +283,7 @@ fn OperatorDescriptor::create_task(
     partition,
     epoch,
     start_offset~,
+    max_state_events~,
   ) catch {
     error => raise ApiError::TaskFailed(@debug.to_string(error))
   }

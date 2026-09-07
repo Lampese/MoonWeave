@@ -946,6 +946,7 @@ pub async fn CompiledJob::run_worker_node(
     partition,
     config.epoch,
     config.start_offset,
+    self.definition.max_state_events.unwrap_or(0),
   )
   let capabilities = [
     self.definition.operator.id(),

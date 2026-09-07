@@ -220,6 +220,7 @@ pub async fn CompiledJob::run_local_cluster(
         partition,
         assignment.epoch(),
         assignment.start_offset(),
+        self.definition.max_state_events.unwrap_or(0),
       ) catch {
         error => raise ApiError::TaskFailed(@debug.to_string(error))
       }

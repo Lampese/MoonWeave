@@ -37,6 +37,7 @@ pub(all) suberror ApiError {
   InvalidEvent(String)
   EmptyKey
   InvalidWindowSize(Int)
+  InvalidStateLimit(Int)
   InvalidEndpoint(String)
   InvalidPort(Int)
   InvalidWorkerAssignment(String)
@@ -182,7 +183,7 @@ pub struct DriverClient {
   operation_lock : @moonbitlang/async.Mutex
   mut submitted : JobSubmission?
 }
-pub async fn DriverClient::await_completion(Self, poll_interval_ms? : Int, timeout_ms? : Int) -> JobRunStatus
+pub async fn DriverClient::await_completion(Self, poll_interval_ms? : Int, timeout_ms? : Int) -> JobRunStatus raise ApiError
 pub async fn DriverClient::cancel(Self) -> JobRunStatus raise ApiError
 pub fn DriverClient::close(Self) -> Unit
 pub async fn DriverClient::command(Self, JobCommand) -> JobRunStatus raise ApiError
@@ -313,10 +314,12 @@ pub struct JobDefinition {
   partitioning : Partitioning
   sink : SinkSpec
   artifact : OperatorArtifact?
+  max_state_events : Int?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobDefinition::artifact(Self) -> OperatorArtifact?
 pub fn JobDefinition::compile(Self, registry? : OperatorRegistry) -> CompiledJob raise ApiError
 pub fn JobDefinition::job_id(Self) -> String
+pub fn JobDefinition::max_state_events(Self) -> Int?
 pub fn JobDefinition::new(String, OperatorRef) -> Self raise ApiError
 pub fn JobDefinition::operator(Self) -> OperatorRef
 pub fn JobDefinition::partition_count(Self) -> Int
@@ -332,6 +335,7 @@ pub fn JobDefinition::with_partitioning(Self, Partitioning) -> Self
 pub fn JobDefinition::with_routes(Self, ArrayView[@plan.ExchangeRoute]) -> Self
 pub fn JobDefinition::with_sink(Self, SinkSpec) -> Self
 pub fn JobDefinition::with_source(Self, SourceSpec) -> Self
+pub fn JobDefinition::with_state_limit(Self, Int) -> Self raise ApiError
 pub fn JobDefinition::with_workers(Self, ArrayView[String]) -> Self raise ApiError
 pub fn JobDefinition::workers(Self) -> ArrayView[String]
 
@@ -370,6 +374,7 @@ pub fn JobSubmission::compile(Self) -> CompiledJob raise ApiError
 pub fn JobSubmission::job(Self) -> ClusterSubmission
 pub fn JobSubmission::new(String, ClusterSubmission) -> Self raise ApiError
 pub fn JobSubmission::run_local(Self) -> LocalJobHandle raise ApiError
+pub async fn JobSubmission::run_remote(Self, DriverConfig) -> RemoteJobHandle raise ApiError
 pub fn JobSubmission::submission_id(Self) -> String
 
 pub struct KeyBy[T] {
@@ -610,6 +615,20 @@ pub(all) enum RecoveryCapability {
   Replayable
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn RecoveryCapability::replayable() -> Self
+
+pub struct RemoteJobHandle {
+  submission : JobSubmission
+  client : DriverClient
+  mut last_status : JobRunStatus
+}
+pub async fn RemoteJobHandle::await_completion(Self, poll_interval_ms? : Int, timeout_ms? : Int) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::cancel(Self) -> JobRunStatus raise ApiError
+pub fn RemoteJobHandle::close(Self) -> Unit
+pub async fn RemoteJobHandle::drain(Self) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::refresh(Self) -> JobRunStatus raise ApiError
+pub fn RemoteJobHandle::status(Self) -> JobRunStatus
+pub fn RemoteJobHandle::submission(Self) -> JobSubmission
 
 pub struct RunHandle[T] {
   mut status : RunStatus

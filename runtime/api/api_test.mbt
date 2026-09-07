@@ -247,6 +247,35 @@ test "local runner executes the same causal Task semantics" {
 }
 
 ///|
+test "job state limits are carried into local execution and fail closed" {
+  let job = JobDefinition::new("limited-job", OperatorRef::reachability()).with_state_limit(
+    1,
+  )
+  assert_eq(job.max_state_events(), Some(1))
+  let run = job.run_local()
+  let first = Event::new(
+    @causal.EventId::new("limited-api", 0),
+    [],
+    "key",
+    Json::object({ "source": Json::string("A"), "target": Json::string("B") }),
+  )
+  let second = Event::new(
+    @causal.EventId::new("limited-api", 1),
+    [],
+    "key",
+    Json::object({ "source": Json::string("B"), "target": Json::string("C") }),
+  )
+  try run.submit([first, second]) catch {
+    ApiError::TaskFailed(reason) =>
+      assert_true(reason.contains("StateLimitExceeded"))
+    _ => fail("expected local state limit rejection")
+  } noraise {
+    _ => fail("expected local state limit rejection")
+  }
+  assert_eq(run.progress().offset(), -1L)
+}
+
+///|
 test "local runner supports deterministic multi-partition key routing" {
   let compiled = JobDefinition::new("local-job", OperatorRef::reachability())
     .with_partition_count(2)

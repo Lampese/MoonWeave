@@ -20,6 +20,7 @@ pub(all) suberror ApiError {
   InvalidEvent(String)
   EmptyKey
   InvalidWindowSize(Int)
+  InvalidStateLimit(Int)
   InvalidEndpoint(String)
   InvalidPort(Int)
   InvalidWorkerAssignment(String)
@@ -129,6 +130,7 @@ pub struct JobDefinition {
   partitioning : Partitioning
   sink : SinkSpec
   artifact : OperatorArtifact?
+  max_state_events : Int?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -149,7 +151,21 @@ pub fn JobDefinition::new(
     partitioning: Partitioning::ByKey,
     sink: SinkSpec::Discard,
     artifact: None,
+    max_state_events: None,
   }
+}
+
+///|
+/// Bound the number of operator and causally pending events retained by each
+/// Task. Leave unset only for an intentionally unbounded local experiment.
+pub fn JobDefinition::with_state_limit(
+  self : JobDefinition,
+  max_events : Int,
+) -> JobDefinition raise ApiError {
+  if max_events <= 0 {
+    raise ApiError::InvalidStateLimit(max_events)
+  }
+  { ..self, max_state_events: Some(max_events), }
 }
 
 ///|
@@ -271,6 +287,11 @@ pub fn JobDefinition::sink(self : JobDefinition) -> SinkSpec {
 ///|
 pub fn JobDefinition::artifact(self : JobDefinition) -> OperatorArtifact? {
   self.artifact
+}
+
+///|
+pub fn JobDefinition::max_state_events(self : JobDefinition) -> Int? {
+  self.max_state_events
 }
 
 ///|
