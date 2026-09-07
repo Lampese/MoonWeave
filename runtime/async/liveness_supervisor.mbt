@@ -60,20 +60,12 @@ pub async fn run_liveness_scan(
         _ => None
       }
     })
-  for worker_id in stale {
-    guard control.worker(worker_id) is Some(worker) else { continue }
-    if worker.lifecycle() is @control.WorkerLifecycle::Active {
-      match store {
-        Some(durable) =>
-          durable.mark_suspect(worker_id) catch {
-            error => raise FrameIoError::CoordinatorStore(error)
-          }
-        None =>
-          control.set_suspect(worker_id) catch {
-            error => raise FrameIoError::Coordinator(error)
-          }
-      }
-    }
+  // A Job-backed scan needs a durable CoordinatorStore for its two-store
+  // recovery intent. Reject this topology before touching liveness state.
+  if store is None && job_store is Some(_) && !stale.is_empty() {
+    raise FrameIoError::Handler(
+      "JobStore liveness recovery requires a durable CoordinatorStore",
+    )
   }
   let replacements = policy.replacement_workers()
   let actions = []
@@ -89,7 +81,36 @@ pub async fn run_liveness_scan(
       }
     }
     match replacement {
-      None => ()
+      None => {
+        // A terminal Job must remain an immutable record. In particular, do
+        // not turn its Workers into Suspect merely because their last
+        // heartbeat predates the terminal transition.
+        let terminal = match job_store {
+          Some(job) =>
+            match job.phase() {
+              @control.JobPhase::Succeeded
+              | @control.JobPhase::Failed
+              | @control.JobPhase::Cancelled => true
+              _ => false
+            }
+          None => false
+        }
+        if terminal {
+          continue
+        }
+        if worker.lifecycle() is @control.WorkerLifecycle::Active {
+          match store {
+            Some(durable) =>
+              durable.mark_suspect(worker_id) catch {
+                error => raise FrameIoError::CoordinatorStore(error)
+              }
+            None =>
+              control.set_suspect(worker_id) catch {
+                error => raise FrameIoError::Coordinator(error)
+              }
+          }
+        }
+      }
       Some(replacement_id) =>
         match (store, job_store) {
           (Some(durable), Some(job)) => {
@@ -105,19 +126,6 @@ pub async fn run_liveness_scan(
                 partition.phase() == @control.JobPartitionPhase::Unassigned
               }) {
               continue
-            }
-            for partition in old_partitions {
-              if partition.phase() == @control.JobPartitionPhase::Running ||
-                partition.phase() == @control.JobPartitionPhase::Draining {
-                job.fail_partition(
-                  partition.partition(),
-                  partition.worker_id(),
-                  partition.epoch(),
-                  "Worker liveness timeout",
-                ) catch {
-                  error => raise FrameIoError::JobStore(error)
-                }
-              }
             }
             ignore(
               recover_worker_leases(
@@ -145,6 +153,7 @@ pub async fn run_liveness_scan(
             actions.push(worker_id)
           }
           (None, Some(_)) =>
+            // This combination is rejected before the scan mutates state.
             raise FrameIoError::Handler(
               "JobStore liveness recovery requires a durable CoordinatorStore",
             )

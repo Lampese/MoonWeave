@@ -229,6 +229,7 @@ pub fn JobState::reassign(Self, Int, String, Int, Int64) -> JobPartition raise J
 pub fn JobState::reassign_many(Self, ArrayView[JobReassignment]) -> Array[JobPartition] raise JobError
 pub fn JobState::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobError
 pub fn JobState::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobError
+pub fn JobState::recover_many(Self, ArrayView[JobReassignment], String) -> Array[JobPartition] raise JobError
 pub fn JobState::snapshot(Self) -> JobSnapshot
 pub fn JobState::spec(Self) -> @plan.JobSpec
 pub fn JobState::start(Self) -> Unit raise JobError

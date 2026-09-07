@@ -223,6 +223,16 @@ fn apply_job_entry(
         },
       )
     }
+    "recover_many" => {
+      guard entry.reassignments is Some(reassignments) else {
+        raise JobStoreError::Malformed
+      }
+      ignore(
+        state.recover_many(reassignments[:], entry.reason) catch {
+          error => raise JobStoreError::Job(error)
+        },
+      )
+    }
     "fail" =>
       state.fail(entry.reason) catch {
         error => raise JobStoreError::Job(error)
@@ -907,6 +917,31 @@ async fn JobStore::reconcile_reassign_many_unlocked(
   self.append_entry(entry)
   ignore(
     self.state.reassign_many(copied[:]) catch {
+      error => raise JobStoreError::Job(error)
+    },
+  )
+  assignments
+}
+
+///|
+async fn JobStore::reconcile_recover_many_unlocked(
+  self : JobStore,
+  reassignments : ArrayView[@control.JobReassignment],
+  reason : String,
+) -> Array[@control.JobPartition] raise JobStoreError {
+  let copied = reassignments.to_owned()
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("recover_many"),
+    reason,
+    reassignments: Some(copied),
+  }
+  let preview = self.preview_state()
+  let assignments = preview.recover_many(copied[:], reason) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.recover_many(copied[:], reason) catch {
       error => raise JobStoreError::Job(error)
     },
   )

@@ -348,16 +348,6 @@ async fn SourceBackedExecution::recover_live_failures(
       return false
     }
   }
-  for assignment in owned {
-    self.job_store.fail_partition(
-      assignment.partition(),
-      assignment.worker_id(),
-      assignment.epoch(),
-      "live Worker transport disconnected",
-    ) catch {
-      error => raise live_execution_error("record live failed lease", error)
-    }
-  }
   ignore(
     @runtime.recover_worker_leases(
       self.coordinator,

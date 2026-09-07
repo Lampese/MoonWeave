@@ -75,3 +75,29 @@ test "multi-lease reassignment preserves the Job drain phase" {
     moved.all(partition => partition.phase() == JobPartitionPhase::Draining),
   )
 }
+
+///|
+test "multi-lease recovery fences running partitions before replacement" {
+  let state = JobState::new(
+    @plan.JobSpec::new(
+      "recover-many",
+      "reachability",
+      2,
+      ["worker-a", "worker-b"],
+      [],
+    ),
+  )
+  ignore(state.assign(0, "worker-a", 0, 0L))
+  ignore(state.assign(1, "worker-a", 0, 0L))
+  state.start()
+  let moved = state.recover_many(
+    [
+      JobReassignment::new(0, "worker-b", 1, 0L),
+      JobReassignment::new(1, "worker-b", 1, 0L),
+    ],
+    "Worker liveness timeout",
+  )
+  assert_eq(moved.map(value => value.worker_id()), ["worker-b", "worker-b"])
+  assert_eq(moved.map(value => value.epoch()), [1, 1])
+  assert_true(moved.all(value => value.phase() == JobPartitionPhase::Running))
+}

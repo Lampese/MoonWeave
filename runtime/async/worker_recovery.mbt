@@ -198,7 +198,9 @@ fn check_worker_recovery(
         partition.start_offset() != target.start_offset {
         raise ReconciliationError::AssignmentMismatch(target.partition)
       }
-      if partition.phase() != @control.JobPartitionPhase::Failed {
+      if partition.phase() != @control.JobPartitionPhase::Running &&
+        partition.phase() != @control.JobPartitionPhase::Draining &&
+        partition.phase() != @control.JobPartitionPhase::Failed {
         raise ReconciliationError::PhaseConflict(target.partition)
       }
     } else {
@@ -224,14 +226,6 @@ fn check_worker_recovery(
       work.required_capability is Some(capability) &&
       !replacement.capabilities().contains(capability) {
       raise ReconciliationError::IdentityMismatch
-    }
-  }
-  if job_pending {
-    let preview = job.preview_state() catch {
-      error => raise ReconciliationError::JobStore(error)
-    }
-    ignore(preview.reassign_many(worker_recovery_reassignments(plan))) catch {
-      error => raise ReconciliationError::JobStore(JobStoreError::Job(error))
     }
   }
   (coordinator_pending, job_pending)
@@ -265,7 +259,10 @@ async fn apply_worker_recovery(
   }
   if job_pending {
     ignore(
-      job.reconcile_reassign_many_unlocked(worker_recovery_reassignments(plan)),
+      job.reconcile_recover_many_unlocked(
+        worker_recovery_reassignments(plan),
+        "Worker recovery",
+      ),
     ) catch {
       error => raise ReconciliationError::JobStore(error)
     }

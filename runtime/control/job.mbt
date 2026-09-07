@@ -742,6 +742,77 @@ pub fn JobState::reassign_many(
 }
 
 ///|
+/// Atomically fence a set of live leases in the Job state and install their
+/// replacements. This is the recovery form used by the cross-store intent;
+/// it closes the crash window between marking partitions failed and moving the
+/// corresponding Coordinator leases.
+pub fn JobState::recover_many(
+  self : JobState,
+  reassignments : ArrayView[JobReassignment],
+  reason : String,
+) -> Array[JobPartition] raise JobError {
+  if reason.is_empty() {
+    raise JobError::EmptyReason
+  }
+  if self.phase != JobPhase::Running && self.phase != JobPhase::Draining {
+    raise JobError::InvalidTransition(
+      expected=JobPhase::Running,
+      actual=self.phase,
+    )
+  }
+  let preview = JobState::from_snapshot(self.snapshot())
+  let seen : Set[Int] = Set([])
+  for item in reassignments {
+    if !seen.add_and_check(item.partition) {
+      raise JobError::AssignmentConflict(item.partition)
+    }
+    let current = preview.checked_partition(item.partition)
+    if current.phase != JobPartitionPhase::Running &&
+      current.phase != JobPartitionPhase::Draining &&
+      current.phase != JobPartitionPhase::Failed {
+      raise JobError::AssignmentConflict(item.partition)
+    }
+    if current.phase != JobPartitionPhase::Failed {
+      preview.fail_partition(
+        item.partition,
+        current.worker_id,
+        current.epoch,
+        reason,
+      )
+    }
+    ignore(
+      preview.reassign(
+        item.partition,
+        item.worker_id,
+        item.epoch,
+        item.start_offset,
+      ),
+    )
+  }
+  let result : Array[JobPartition] = []
+  for item in reassignments {
+    let current = self.checked_partition(item.partition)
+    if current.phase != JobPartitionPhase::Failed {
+      self.fail_partition(
+        item.partition,
+        current.worker_id,
+        current.epoch,
+        reason,
+      )
+    }
+    result.push(
+      self.reassign(
+        item.partition,
+        item.worker_id,
+        item.epoch,
+        item.start_offset,
+      ),
+    )
+  }
+  result
+}
+
+///|
 /// Mark one partition stopped after its pending causal work has drained.
 pub fn JobState::stop_partition(
   self : JobState,

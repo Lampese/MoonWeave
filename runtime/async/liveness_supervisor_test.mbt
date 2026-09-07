@@ -140,10 +140,15 @@ async test "durable liveness recovery moves Job and Coordinator leases together"
   job.start()
   coordinator.record_heartbeat("worker-a", old, 5L)
   let policy = LivenessPolicy::new(10L, 1, ["worker-b"])
-  assert_eq(
-    run_durable_liveness_scan(coordinator, 15L, policy, job_store=job),
-    ["worker-a"],
-  )
+  let actions = run_durable_liveness_scan(
+    coordinator,
+    15L,
+    policy,
+    job_store=job,
+  ) catch {
+    error => fail("liveness recovery: " + @debug.to_string(error))
+  }
+  assert_eq(actions, ["worker-a"])
   assert_eq(
     coordinator.snapshot().assignments().map(value => value.worker_id()),
     ["worker-b", "worker-b"],
@@ -156,4 +161,109 @@ async test "durable liveness recovery moves Job and Coordinator leases together"
   let replayed = reconcile_job_coordinator(coordinator, job)
   assert_eq(replayed.recovered_transactions(), 0)
   assert_eq(replayed.repaired_transactions(), 0)
+}
+
+///|
+async test "liveness recovery rejects an invalid store combination without mutation" {
+  let directory = @fs.tmpdir(prefix="moonweave-liveness-store-mismatch")
+  let coordinator = @control.CoordinatorState::new(
+    "liveness-store-mismatch-cluster", "coordinator",
+  )
+  let spec = @plan.JobSpec::new(
+    "liveness-store-mismatch-job",
+    "reachability",
+    1,
+    ["worker-a", "worker-b"],
+    [],
+  )
+  let job = JobStore::open(spec, directory + "/job.wal")
+  defer {
+    job.close()
+    @fs.rmdir(directory, recursive=true) catch {
+      _ => ()
+    }
+  }
+  let old = @protocol.Incarnation::new("store-mismatch-old")
+  let replacement = @protocol.Incarnation::new("store-mismatch-replacement")
+  ignore(coordinator.register_worker("worker-a", old, []))
+  ignore(coordinator.register_worker("worker-b", replacement, []))
+  let assignment = coordinator.assign(0, "worker-a")
+  ignore(job.assign(0, "worker-a", assignment.epoch(), 0L))
+  job.start()
+  coordinator.record_heartbeat("worker-a", old, 1L)
+  let before_coordinator = coordinator.snapshot()
+  let before_job = job.snapshot()
+  let job_offset = job.journal_offset()
+  try
+    run_liveness_scan(
+      coordinator,
+      None,
+      11L,
+      LivenessPolicy::new(10L, 1, ["worker-b"]),
+      job_store=job,
+    )
+  catch {
+    FrameIoError::Handler(message) =>
+      assert_eq(
+        message, "JobStore liveness recovery requires a durable CoordinatorStore",
+      )
+    error =>
+      fail("expected invalid store combination: " + @debug.to_string(error))
+  } noraise {
+    _ => fail("invalid store combination was accepted")
+  }
+  assert_eq(coordinator.snapshot(), before_coordinator)
+  assert_eq(job.snapshot(), before_job)
+  assert_eq(job.journal_offset(), job_offset)
+}
+
+///|
+async test "terminal Job liveness scan leaves the Worker lifecycle unchanged" {
+  let directory = @fs.tmpdir(prefix="moonweave-liveness-terminal")
+  let coordinator = CoordinatorStore::open(
+    "liveness-terminal-cluster",
+    "coordinator",
+    directory + "/coordinator.wal",
+  )
+  let spec = @plan.JobSpec::new(
+    "liveness-terminal-job",
+    "reachability",
+    1,
+    ["worker-a", "worker-b"],
+    [],
+  )
+  let job = JobStore::open(spec, directory + "/job.wal")
+  defer {
+    coordinator.close()
+    job.close()
+    @fs.rmdir(directory, recursive=true) catch {
+      _ => ()
+    }
+  }
+  let old = @protocol.Incarnation::new("terminal-old")
+  let replacement = @protocol.Incarnation::new("terminal-replacement")
+  ignore(coordinator.register_worker("worker-a", old, []))
+  ignore(coordinator.register_worker("worker-b", replacement, []))
+  let assignment = coordinator.assign(0, "worker-a")
+  ignore(job.assign(0, "worker-a", assignment.epoch(), 0L))
+  job.start()
+  job.fail("terminal test")
+  coordinator.record_heartbeat("worker-a", old, 1L)
+  let before_coordinator = coordinator.snapshot()
+  let before_job = job.snapshot()
+  let coordinator_offset = coordinator.journal_offset()
+  let job_offset = job.journal_offset()
+  assert_eq(
+    run_durable_liveness_scan(
+      coordinator,
+      11L,
+      LivenessPolicy::new(10L, 1, []),
+      job_store=job,
+    ),
+    [],
+  )
+  assert_eq(coordinator.snapshot(), before_coordinator)
+  assert_eq(job.snapshot(), before_job)
+  assert_eq(coordinator.journal_offset(), coordinator_offset)
+  assert_eq(job.journal_offset(), job_offset)
 }
