@@ -83,3 +83,60 @@ async test "job work plan binds the registered operator capability" {
   }
   store.close()
 }
+
+///|
+async test "job work plan accepts append-only source growth" {
+  let directory = @fs.tmpdir(prefix="moonweave-job-plan-growth")
+  let journal = directory + "/job.wal"
+  defer {
+    @fs.remove(journal) catch {
+      _ => ()
+    }
+    @fs.remove(journal + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let spec = @plan.JobSpec::new("growing-job", "reachability", 1, ["worker"], [])
+  let store = JobStore::open(spec, journal)
+  ignore(store.assign(0, "worker", 0, 0L))
+  let first = @protocol.EventBatch::new(0, 0, 0L, [
+    @protocol.EventRecord::new(
+      @causal.EventId::new("growth", 0),
+      [],
+      "key",
+      Json::string("first"),
+    ),
+  ])
+  let second = @protocol.EventBatch::new(0, 0, 1L, [
+    @protocol.EventRecord::new(
+      @causal.EventId::new("growth", 1),
+      [],
+      "key",
+      Json::string("second"),
+    ),
+  ])
+  let initial = SupervisorWork::new("worker", "initial", 0, [first])
+  store.bind_work(initial, append_only=true)
+  let initial_offset = store.journal_offset()
+  let extended = SupervisorWork::new("worker", "extended", 0, [first, second])
+  store.start()
+  store.drain()
+  store.bind_work(extended, append_only=true)
+  assert_true(store.journal_offset() > initial_offset)
+  store.close()
+
+  let restored = JobStore::open(spec, journal)
+  defer restored.close()
+  assert_eq(restored.work_plans[0].batches, [first, second])
+  try
+    restored.bind_work(SupervisorWork::new("worker", "rewritten", 0, [second]))
+  catch {
+    JobStoreError::PlanMismatch(partition) => assert_eq(partition, 0)
+    _ => fail("expected append-only plan rejection")
+  } noraise {
+    _ => fail("expected append-only plan rejection")
+  }
+}

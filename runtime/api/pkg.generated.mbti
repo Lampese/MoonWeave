@@ -235,6 +235,7 @@ pub fn DriverControlConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
 pub struct DriverControlListener {
   config : DriverControlConfig
   server : @socket.TcpServer
+  mut active_requests : Int
 }
 pub async fn DriverControlListener::bind(DriverControlConfig) -> Self raise ApiError
 pub fn DriverControlListener::close(Self) -> Unit
@@ -247,8 +248,12 @@ pub struct DriverCoordinator {
   data_listener : CoordinatorListener
   control_listener : DriverControlListener
   store : DriverStore
-  execution_lock : @moonbitlang/async.Mutex
+  command_lock : @moonbitlang/async.Mutex
   mut execution : CoordinatorNodeSummary?
+  mut live_execution : SourceBackedExecution?
+  mut live_task : @moonbitlang/async.Task[Result[CoordinatorNodeSummary, String]]?
+  mut running : Bool
+  mut closed : Bool
 }
 pub async fn DriverCoordinator::bind(CoordinatorNodeConfig, DriverControlConfig, DriverStore) -> Self raise ApiError
 pub fn DriverCoordinator::close(Self) -> Unit
@@ -687,6 +692,16 @@ pub fn[T] Source::from_array(ArrayView[T]) -> Self[T]
 pub fn[T] Source::records(Self[T]) -> ArrayView[T]
 pub fn[T] Source::run(Self[T], Sink[T]) -> RunHandle[T]
 pub fn[T] Source::stream(Self[T]) -> Stream[T]
+
+pub struct SourceBackedExecution {
+  listener : CoordinatorListener
+  job : CompiledJob
+  coordinator : @moonweave/moonweave/runtime/async.CoordinatorStore
+  job_store : @moonweave/moonweave/runtime/async.JobStore
+  source : @moonweave/moonweave/runtime/async.SourceBackedJob
+  output_manifest : @moonweave/moonweave/runtime/async.JobOutputManifest?
+  mut closed : Bool
+}
 
 pub(all) enum SourceSpec {
   Events

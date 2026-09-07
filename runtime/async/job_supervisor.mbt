@@ -153,9 +153,13 @@ async fn wait_job_drain(
   coordinator : CoordinatorStore?,
   output_manifest : JobOutputManifest?,
   maximum_frame_bytes : Int,
+  read_next? : async () -> @protocol.Frame raise FrameIoError,
 ) -> Unit raise FrameIoError {
   for ;; {
-    let frame = read_frame(connection, maximum_frame_bytes~)
+    let frame = match read_next {
+      None => read_frame(connection, maximum_frame_bytes~)
+      Some(read) => read()
+    }
     session.accept_frame(frame) catch {
       error => raise FrameIoError::Session(error)
     }
@@ -265,6 +269,7 @@ async fn confirm_job_drain(
   target_offset : Int64,
   maximum_frame_bytes : Int,
   timeout_ms : Int,
+  read_next? : async () -> @protocol.Frame raise FrameIoError,
 ) -> Unit raise FrameIoError {
   job.drain_partition(
     assignment.partition(),
@@ -293,8 +298,16 @@ async fn confirm_job_drain(
     try {
       write_frame(connection, frame, maximum_frame_bytes~)
       wait_job_drain(
-        connection, control, worker, assignment, session, job, coordinator, output_manifest,
+        connection,
+        control,
+        worker,
+        assignment,
+        session,
+        job,
+        coordinator,
+        output_manifest,
         maximum_frame_bytes,
+        read_next?,
       )
       Ok(())
     } catch {

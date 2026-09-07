@@ -51,6 +51,8 @@ pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorSto
 
 pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> SupervisorRunSummary raise FrameIoError
 
+pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> LiveSupervisorSummary raise FrameIoError
+
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
 pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?, LivenessPolicy) -> Unit raise FrameIoError
@@ -650,6 +652,23 @@ pub async fn JobStore::stop_partition(Self, Int, String, Int, Int) -> Unit raise
 
 type JobStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+type LiveJobControl
+
+type LiveJobPhase derive(Eq)
+
+pub(all) struct LiveSupervisorSummary {
+  completed_partitions : Int
+  failed_partitions : Int
+  sent_batches : Int
+  sent_deltas : Int
+  failures : Array[SupervisorFailure]
+} derive(Eq, @debug.Debug)
+pub fn LiveSupervisorSummary::completed_partitions(Self) -> Int
+pub fn LiveSupervisorSummary::failed_partitions(Self) -> Int
+pub fn LiveSupervisorSummary::failures(Self) -> ArrayView[SupervisorFailure]
+pub fn LiveSupervisorSummary::sent_batches(Self) -> Int
+pub fn LiveSupervisorSummary::sent_deltas(Self) -> Int
+
 pub struct LivenessPolicy {
   heartbeat_timeout_ms : Int64
   scan_interval_ms : Int
@@ -706,6 +725,29 @@ pub fn RoutedIngress::event(Self) -> @protocol.EventRecord
 pub fn RoutedIngress::offset(Self) -> Int64
 pub fn RoutedIngress::partition(Self) -> Int
 pub fn RoutedIngress::worker_id(Self) -> String
+
+pub struct SourceBackedJob {
+  source : SourceLog
+  plan : @plan.JobSpec
+  coordinator : CoordinatorStore
+  job_store : JobStore
+  required_capability : String?
+  ingress_lock : @moonbitlang/async.Mutex
+  lifecycle : LiveJobControl
+  mut failed : Bool
+  mut closed : Bool
+}
+pub async fn SourceBackedJob::cancel(Self) -> Unit raise FrameIoError
+pub fn SourceBackedJob::close(Self) -> Unit
+pub fn SourceBackedJob::coordinator(Self) -> CoordinatorStore
+pub fn SourceBackedJob::event_count(Self) -> Int
+pub async fn SourceBackedJob::ingest(Self, @protocol.EventRecord) -> Int64 raise FrameIoError
+pub async fn SourceBackedJob::ingest_all(Self, ArrayView[@protocol.EventRecord]) -> Unit raise FrameIoError
+pub fn SourceBackedJob::job_store(Self) -> JobStore
+pub async fn SourceBackedJob::open(String, @plan.JobSpec, CoordinatorStore, JobStore, required_capability? : String) -> Self raise FrameIoError
+pub fn SourceBackedJob::plan(Self) -> @plan.JobSpec
+pub async fn SourceBackedJob::refresh_work_plans(Self) -> Unit raise FrameIoError
+pub async fn SourceBackedJob::seal(Self) -> Unit raise FrameIoError
 
 type SourceEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 

@@ -412,6 +412,7 @@ pub fn DriverControlConfig::advertised_endpoint(
 pub struct DriverControlListener {
   config : DriverControlConfig
   server : @socket.TcpServer
+  mut active_requests : Int
 }
 
 ///|
@@ -427,7 +428,7 @@ pub async fn DriverControlListener::bind(
     error =>
       raise ApiError::Cluster("bind Driver control: " + @debug.to_string(error))
   }
-  { config, server, }
+  { config, server, active_requests: 0, }
 }
 
 ///|
@@ -516,11 +517,12 @@ fn driver_status_from_api(status : JobRunStatus) -> @protocol.DriverStatus {
 ///|
 async fn serve_driver_connection(
   connection : @socket.Tcp,
-  cluster_id : String,
-  coordinator_id : String,
+  listener : DriverControlListener,
   handler : async (JobCommand) -> Result[JobRunStatus, String],
 ) -> Unit {
   defer connection.close()
+  let cluster_id = listener.config.cluster_id
+  let coordinator_id = listener.config.coordinator_id
   let first = @runtime.read_frame(connection)
   match first.kind() {
     @protocol.FrameKind::DriverSubmit => ()
@@ -562,41 +564,47 @@ async fn serve_driver_connection(
   let mut frame = first
   let mut inbound_value = inbound
   for ;; {
-    let result = if frame.message_id() == last_message_id {
-      last_result
-    } else {
-      try {
-        let command = driver_command_from_wire(inbound_value)
-        if !bound && !(command is JobCommand::Submit(_)) {
-          raise ApiError::UnknownSubmission("submit first")
-        }
-        match handler(command) {
-          Ok(status) => {
-            if command is JobCommand::Submit(_) {
-              bound = true
-            }
-            Ok(driver_status_from_api(status))
-          }
-          Err(reason) => Err(reason)
-        }
-      } catch {
-        error => Err(@debug.to_string(error))
+    listener.active_requests += 1
+    {
+      defer {
+        listener.active_requests -= 1
       }
+      let result = if frame.message_id() == last_message_id {
+        last_result
+      } else {
+        try {
+          let command = driver_command_from_wire(inbound_value)
+          if !bound && !(command is JobCommand::Submit(_)) {
+            raise ApiError::UnknownSubmission("submit first")
+          }
+          match handler(command) {
+            Ok(status) => {
+              if command is JobCommand::Submit(_) {
+                bound = true
+              }
+              Ok(driver_status_from_api(status))
+            }
+            Err(reason) => Err(reason)
+          }
+        } catch {
+          error => Err(@debug.to_string(error))
+        }
+      }
+      let reply = @protocol.DriverReply::{
+        request_id: frame.message_id(),
+        result,
+      }
+      let response = outbound.build(
+        @protocol.FrameKind::DriverStatus,
+        reply.to_payload(),
+      )
+      @runtime.write_frame(connection, response)
+      if !bound {
+        return
+      }
+      last_message_id = frame.message_id()
+      last_result = result
     }
-    let reply = @protocol.DriverReply::{
-      request_id: frame.message_id(),
-      result,
-    }
-    let response = outbound.build(
-      @protocol.FrameKind::DriverStatus,
-      reply.to_payload(),
-    )
-    @runtime.write_frame(connection, response)
-    if !bound {
-      return
-    }
-    last_message_id = frame.message_id()
-    last_result = result
     guard @runtime.read_optional_frame(connection) is Some(next) else { return }
     frame = next
     inbound_value = session.accept_frame(frame)
@@ -641,14 +649,7 @@ pub async fn DriverControlListener::run(
   self.server.run_forever(max_connections~, allow_failure=true) <| ((
     connection,
     _,
-  ) => {
-    serve_driver_connection(
-      connection,
-      self.config.cluster_id,
-      self.config.coordinator_id,
-      handler,
-    )
-  })
+  ) => serve_driver_connection(connection, self, handler))
 }
 
 ///|
@@ -659,12 +660,7 @@ pub async fn DriverControlListener::run_once(
   handler : async (JobCommand) -> Result[JobRunStatus, String],
 ) -> Unit {
   let (connection, _) = self.server.accept()
-  serve_driver_connection(
-    connection,
-    self.config.cluster_id,
-    self.config.coordinator_id,
-    handler,
-  )
+  serve_driver_connection(connection, self, handler)
 }
 
 ///|

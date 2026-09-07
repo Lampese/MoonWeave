@@ -11,6 +11,7 @@ struct JobExecutionPlan {
   deltas : Array[@protocol.DeltaBatch]
   probe : @protocol.Probe?
   required_capability : String?
+  append_only : Bool?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -113,18 +114,59 @@ fn install_job_work_plan(
   }
   match plans.get(plan.partition) {
     Some(previous) if previous.required_capability != plan.required_capability ||
+      previous.append_only != plan.append_only ||
       previous.epoch > plan.epoch ||
-      (previous.epoch == plan.epoch && previous != plan) =>
-      raise JobStoreError::PlanMismatch(plan.partition)
+      (
+        previous.epoch == plan.epoch &&
+        previous != plan &&
+        (
+          previous.append_only != Some(true) ||
+          partition.phase() == @control.JobPartitionPhase::Succeeded ||
+          !previous.is_append_only_prefix_of(plan)
+        )
+      ) => raise JobStoreError::PlanMismatch(plan.partition)
     _ => ()
   }
   plans[plan.partition] = plan
 }
 
 ///|
+/// A source-backed live job may grow its durable work plan while retaining the
+/// same lease. Every existing primary batch and exchange delta must remain in
+/// the same order; the only permitted mutation is appending new work.
+fn JobExecutionPlan::is_append_only_prefix_of(
+  self : JobExecutionPlan,
+  next : JobExecutionPlan,
+) -> Bool {
+  if self.job_id != next.job_id ||
+    self.partition != next.partition ||
+    self.worker_id != next.worker_id ||
+    self.epoch != next.epoch ||
+    self.start_offset != next.start_offset ||
+    self.required_capability != next.required_capability ||
+    self.probe != next.probe ||
+    self.batches.length() > next.batches.length() ||
+    self.deltas.length() > next.deltas.length() {
+    return false
+  }
+  for index in 0..<self.batches.length() {
+    if self.batches[index] != next.batches[index] {
+      return false
+    }
+  }
+  for index in 0..<self.deltas.length() {
+    if self.deltas[index] != next.deltas[index] {
+      return false
+    }
+  }
+  true
+}
+
+///|
 fn JobStore::check_work(
   self : JobStore,
   work : SupervisorWork,
+  append_only? : Bool = false,
 ) -> JobExecutionPlan raise JobStoreError {
   guard self.state.partition(work.partition()) is Some(partition) else {
     raise JobStoreError::PlanMismatch(work.partition())
@@ -139,6 +181,11 @@ fn JobStore::check_work(
     deltas: work.deltas().to_owned(),
     probe: work.probe(),
     required_capability: work.required_capability(),
+    append_only: if append_only {
+      Some(true)
+    } else {
+      None
+    },
   }
   let plan = validate_job_work_plan(self.state, candidate)
   let preview = self.work_plans.copy()
@@ -164,12 +211,13 @@ fn JobStore::check_work(
 async fn JobStore::bind_work(
   self : JobStore,
   work : SupervisorWork,
+  append_only? : Bool = false,
 ) -> Unit raise JobStoreError {
   self.write_lock.acquire() catch {
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
-  let plan = self.check_work(work)
+  let plan = self.check_work(work, append_only~)
   if self.work_plans.get(plan.partition) == Some(plan) {
     return
   }
