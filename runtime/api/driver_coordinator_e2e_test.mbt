@@ -88,6 +88,8 @@ async test "DriverCoordinator executes a submitted Job with a waiting Worker" {
       }
       assert_eq(execution_summary.completed_partitions(), 1)
       assert_eq(worker_summary.live_batches(), 1)
+      assert_eq(worker_summary.state_events(), 1)
+      assert_eq(worker_summary.pending_events(), 0)
     }
   })
 }

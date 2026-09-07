@@ -21,6 +21,9 @@ test "job definitions compile to deterministic built-in plans" {
     DeliveryGuarantee::AtLeastOnce,
   )
   assert_true(compiled.plan_digest().has_prefix("plan-"))
+  assert_eq(compiled.state_schema(), "reachability-state:v1")
+  assert_eq(compiled.delivery_guarantee(), DeliveryGuarantee::AtLeastOnce)
+  assert_eq(compiled.recovery_capability(), RecoveryCapability::Replayable)
   assert_eq(compiled.plan_digest(), second.compile().plan_digest())
 }
 

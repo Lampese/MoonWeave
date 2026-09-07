@@ -48,6 +48,24 @@ pub fn SourceSpec::events() -> SourceSpec {
 }
 
 ///|
+/// The built-in event source is backed by a durable Coordinator SourceLog.
+pub(all) enum RecoveryCapability {
+  Replayable
+} derive(Debug, Eq, Compare, ToJson, FromJson)
+
+///|
+pub fn RecoveryCapability::replayable() -> RecoveryCapability {
+  RecoveryCapability::Replayable
+}
+
+///|
+pub fn SourceSpec::recovery_capability(self : SourceSpec) -> RecoveryCapability {
+  match self {
+    SourceSpec::Events => RecoveryCapability::Replayable
+  }
+}
+
+///|
 /// Deterministic partitioning selected by the job compiler.
 pub(all) enum Partitioning {
   ByKey
@@ -430,6 +448,20 @@ pub fn JobRunStatus::accepted_events(self : JobRunStatus) -> Int64 {
 ///|
 pub fn JobRunStatus::failure(self : JobRunStatus) -> String? {
   self.failure
+}
+
+///|
+pub fn JobRunStatus::delivery_guarantee(
+  _self : JobRunStatus,
+) -> DeliveryGuarantee {
+  DeliveryGuarantee::AtLeastOnce
+}
+
+///|
+pub fn JobRunStatus::recovery_capability(
+  _self : JobRunStatus,
+) -> RecoveryCapability {
+  RecoveryCapability::Replayable
 }
 
 ///|

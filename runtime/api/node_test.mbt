@@ -79,6 +79,7 @@ async test "coordinator assigns two remote worker nodes over TCP" {
       assert_eq(second_summary.worker_id(), "worker-b")
       assert_eq(first_summary.live_batches(), 1)
       assert_eq(second_summary.live_batches(), 1)
+      assert_eq(first_summary.state_schema(), "reachability-state:v1")
       assert_eq(coordinator.completed_partitions(), 2)
       assert_eq(coordinator.failed_partitions(), 0)
       assert_eq(coordinator.sent_batches(), 2)

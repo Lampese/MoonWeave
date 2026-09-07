@@ -102,6 +102,7 @@ pub struct CompiledJob {
   plan_digest : String
 }
 pub fn CompiledJob::definition(Self) -> JobDefinition
+pub fn CompiledJob::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn CompiledJob::job_id(Self) -> String
 pub fn CompiledJob::operator(Self) -> OperatorRef
 pub fn CompiledJob::operator_descriptor(Self) -> OperatorDescriptor
@@ -109,11 +110,13 @@ pub fn CompiledJob::partition_count(Self) -> Int
 pub fn CompiledJob::partition_for_key(Self, String) -> Int
 pub fn CompiledJob::partitioning(Self) -> Partitioning
 pub fn CompiledJob::plan_digest(Self) -> String
+pub fn CompiledJob::recovery_capability(Self) -> RecoveryCapability
 pub async fn CompiledJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[Event]) -> CoordinatorNodeSummary raise ApiError
 pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
 pub async fn CompiledJob::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
 pub async fn CompiledJob::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
 pub fn CompiledJob::sink(Self) -> SinkSpec
+pub fn CompiledJob::state_schema(Self) -> String
 pub fn CompiledJob::submission(Self) -> ClusterSubmission
 pub fn CompiledJob::submission_with_id(Self, String) -> JobSubmission raise ApiError
 
@@ -352,11 +355,13 @@ pub(all) struct JobRunStatus {
   failure : String?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobRunStatus::accepted_events(Self) -> Int64
+pub fn JobRunStatus::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn JobRunStatus::failure(Self) -> String?
 pub fn JobRunStatus::job_id(Self) -> String
 pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?) -> Self
 pub fn JobRunStatus::phase(Self) -> JobRunPhase
 pub fn JobRunStatus::plan_digest(Self) -> String
+pub fn JobRunStatus::recovery_capability(Self) -> RecoveryCapability
 pub fn JobRunStatus::submission_id(Self) -> String
 
 pub(all) struct JobSubmission {
@@ -603,6 +608,11 @@ pub(all) enum Partitioning {
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Partitioning::by_key() -> Self
 
+pub(all) enum RecoveryCapability {
+  Replayable
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn RecoveryCapability::replayable() -> Self
+
 pub struct RunHandle[T] {
   mut status : RunStatus
   outputs : Array[T]
@@ -651,6 +661,7 @@ pub(all) enum SourceSpec {
   Events
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SourceSpec::events() -> Self
+pub fn SourceSpec::recovery_capability(Self) -> RecoveryCapability
 
 pub struct Stream[T] {
   records : Array[T]
@@ -711,13 +722,19 @@ pub(all) struct WorkerNodeSummary {
   live_batches : Int
   persisted_offset : Int64
   applied_offset : Int64
+  state_events : Int
+  pending_events : Int
+  state_schema : String
 } derive(Eq, @debug.Debug)
 pub fn WorkerNodeSummary::applied_offset(Self) -> Int64
 pub fn WorkerNodeSummary::live_batches(Self) -> Int
 pub fn WorkerNodeSummary::partition(Self) -> Int
+pub fn WorkerNodeSummary::pending_events(Self) -> Int
 pub fn WorkerNodeSummary::persisted_offset(Self) -> Int64
 pub fn WorkerNodeSummary::replayed_batches(Self) -> Int
 pub fn WorkerNodeSummary::replayed_deltas(Self) -> Int
+pub fn WorkerNodeSummary::state_events(Self) -> Int
+pub fn WorkerNodeSummary::state_schema(Self) -> String
 pub fn WorkerNodeSummary::worker_id(Self) -> String
 
 pub(all) struct WorkerSlot {

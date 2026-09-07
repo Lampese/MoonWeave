@@ -480,6 +480,9 @@ pub(all) struct WorkerNodeSummary {
   live_batches : Int
   persisted_offset : Int64
   applied_offset : Int64
+  state_events : Int
+  pending_events : Int
+  state_schema : String
 } derive(Debug, Eq)
 
 ///|
@@ -515,6 +518,21 @@ pub fn WorkerNodeSummary::persisted_offset(self : WorkerNodeSummary) -> Int64 {
 ///|
 pub fn WorkerNodeSummary::applied_offset(self : WorkerNodeSummary) -> Int64 {
   self.applied_offset
+}
+
+///|
+pub fn WorkerNodeSummary::state_events(self : WorkerNodeSummary) -> Int {
+  self.state_events
+}
+
+///|
+pub fn WorkerNodeSummary::pending_events(self : WorkerNodeSummary) -> Int {
+  self.pending_events
+}
+
+///|
+pub fn WorkerNodeSummary::state_schema(self : WorkerNodeSummary) -> String {
+  self.state_schema
 }
 
 ///|
@@ -972,5 +990,8 @@ pub async fn CompiledJob::run_worker_node(
     live_batches: summary.live_batches(),
     persisted_offset: summary.persisted_offset(),
     applied_offset: summary.applied_offset(),
+    state_events: task.event_count(),
+    pending_events: task.pending_count(),
+    state_schema: self.descriptor.state_schema(),
   }
 }

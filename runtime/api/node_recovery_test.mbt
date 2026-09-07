@@ -92,6 +92,7 @@ async test "Coordinator fences a disconnected Worker and recovers on a replaceme
       }
       assert_eq(worker_summary.partition(), 0)
       assert_eq(worker_summary.live_batches(), 1)
+      assert_eq(worker_summary.state_events(), 1)
     }
   })
 }

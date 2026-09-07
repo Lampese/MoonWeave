@@ -179,6 +179,23 @@ pub fn CompiledJob::plan_digest(self : CompiledJob) -> String {
 }
 
 ///|
+pub fn CompiledJob::state_schema(self : CompiledJob) -> String {
+  self.descriptor.state_schema()
+}
+
+///|
+pub fn CompiledJob::delivery_guarantee(self : CompiledJob) -> DeliveryGuarantee {
+  self.definition.sink.delivery_guarantee()
+}
+
+///|
+pub fn CompiledJob::recovery_capability(
+  self : CompiledJob,
+) -> RecoveryCapability {
+  self.definition.source.recovery_capability()
+}
+
+///|
 pub fn CompiledJob::sink(self : CompiledJob) -> SinkSpec {
   self.definition.sink
 }
