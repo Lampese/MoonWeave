@@ -197,6 +197,6 @@ pub async fn run_liveness_watchdog(
     @async.sleep(policy.scan_interval_ms()) catch {
       error => raise FrameIoError::Io(@debug.to_string(error))
     }
-    ignore(run_liveness_scan(control, store, @async.now(), policy, job_store?))
+    let _ = run_liveness_scan(control, store, @async.now(), policy, job_store?)
   }
 }
