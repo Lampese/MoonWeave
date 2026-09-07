@@ -196,6 +196,15 @@ pub fn CompiledJob::recovery_capability(
 }
 
 ///|
+pub fn CompiledJob::connector_contract(self : CompiledJob) -> ConnectorContract {
+  {
+    source_recovery: self.recovery_capability(),
+    sink_delivery: self.delivery_guarantee(),
+    idempotent_sink_required: self.definition.sink.requires_idempotent_consumer(),
+  }
+}
+
+///|
 pub fn CompiledJob::sink(self : CompiledJob) -> SinkSpec {
   self.definition.sink
 }

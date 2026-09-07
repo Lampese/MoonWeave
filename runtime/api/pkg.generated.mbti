@@ -102,6 +102,7 @@ pub struct CompiledJob {
   descriptor : OperatorDescriptor
   plan_digest : String
 }
+pub fn CompiledJob::connector_contract(Self) -> ConnectorContract
 pub fn CompiledJob::definition(Self) -> JobDefinition
 pub fn CompiledJob::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn CompiledJob::job_id(Self) -> String
@@ -116,10 +117,20 @@ pub async fn CompiledJob::run_coordinator_node(Self, CoordinatorNodeConfig, Arra
 pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
 pub async fn CompiledJob::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
 pub async fn CompiledJob::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
+pub async fn CompiledJob::run_worker_node_set(Self, WorkerNodeSetConfig) -> WorkerNodeSetSummary raise ApiError
 pub fn CompiledJob::sink(Self) -> SinkSpec
 pub fn CompiledJob::state_schema(Self) -> String
 pub fn CompiledJob::submission(Self) -> ClusterSubmission
 pub fn CompiledJob::submission_with_id(Self, String) -> JobSubmission raise ApiError
+
+pub(all) struct ConnectorContract {
+  source_recovery : RecoveryCapability
+  sink_delivery : DeliveryGuarantee
+  idempotent_sink_required : Bool
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn ConnectorContract::idempotent_sink_required(Self) -> Bool
+pub fn ConnectorContract::sink_delivery(Self) -> DeliveryGuarantee
+pub fn ConnectorContract::source_recovery(Self) -> RecoveryCapability
 
 pub struct CoordinatorListener {
   config : CoordinatorNodeConfig
@@ -359,6 +370,7 @@ pub(all) struct JobRunStatus {
 pub fn JobRunStatus::accepted_events(Self) -> Int64
 pub fn JobRunStatus::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn JobRunStatus::failure(Self) -> String?
+pub fn JobRunStatus::idempotent_sink_required(Self) -> Bool
 pub fn JobRunStatus::job_id(Self) -> String
 pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?) -> Self
 pub fn JobRunStatus::phase(Self) -> JobRunPhase
@@ -665,6 +677,7 @@ pub(all) enum SinkSpec {
 pub fn SinkSpec::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn SinkSpec::discard() -> Self
 pub fn SinkSpec::durable(String) -> Self raise ApiError
+pub fn SinkSpec::requires_idempotent_consumer(Self) -> Bool
 
 pub struct Source[T] {
   records : Array[T]
@@ -730,6 +743,35 @@ pub fn WorkerNodeConfig::start_offset(Self) -> Int64
 pub fn WorkerNodeConfig::storage_dir(Self) -> String
 pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::worker_id(Self) -> String
+
+pub struct WorkerNodeSetConfig {
+  cluster_id : String
+  coordinator_id : String
+  coordinator : NodeEndpoint
+  worker_id : String
+  incarnation : String
+  storage_dir : String
+} derive(Eq, @debug.Debug)
+pub fn WorkerNodeSetConfig::cluster_id(Self) -> String
+pub fn WorkerNodeSetConfig::coordinator(Self) -> NodeEndpoint
+pub fn WorkerNodeSetConfig::coordinator_id(Self) -> String
+pub fn WorkerNodeSetConfig::incarnation(Self) -> String
+pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
+pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
+pub fn WorkerNodeSetConfig::worker_id(Self) -> String
+
+pub(all) struct WorkerNodeSetSummary {
+  worker_id : String
+  completed_tasks : Int
+  failed_tasks : Int
+  replayed_batches : Int
+  live_batches : Int
+} derive(Eq, @debug.Debug)
+pub fn WorkerNodeSetSummary::completed_tasks(Self) -> Int
+pub fn WorkerNodeSetSummary::failed_tasks(Self) -> Int
+pub fn WorkerNodeSetSummary::live_batches(Self) -> Int
+pub fn WorkerNodeSetSummary::replayed_batches(Self) -> Int
+pub fn WorkerNodeSetSummary::worker_id(Self) -> String
 
 pub(all) struct WorkerNodeSummary {
   worker_id : String

@@ -119,6 +119,45 @@ pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
 }
 
 ///|
+/// Durable output consumers must use the stable output idempotency key when
+/// retrying after a crash. The engine does not claim an external transaction.
+pub fn SinkSpec::requires_idempotent_consumer(self : SinkSpec) -> Bool {
+  match self {
+    SinkSpec::Discard => false
+    SinkSpec::Durable(_) => true
+  }
+}
+
+///|
+/// Explicit source/sink contract exposed by the compiler and run handles.
+pub(all) struct ConnectorContract {
+  source_recovery : RecoveryCapability
+  sink_delivery : DeliveryGuarantee
+  idempotent_sink_required : Bool
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn ConnectorContract::source_recovery(
+  self : ConnectorContract,
+) -> RecoveryCapability {
+  self.source_recovery
+}
+
+///|
+pub fn ConnectorContract::sink_delivery(
+  self : ConnectorContract,
+) -> DeliveryGuarantee {
+  self.sink_delivery
+}
+
+///|
+pub fn ConnectorContract::idempotent_sink_required(
+  self : ConnectorContract,
+) -> Bool {
+  self.idempotent_sink_required
+}
+
+///|
 /// User-facing, transport-free description of a MoonWeave Job.
 pub struct JobDefinition {
   job_id : String
@@ -427,6 +466,7 @@ pub(all) struct JobRunStatus {
   phase : JobRunPhase
   accepted_events : Int64
   failure : String?
+  idempotent_sink_required : Bool
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -437,8 +477,17 @@ pub fn JobRunStatus::new(
   phase : JobRunPhase,
   accepted_events : Int64,
   failure : String?,
+  idempotent_sink_required? : Bool = true,
 ) -> JobRunStatus {
-  { submission_id, job_id, plan_digest, phase, accepted_events, failure, }
+  {
+    submission_id,
+    job_id,
+    plan_digest,
+    phase,
+    accepted_events,
+    failure,
+    idempotent_sink_required,
+  }
 }
 
 ///|
@@ -483,6 +532,11 @@ pub fn JobRunStatus::recovery_capability(
   _self : JobRunStatus,
 ) -> RecoveryCapability {
   RecoveryCapability::Replayable
+}
+
+///|
+pub fn JobRunStatus::idempotent_sink_required(self : JobRunStatus) -> Bool {
+  self.idempotent_sink_required
 }
 
 ///|

@@ -177,6 +177,7 @@ fn driver_submit_payload(submission : JobSubmission) -> Json {
 ///|
 fn driver_status_to_api(
   status : @protocol.DriverStatus,
+  idempotent_sink_required : Bool,
 ) -> JobRunStatus raise ApiError {
   let phase = match status.phase() {
     "Created" => JobRunPhase::Created
@@ -194,6 +195,7 @@ fn driver_status_to_api(
     phase,
     accepted_events: status.accepted_events(),
     failure: status.failure(),
+    idempotent_sink_required,
   }
 }
 
@@ -245,7 +247,12 @@ async fn DriverClient::exchange(
     Ok(value) => value
     Err(reason) => raise ApiError::InvalidDriverCommand(reason)
   }
-  let converted = driver_status_to_api(status)
+  let idempotent_sink_required = match self.submitted {
+    Some(submission) =>
+      submission.job().definition().sink().requires_idempotent_consumer()
+    None => true
+  }
+  let converted = driver_status_to_api(status, idempotent_sink_required)
   match self.submitted {
     Some(submission) if converted.submission_id != submission.submission_id ||
       converted.job_id != submission.job.definition.job_id ||
@@ -278,7 +285,8 @@ pub async fn DriverClient::submit(
       },
     )
   }
-  let status = self.exchange(
+  self.submitted = Some(submission)
+  self.exchange(
     @protocol.FrameKind::DriverSubmit,
     @protocol.DriverSubmit::new(
       submission.submission_id(),
@@ -287,8 +295,6 @@ pub async fn DriverClient::submit(
       error => raise ApiError::Cluster(@debug.to_string(error))
     },
   )
-  self.submitted = Some(submission)
-  status
 }
 
 ///|

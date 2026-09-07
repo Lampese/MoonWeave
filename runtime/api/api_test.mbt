@@ -24,6 +24,11 @@ test "job definitions compile to deterministic built-in plans" {
   assert_eq(compiled.state_schema(), "reachability-state:v1")
   assert_eq(compiled.delivery_guarantee(), DeliveryGuarantee::AtLeastOnce)
   assert_eq(compiled.recovery_capability(), RecoveryCapability::Replayable)
+  assert_eq(
+    compiled.connector_contract().sink_delivery(),
+    DeliveryGuarantee::AtLeastOnce,
+  )
+  assert_true(compiled.connector_contract().idempotent_sink_required())
   assert_eq(compiled.plan_digest(), second.compile().plan_digest())
 }
 

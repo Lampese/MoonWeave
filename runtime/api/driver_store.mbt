@@ -303,6 +303,7 @@ pub fn DriverStore::status(self : DriverStore) -> JobRunStatus raise ApiError {
     self.phase,
     self.accepted_events,
     self.failure,
+    idempotent_sink_required=compiled.sink().requires_idempotent_consumer(),
   )
 }
 

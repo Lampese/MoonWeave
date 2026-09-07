@@ -42,6 +42,9 @@ pub fn LocalJobHandle::status(self : LocalJobHandle) -> JobRunStatus {
     phase: self.phase,
     accepted_events: self.accepted_events,
     failure: self.failure,
+    idempotent_sink_required: self.compiled
+    .sink()
+    .requires_idempotent_consumer(),
   }
 }
 
