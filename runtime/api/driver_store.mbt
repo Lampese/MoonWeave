@@ -430,7 +430,7 @@ pub async fn DriverStore::cancel(
 /// Mark execution complete after the Coordinator has returned a successful
 /// summary. The Coordinator listener owns JobStore and has already enforced
 /// every partition drain barrier before this method is called.
-pub async fn DriverStore::succeed(
+async fn DriverStore::succeed(
   self : DriverStore,
 ) -> JobRunStatus raise ApiError {
   self.write_lock.acquire() catch {
@@ -459,7 +459,7 @@ pub async fn DriverStore::succeed(
 ///|
 /// Record an execution failure without changing a cancelled or already
 /// terminal submission.
-pub async fn DriverStore::fail(
+async fn DriverStore::fail(
   self : DriverStore,
   reason : String,
 ) -> JobRunStatus raise ApiError {

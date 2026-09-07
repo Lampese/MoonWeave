@@ -70,3 +70,36 @@ test "driver client validates Coordinator status frames" {
   assert_eq(accepted.phase(), "Running")
   assert_eq(client.session_id(), "driver-1/driver/0")
 }
+
+///|
+test "driver replies preserve request identity and reject malformed status" {
+  let status = DriverStatus::new(
+    "submission",
+    "job",
+    "digest",
+    "Running",
+    3L,
+    None,
+  )
+  let reply = DriverReply::{
+    request_id: "driver-1/driver/4",
+    result: Ok(status),
+  }
+  let decoded = DriverReply::from_payload(reply.to_payload())
+  assert_eq(decoded, reply)
+  let rejected = DriverReply::{
+    request_id: "driver-1/driver/5",
+    result: Err("plan mismatch"),
+  }
+  assert_eq(DriverReply::from_payload(rejected.to_payload()), rejected)
+  try
+    DriverReply::from_payload(
+      "{\"request_id\":\"x\",\"result\":{\"Ok\":{\"phase\":\"Unknown\"}}}",
+    )
+  catch {
+    MessageError::Malformed => ()
+    _ => fail("expected malformed Driver status")
+  } noraise {
+    _ => fail("expected malformed Driver status")
+  }
+}

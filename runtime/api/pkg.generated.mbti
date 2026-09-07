@@ -270,7 +270,6 @@ pub async fn DriverStore::cancel(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::close(Self) -> Unit
 pub async fn DriverStore::compact(Self) -> Unit raise ApiError
 pub async fn DriverStore::drain(Self) -> JobRunStatus raise ApiError
-pub async fn DriverStore::fail(Self, String) -> JobRunStatus raise ApiError
 pub async fn DriverStore::handle(Self, JobCommand) -> Result[JobRunStatus, String]
 pub async fn DriverStore::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
 pub fn DriverStore::inputs(Self) -> Array[Event] raise ApiError
@@ -281,7 +280,6 @@ pub fn DriverStore::stats(Self) -> @moonweave/moonweave/runtime/async.WalStats
 pub fn DriverStore::status(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::submission(Self) -> JobSubmission? raise ApiError
 pub async fn DriverStore::submit(Self, JobSubmission) -> JobRunStatus raise ApiError
-pub async fn DriverStore::succeed(Self) -> JobRunStatus raise ApiError
 
 pub struct Event {
   record : @protocol.EventRecord

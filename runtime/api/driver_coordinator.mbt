@@ -38,6 +38,7 @@ pub async fn DriverCoordinator::bind(
 ) -> DriverCoordinator raise ApiError {
   let data_listener = CoordinatorNode::bind(data_config)
   errdefer data_listener.close()
+  errdefer store.close()
   let control_listener = DriverControlListener::bind(control_config)
   {
     data_listener,
@@ -143,6 +144,8 @@ pub async fn DriverCoordinator::run(
   let control = self.control_listener
   let data = self.data_listener
   let store = self.store
+  defer control.close()
+  defer data.close()
   defer store.close()
   try
     @async_runtime.with_task_group <| group => {
