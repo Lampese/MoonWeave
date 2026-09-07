@@ -233,3 +233,91 @@ async test "live reconnect expires without another Worker" {
     }
   })
 }
+
+///|
+async test "live supervisor reports every transport failure for one multi-lease Worker" {
+  let directory = @fs.tmpdir(prefix="moonweave-live-multi-failure")
+  defer @fs.rmdir(directory, recursive=true)
+  let spec = @plan.JobSpec::new(
+    "live-multi-failure",
+    "reachability",
+    2,
+    ["worker"],
+    [],
+  )
+  let coordinator = CoordinatorStore::open(
+    "live-multi-failure",
+    "coordinator",
+    directory + "/coordinator.wal",
+  )
+  defer coordinator.close()
+  let job = JobStore::open(spec, directory + "/job.wal")
+  defer job.close()
+  let capability = @task.OperatorKind::Reachability.capability()
+  let boot = @protocol.Incarnation::new("multi-boot")
+  ignore(coordinator.register_worker("worker", boot, [capability]))
+  for partition in 0..<2 {
+    let assignment = coordinator.assign(partition, "worker")
+    ignore(job.assign(partition, "worker", assignment.epoch(), 0L))
+  }
+  let live = SourceBackedJob::open(
+    directory + "/source.wal",
+    spec,
+    coordinator,
+    job,
+    required_capability=capability,
+  )
+  defer live.close()
+  live.refresh_work_plans()
+  job.start()
+  let server = @socket.TcpServer(
+    @socket.Addr::parse("127.0.0.1:0"),
+    reuse_addr=true,
+  )
+  defer server.close()
+  @async_runtime.with_timeout(5000, () => {
+    @async_runtime.with_task_group <| group => {
+      let supervisor = group.spawn(allow_failure=true) <| () => {
+        Ok(
+          run_live_source_supervisor(
+            server,
+            live,
+            poll_interval_ms=1,
+            reconnect_attempts=0,
+            reconnect_timeout_ms=20,
+          ),
+        ) catch {
+          error => Err(@debug.to_string(error))
+        }
+      }
+      for partition in 0..<2 {
+        let connection = @socket.Tcp::connect(server.addr)
+        ignore(
+          worker_handshake(
+            connection,
+            "live-multi-failure",
+            "coordinator",
+            "worker",
+            "multi-boot",
+            [capability],
+            requested_partition=partition,
+          ),
+        )
+        connection.close()
+      }
+      let result = supervisor.wait()
+      guard result is Ok(summary) else {
+        fail("multi-lease supervisor failed: " + @debug.to_string(result))
+      }
+      assert_eq(summary.failed_partitions(), 2)
+      assert_true(summary.recoverable_failures())
+      assert_eq(summary.failures().map(failure => failure.worker_id()), [
+        "worker", "worker",
+      ])
+      assert_eq(summary.failures().map(failure => failure.partition()), [
+        Some(0),
+        Some(1),
+      ])
+    }
+  })
+}
