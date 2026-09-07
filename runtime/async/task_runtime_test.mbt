@@ -114,6 +114,93 @@ async test "worker task executes a built-in operator over real TCP" {
 }
 
 ///|
+async test "worker task rejects a checkpoint state schema before restoring state" {
+  with_worker_recovery_paths <| ((wal_path, checkpoint_path) => {
+    let snapshot_task = @task.Task::new(
+      "schema-task",
+      "reachability",
+      @task.OperatorKind::Reachability,
+      0,
+      1,
+    )
+    let snapshot = snapshot_task.snapshot()
+    let checkpoint = Checkpoint::new(
+      0,
+      1,
+      0L,
+      -1L,
+      -1L,
+      snapshot.frontier_digest(),
+      state_schema="reachability-state:v2",
+      operator_state=@json.to_json(snapshot),
+    )
+    checkpoint.save(checkpoint_path)
+    let server = @socket.TcpServer(
+      @socket.Addr::parse("127.0.0.1:0"),
+      reuse_addr=true,
+    )
+    defer server.close()
+    let addr = server.addr
+    @async_runtime.with_timeout(10000, () => {
+      @async_runtime.with_task_group <| group => {
+        group.spawn_bg() <| () => {
+          let (connection, _) = server.accept()
+          defer connection.close()
+          ignore(
+            coordinator_handshake(
+              connection,
+              "cluster-schema",
+              "coordinator",
+              "worker-schema",
+              "schema-session",
+              assignment=@protocol.AssignmentSpec::new(0, 1, "boot-schema"),
+            ),
+          )
+        }
+        let task = @task.Task::new(
+          "schema-task",
+          "reachability",
+          @task.OperatorKind::Reachability,
+          0,
+          1,
+        )
+        let outputs : Array[@task.TaskOutput] = []
+        let output_handler : (@task.TaskOutput) -> Unit raise = output => {
+          outputs.push(output)
+        }
+        try
+          run_worker_task(
+            @socket.Tcp::connect(addr),
+            "cluster-schema",
+            "coordinator",
+            "worker-schema",
+            "boot-schema",
+            [],
+            wal_path,
+            task,
+            output_handler,
+            checkpoint_path~,
+          )
+        catch {
+          FrameIoError::Handler(message) =>
+            assert_eq(message, "checkpoint state schema mismatch")
+          error => fail("unexpected error: \{@debug.to_string(error)}")
+        } noraise {
+          _ => fail("expected checkpoint schema mismatch")
+        }
+        assert_eq(task.phase(), @task.TaskPhase::Failed)
+        assert_eq(task.offset(), -1L)
+        assert_eq(outputs, [])
+      }
+    })
+    guard Checkpoint::load(checkpoint_path) is Some(unchanged) else {
+      fail("mismatched checkpoint should remain intact")
+    }
+    assert_eq(unchanged, checkpoint)
+  })
+}
+
+///|
 test "failed task does not advance its primary offset" {
   let task = @task.Task::new(
     "task-failure",

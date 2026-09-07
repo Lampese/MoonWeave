@@ -19,6 +19,7 @@ pub(all) struct Checkpoint {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
+  state_schema : String?
   operator_state : Json?
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -31,6 +32,7 @@ pub fn Checkpoint::new(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset? : Int64 = 0L,
+  state_schema? : String,
   operator_state? : Json,
 ) -> Checkpoint raise CheckpointError {
   if partition < 0 ||
@@ -40,7 +42,8 @@ pub fn Checkpoint::new(
     persisted_offset < -1L ||
     applied_offset < -1L ||
     applied_offset > persisted_offset ||
-    frontier_digest.is_empty() {
+    frontier_digest.is_empty() ||
+    (state_schema is Some(value) && value.is_empty()) {
     raise CheckpointError::InvalidField
   }
   {
@@ -52,6 +55,7 @@ pub fn Checkpoint::new(
     persisted_offset,
     applied_offset,
     frontier_digest,
+    state_schema,
     operator_state,
   }
 }
@@ -97,6 +101,11 @@ pub fn Checkpoint::frontier_digest(self : Checkpoint) -> String {
 }
 
 ///|
+pub fn Checkpoint::state_schema(self : Checkpoint) -> String? {
+  self.state_schema
+}
+
+///|
 pub fn Checkpoint::operator_state(self : Checkpoint) -> Json? {
   self.operator_state
 }
@@ -114,6 +123,7 @@ fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
     self.applied_offset,
     self.frontier_digest,
     delta_wal_offset=self.delta_wal_offset,
+    state_schema?=self.state_schema,
     operator_state?=self.operator_state,
   )
 }

@@ -366,13 +366,14 @@ pub(all) struct JobRunStatus {
   phase : JobRunPhase
   accepted_events : Int64
   failure : String?
+  idempotent_sink_required : Bool
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobRunStatus::accepted_events(Self) -> Int64
 pub fn JobRunStatus::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn JobRunStatus::failure(Self) -> String?
 pub fn JobRunStatus::idempotent_sink_required(Self) -> Bool
 pub fn JobRunStatus::job_id(Self) -> String
-pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?) -> Self
+pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?, idempotent_sink_required? : Bool) -> Self
 pub fn JobRunStatus::phase(Self) -> JobRunPhase
 pub fn JobRunStatus::plan_digest(Self) -> String
 pub fn JobRunStatus::recovery_capability(Self) -> RecoveryCapability

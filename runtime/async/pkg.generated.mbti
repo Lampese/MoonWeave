@@ -314,6 +314,7 @@ pub(all) struct Checkpoint {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
+  state_schema : String?
   operator_state : Json?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Checkpoint::applied_offset(Self) -> Int64
@@ -321,11 +322,12 @@ pub fn Checkpoint::delta_wal_offset(Self) -> Int64
 pub fn Checkpoint::epoch(Self) -> Int
 pub fn Checkpoint::frontier_digest(Self) -> String
 pub async fn Checkpoint::load(String) -> Self? raise CheckpointError
-pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, operator_state? : Json) -> Self raise CheckpointError
+pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, state_schema? : String, operator_state? : Json) -> Self raise CheckpointError
 pub fn Checkpoint::operator_state(Self) -> Json?
 pub fn Checkpoint::partition(Self) -> Int
 pub fn Checkpoint::persisted_offset(Self) -> Int64
 pub async fn Checkpoint::save(Self, String) -> Unit raise CheckpointError
+pub fn Checkpoint::state_schema(Self) -> String?
 pub fn Checkpoint::version(Self) -> Int
 pub fn Checkpoint::wal_offset(Self) -> Int64
 

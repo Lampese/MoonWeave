@@ -33,6 +33,11 @@ pub fn TaskSnapshot::operator(self : TaskSnapshot) -> OperatorKind {
 }
 
 ///|
+pub fn TaskSnapshot::state_schema(self : TaskSnapshot) -> String {
+  self.operator.state_schema()
+}
+
+///|
 pub fn TaskSnapshot::operator_capability(self : TaskSnapshot) -> String? {
   self.operator_capability
 }

@@ -261,12 +261,20 @@ fn validate_checkpoint(
   wal_batches : ArrayView[@protocol.EventBatch],
   delta_records : ArrayView[DeltaWalRecord],
   restored_offset : Int64,
+  state_schema : String?,
 ) -> Unit raise FrameIoError {
   if checkpoint.partition() != assignment.partition() ||
     checkpoint.epoch() != assignment.epoch() {
     raise FrameIoError::Handler(
       "checkpoint does not match the active assignment",
     )
+  }
+  match (checkpoint.state_schema(), state_schema) {
+    (Some(saved), Some(expected)) if saved != expected =>
+      raise FrameIoError::Handler("checkpoint state schema mismatch")
+    (Some(saved), None) if saved.is_empty() =>
+      raise FrameIoError::Handler("checkpoint state schema is empty")
+    _ => ()
   }
   if checkpoint.wal_offset() > wal.write_offset() ||
     checkpoint.delta_wal_offset() > delta_wal_offset ||
@@ -326,6 +334,7 @@ async fn save_checkpoint(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset : Int64,
+  state_schema : String?,
   operator_state? : Json,
 ) -> Unit raise FrameIoError {
   match checkpoint_path {
@@ -339,6 +348,7 @@ async fn save_checkpoint(
         applied_offset,
         frontier_digest,
         delta_wal_offset~,
+        state_schema?,
         operator_state?,
       ) catch {
         error => raise FrameIoError::Checkpoint(error)
@@ -510,6 +520,7 @@ async fn run_worker_impl(
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
+  state_schema? : String,
   assignment_setup? : () -> Unit raise FrameIoError,
   drain_handler? : () -> Unit raise FrameIoError,
   output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
@@ -600,7 +611,7 @@ async fn run_worker_impl(
     Some(value) =>
       validate_checkpoint(
         value, assignment, wal, replay, delta_replay, delta_wal_offset, wal_batches,
-        delta_records, restored_offset,
+        delta_records, restored_offset, state_schema,
       )
   }
   let mut primary_replay_start = 0
@@ -660,6 +671,7 @@ async fn run_worker_impl(
     restored_offset,
     recovered_frontier_digest,
     delta_wal_offset,
+    state_schema,
     operator_state?=match state_snapshot {
       None => None
       Some(snapshot) => Some(snapshot())
@@ -875,6 +887,7 @@ async fn run_worker_impl(
               Some(value) => value.write_offset()
               None => 0L
             },
+            state_schema,
             operator_state?=match state_snapshot {
               None => None
               Some(snapshot) => Some(snapshot())
@@ -956,6 +969,7 @@ async fn run_worker_impl(
               Some(value) => value.write_offset()
               None => 0L
             },
+            state_schema,
             operator_state?=match state_snapshot {
               None => None
               Some(snapshot) => Some(snapshot())

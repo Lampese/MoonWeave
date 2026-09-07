@@ -365,6 +365,7 @@ test "task snapshot preserves pending causal state and resumes deterministically
   let snapshot = task.snapshot()
   assert_eq(snapshot.offset(), 0L)
   assert_eq(snapshot.events().length(), 1)
+  assert_eq(snapshot.state_schema(), "reachability-state:v1")
   assert_true(snapshot.operator_capability() is Some(_))
 
   let forged = TaskSnapshot::{

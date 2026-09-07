@@ -185,6 +185,7 @@ pub async fn run_worker_task(
       } else {
         Some(task.partition())
       },
+      state_schema=task.operator().state_schema(),
       drain_handler=() => {
         task.drain() catch {
           error => raise FrameIoError::Task(error)
