@@ -667,12 +667,27 @@ async fn release_supervisor_claim(
 }
 
 ///|
+async fn accept_supervisor_connection(
+  server : @socket.TcpServer,
+  accept_lock : @async.Mutex,
+) -> (@socket.Tcp, @socket.Addr) raise FrameIoError {
+  accept_lock.acquire() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  defer accept_lock.release()
+  server.accept() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+}
+
+///|
 async fn supervise_one_connection(
   server : @socket.TcpServer,
   control : @control.CoordinatorState,
   works : ArrayView[SupervisorWork],
   claimed : Set[String],
   claim_lock : @async.Mutex,
+  accept_lock : @async.Mutex,
   maximum_frame_bytes : Int,
   store : CoordinatorStore?,
   retry_policy : RetryPolicy,
@@ -687,9 +702,7 @@ async fn supervise_one_connection(
     let mut claimed_partition : Int? = None
     let mut active_assignment : @control.PartitionAssignment? = None
     let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
-      let (connection, _) = server.accept() catch {
-        error => raise FrameIoError::Io(@debug.to_string(error))
-      }
+      let (connection, _) = accept_supervisor_connection(server, accept_lock)
       defer connection.close()
       let hello_frame = read_frame(connection, maximum_frame_bytes~)
       let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
@@ -927,6 +940,7 @@ async fn run_supervisor_impl(
   (@async.with_task_group <| group => {
     let claimed : Set[String] = Set([])
     let claim_lock = @async.Mutex::Mutex()
+    let accept_lock = @async.Mutex::Mutex()
     let tasks : Array[@async.Task[SupervisedAttemptResult]] = []
     for _ in works {
       let task = group.spawn(allow_failure=true) <| () => {
@@ -936,6 +950,7 @@ async fn run_supervisor_impl(
           works[:],
           claimed,
           claim_lock,
+          accept_lock,
           maximum_frame_bytes,
           store,
           retry_policy,

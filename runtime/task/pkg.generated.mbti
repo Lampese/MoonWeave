@@ -71,8 +71,8 @@ pub struct Task {
   operator_id : String
   operator : OperatorKind
   partition : Int
-  epoch : Int
-  start_offset : Int64
+  mut epoch : Int
+  mut start_offset : Int64
   mut phase : TaskPhase
   mut offset : Int64
   mut frontier : @causal.Frontier
@@ -81,6 +81,7 @@ pub struct Task {
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
 }
+pub fn Task::adopt_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
 pub fn Task::drain(Self) -> Unit raise TaskError
 pub fn Task::epoch(Self) -> Int
 pub fn Task::event_count(Self) -> Int

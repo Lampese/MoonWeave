@@ -137,6 +137,14 @@ pub fn CompiledJob::submission(self : CompiledJob) -> ClusterSubmission {
 }
 
 ///|
+pub fn CompiledJob::submission_with_id(
+  self : CompiledJob,
+  submission_id : String,
+) -> JobSubmission raise ApiError {
+  JobSubmission::new(submission_id, self.submission())
+}
+
+///|
 /// Recompile and verify a submission before accepting it into a runtime. This
 /// catches plan drift and operator artifact mismatch without loading code.
 pub fn ClusterSubmission::compile(

@@ -956,3 +956,309 @@ pub fn CoordinatorSession::accept_frame(
   self.seen_messages[frame.message_id()] = frame
   self.next_sequence += 1L
 }
+
+///|
+pub(all) enum DriverSessionPhase {
+  Disconnected
+  Running
+  Closed
+} derive(Debug, Eq, Compare, ToJson, FromJson)
+
+///|
+pub(all) enum DriverInbound {
+  Submit(DriverSubmit)
+  Command(DriverCommand)
+} derive(Debug, Eq)
+
+///|
+/// Pure control-plane state for one Driver-to-Coordinator connection. It does
+/// not know JobStore or runtime/api; those belong to the async adapter.
+pub struct DriverSession {
+  cluster_id : String
+  coordinator_id : String
+  driver_id : String
+  mut session_id : String
+  mut phase : DriverSessionPhase
+  mut next_sequence : Int64
+  mut incarnation : String
+  seen_messages : Map[String, Frame]
+}
+
+///|
+pub fn DriverSession::new(
+  cluster_id : String,
+  coordinator_id : String,
+  driver_id : String,
+) -> DriverSession raise SessionError {
+  if cluster_id.is_empty() || coordinator_id.is_empty() || driver_id.is_empty() {
+    raise SessionError::ClusterMismatch
+  }
+  {
+    cluster_id,
+    coordinator_id,
+    driver_id,
+    session_id: "bootstrap",
+    phase: DriverSessionPhase::Disconnected,
+    next_sequence: 0L,
+    incarnation: "",
+    seen_messages: Map([]),
+  }
+}
+
+///|
+pub fn DriverSession::phase(self : DriverSession) -> DriverSessionPhase {
+  self.phase
+}
+
+///|
+pub fn DriverSession::session_id(self : DriverSession) -> String {
+  self.session_id
+}
+
+///|
+pub fn DriverSession::next_sequence(self : DriverSession) -> Int64 {
+  self.next_sequence
+}
+
+///|
+/// Return whether this connection has already admitted a frame identity. The
+/// control-plane adapter uses this to replay a cached status without applying
+/// a mutating Driver command twice.
+pub fn DriverSession::has_seen(
+  self : DriverSession,
+  message_id : String,
+) -> Bool {
+  self.seen_messages.contains(message_id)
+}
+
+///|
+fn driver_incarnation_is_valid(value : String) -> Bool {
+  value == "driver" || value.has_prefix("driver-")
+}
+
+///|
+fn DriverSession::validate_frame(
+  self : DriverSession,
+  frame : Frame,
+) -> Unit raise SessionError {
+  if self.phase == DriverSessionPhase::Closed {
+    raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+  }
+  if frame.cluster_id() != self.cluster_id ||
+    frame.sender_id() != self.driver_id {
+    raise SessionError::ClusterMismatch
+  }
+  if !driver_incarnation_is_valid(frame.worker_incarnation()) {
+    raise SessionError::IncarnationMismatch
+  }
+  if self.phase != DriverSessionPhase::Disconnected &&
+    frame.worker_incarnation() != self.incarnation {
+    raise SessionError::IncarnationMismatch
+  }
+  if self.phase == DriverSessionPhase::Disconnected {
+    if frame.session_id() != "bootstrap" ||
+      !(frame.kind() is FrameKind::DriverSubmit) {
+      raise SessionError::WrongPhase(expected=Handshaking, actual=Disconnected)
+    }
+  } else if frame.session_id() != self.session_id {
+    raise SessionError::SessionMismatch
+  }
+  if frame.message_sequence() < self.next_sequence {
+    raise SessionError::MessageRegression(
+      expected_at_least=self.next_sequence,
+      actual=frame.message_sequence(),
+    )
+  }
+  if frame.message_sequence() > self.next_sequence {
+    raise SessionError::MessageGap(
+      expected=self.next_sequence,
+      actual=frame.message_sequence(),
+    )
+  }
+}
+
+///|
+pub fn DriverSession::accept_frame(
+  self : DriverSession,
+  frame : Frame,
+) -> DriverInbound raise SessionError {
+  if self.phase == DriverSessionPhase::Closed {
+    raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+  }
+  match self.seen_messages.get(frame.message_id()) {
+    Some(previous) if previous == frame =>
+      match frame.kind() {
+        FrameKind::DriverSubmit =>
+          return DriverInbound::Submit(
+            DriverSubmit::from_payload(frame.payload()) catch {
+              error => raise SessionError::Payload(error)
+            },
+          )
+        FrameKind::DriverCommand =>
+          return DriverInbound::Command(
+            DriverCommand::from_payload(frame.payload()) catch {
+              error => raise SessionError::Payload(error)
+            },
+          )
+        _ =>
+          raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+      }
+    Some(_) => raise SessionError::MessageIdConflict(frame.message_id())
+    None => ()
+  }
+  self.validate_frame(frame)
+  let inbound = match frame.kind() {
+    FrameKind::DriverSubmit => {
+      if self.phase != DriverSessionPhase::Disconnected {
+        raise SessionError::WrongPhase(expected=Disconnected, actual=Running)
+      }
+      let submit = DriverSubmit::from_payload(frame.payload()) catch {
+        error => raise SessionError::Payload(error)
+      }
+      self.session_id = frame.message_id()
+      self.incarnation = frame.worker_incarnation()
+      self.phase = DriverSessionPhase::Running
+      DriverInbound::Submit(submit)
+    }
+    FrameKind::DriverCommand =>
+      DriverInbound::Command(
+        DriverCommand::from_payload(frame.payload()) catch {
+          error => raise SessionError::Payload(error)
+        },
+      )
+    _ => raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+  }
+  self.seen_messages.clear()
+  self.seen_messages[frame.message_id()] = frame
+  self.next_sequence += 1L
+  inbound
+}
+
+///|
+pub fn DriverSession::close(self : DriverSession) -> Unit {
+  self.phase = DriverSessionPhase::Closed
+}
+
+///|
+/// Driver-side validator for Coordinator status frames.
+pub struct DriverClientSession {
+  cluster_id : String
+  coordinator_id : String
+  driver_id : String
+  mut session_id : String
+  mut phase : DriverSessionPhase
+  mut next_sequence : Int64
+}
+
+///|
+pub fn DriverClientSession::new(
+  cluster_id : String,
+  coordinator_id : String,
+  driver_id : String,
+) -> DriverClientSession raise SessionError {
+  if cluster_id.is_empty() || coordinator_id.is_empty() || driver_id.is_empty() {
+    raise SessionError::ClusterMismatch
+  }
+  {
+    cluster_id,
+    coordinator_id,
+    driver_id,
+    session_id: "bootstrap",
+    phase: DriverSessionPhase::Disconnected,
+    next_sequence: 0L,
+  }
+}
+
+///|
+pub fn DriverClientSession::phase(
+  self : DriverClientSession,
+) -> DriverSessionPhase {
+  self.phase
+}
+
+///|
+pub fn DriverClientSession::session_id(self : DriverClientSession) -> String {
+  self.session_id
+}
+
+///|
+pub fn DriverClientSession::close(self : DriverClientSession) -> Unit {
+  self.phase = DriverSessionPhase::Closed
+}
+
+///|
+pub fn DriverClientSession::accept_status(
+  self : DriverClientSession,
+  frame : Frame,
+) -> DriverStatus raise SessionError {
+  self.validate_response(frame)
+  let status = DriverStatus::from_payload(frame.payload()) catch {
+    error => raise SessionError::Payload(error)
+  }
+  self.commit_response(frame)
+  status
+}
+
+///|
+fn DriverClientSession::validate_response(
+  self : DriverClientSession,
+  frame : Frame,
+) -> Unit raise SessionError {
+  if self.phase == DriverSessionPhase::Closed {
+    raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+  }
+  if frame.cluster_id() != self.cluster_id ||
+    frame.sender_id() != self.coordinator_id ||
+    !driver_incarnation_is_valid(frame.worker_incarnation()) {
+    raise SessionError::ClusterMismatch
+  }
+  if !(frame.kind() is FrameKind::DriverStatus) {
+    raise SessionError::WrongPhase(expected=Running, actual=Disconnected)
+  }
+  if self.phase == DriverSessionPhase::Disconnected {
+    if frame.session_id() == "bootstrap" {
+      raise SessionError::SessionMismatch
+    }
+  } else if frame.session_id() != self.session_id {
+    raise SessionError::SessionMismatch
+  }
+  if frame.message_sequence() < self.next_sequence {
+    raise SessionError::MessageRegression(
+      expected_at_least=self.next_sequence,
+      actual=frame.message_sequence(),
+    )
+  }
+  if frame.message_sequence() > self.next_sequence {
+    raise SessionError::MessageGap(
+      expected=self.next_sequence,
+      actual=frame.message_sequence(),
+    )
+  }
+}
+
+///|
+fn DriverClientSession::commit_response(
+  self : DriverClientSession,
+  frame : Frame,
+) -> Unit {
+  self.session_id = frame.session_id()
+  self.phase = DriverSessionPhase::Running
+  self.next_sequence += 1L
+}
+
+///|
+pub fn DriverClientSession::accept_reply(
+  self : DriverClientSession,
+  frame : Frame,
+  request_id : String,
+) -> DriverReply raise SessionError {
+  self.validate_response(frame)
+  let reply = DriverReply::from_payload(frame.payload()) catch {
+    error => raise SessionError::Payload(error)
+  }
+  if reply.request_id != request_id {
+    raise SessionError::MessageIdConflict(reply.request_id)
+  }
+  self.commit_response(frame)
+  reply
+}

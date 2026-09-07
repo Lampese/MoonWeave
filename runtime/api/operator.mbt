@@ -258,6 +258,9 @@ pub fn OperatorDescriptor::validate_event(
   event : Event,
 ) -> Unit raise ApiError {
   self.validate()
+  ignore(
+    Event::new(event.id(), event.record.parents(), event.key(), event.payload()),
+  )
   self.operator_kind.validate_payload(event.payload()) catch {
     error => raise ApiError::InvalidEvent(@debug.to_string(error))
   }

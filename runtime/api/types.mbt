@@ -18,6 +18,17 @@ pub(all) suberror ApiError {
   SubmissionMismatch(String)
   LocalModeUnsupported
   InvalidEvent(String)
+  EmptyKey
+  InvalidWindowSize(Int)
+  InvalidEndpoint(String)
+  InvalidPort(Int)
+  InvalidWorkerAssignment(String)
+  EmptySubmissionId
+  InvalidJobPhase(expected~ : JobRunPhase, actual~ : JobRunPhase)
+  UnknownSubmission(String)
+  RequestConflict(String)
+  InvalidDriverCommand(String)
+  DriverClosed
   TaskFailed(String)
   Closed
   Cluster(String)
@@ -56,6 +67,19 @@ pub(all) enum SinkSpec {
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
+/// Delivery guarantees are part of the connector contract. The current
+/// durable sink is explicitly at-least-once; exactly-once requires a
+/// transactional external sink and is not implied by this local WAL.
+pub(all) enum DeliveryGuarantee {
+  AtLeastOnce
+} derive(Debug, Eq, Compare, ToJson, FromJson)
+
+///|
+pub fn DeliveryGuarantee::at_least_once() -> DeliveryGuarantee {
+  DeliveryGuarantee::AtLeastOnce
+}
+
+///|
 pub fn SinkSpec::discard() -> SinkSpec {
   SinkSpec::Discard
 }
@@ -66,6 +90,13 @@ pub fn SinkSpec::durable(name : String) -> SinkSpec raise ApiError {
     raise ApiError::EmptySinkId
   }
   SinkSpec::Durable(name)
+}
+
+///|
+pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
+  match self {
+    SinkSpec::Discard | SinkSpec::Durable(_) => DeliveryGuarantee::AtLeastOnce
+  }
 }
 
 ///|
@@ -229,7 +260,7 @@ pub fn JobDefinition::artifact(self : JobDefinition) -> OperatorArtifact? {
 /// representation of the local/cluster runner.
 pub struct Event {
   record : @protocol.EventRecord
-} derive(Debug, Eq)
+} derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 pub fn Event::new(
@@ -271,6 +302,134 @@ pub fn Event::key(self : Event) -> String {
 ///|
 pub fn Event::payload(self : Event) -> Json {
   self.record.payload()
+}
+
+///|
+pub(all) enum JobRunPhase {
+  Created
+  Running
+  Draining
+  Succeeded
+  Failed
+  Cancelled
+} derive(Debug, Eq, Compare, ToJson, FromJson)
+
+///|
+/// A serializable handoff envelope with a stable submission identity. The
+/// embedded ClusterSubmission still carries plan and operator compatibility.
+pub(all) struct JobSubmission {
+  submission_id : String
+  job : ClusterSubmission
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobSubmission::new(
+  submission_id : String,
+  job : ClusterSubmission,
+) -> JobSubmission raise ApiError {
+  if submission_id.is_empty() {
+    raise ApiError::EmptySubmissionId
+  }
+  { submission_id, job, }
+}
+
+///|
+pub fn JobSubmission::submission_id(self : JobSubmission) -> String {
+  self.submission_id
+}
+
+///|
+pub fn JobSubmission::job(self : JobSubmission) -> ClusterSubmission {
+  self.job
+}
+
+///|
+/// Commands share one schema between a local handle and a future remote
+/// Driver/Coordinator control session.
+pub(all) enum JobCommand {
+  Submit(JobSubmission)
+  Input(Array[Event])
+  Status
+  Drain
+  Cancel
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobCommand::submit(value : JobSubmission) -> JobCommand {
+  JobCommand::Submit(value)
+}
+
+///|
+pub fn JobCommand::input(events : ArrayView[Event]) -> JobCommand {
+  JobCommand::Input(events.to_owned())
+}
+
+///|
+pub fn JobCommand::status() -> JobCommand {
+  JobCommand::Status
+}
+
+///|
+pub fn JobCommand::drain() -> JobCommand {
+  JobCommand::Drain
+}
+
+///|
+pub fn JobCommand::cancel() -> JobCommand {
+  JobCommand::Cancel
+}
+
+///|
+/// Durable identity and lifecycle view returned by a Job handle.
+pub(all) struct JobRunStatus {
+  submission_id : String
+  job_id : String
+  plan_digest : String
+  phase : JobRunPhase
+  accepted_events : Int64
+  failure : String?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobRunStatus::new(
+  submission_id : String,
+  job_id : String,
+  plan_digest : String,
+  phase : JobRunPhase,
+  accepted_events : Int64,
+  failure : String?,
+) -> JobRunStatus {
+  { submission_id, job_id, plan_digest, phase, accepted_events, failure, }
+}
+
+///|
+pub fn JobRunStatus::submission_id(self : JobRunStatus) -> String {
+  self.submission_id
+}
+
+///|
+pub fn JobRunStatus::job_id(self : JobRunStatus) -> String {
+  self.job_id
+}
+
+///|
+pub fn JobRunStatus::plan_digest(self : JobRunStatus) -> String {
+  self.plan_digest
+}
+
+///|
+pub fn JobRunStatus::phase(self : JobRunStatus) -> JobRunPhase {
+  self.phase
+}
+
+///|
+pub fn JobRunStatus::accepted_events(self : JobRunStatus) -> Int64 {
+  self.accepted_events
+}
+
+///|
+pub fn JobRunStatus::failure(self : JobRunStatus) -> String? {
+  self.failure
 }
 
 ///|

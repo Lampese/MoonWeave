@@ -510,6 +510,7 @@ async fn run_worker_impl(
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
+  assignment_setup? : () -> Unit raise FrameIoError,
   drain_handler? : () -> Unit raise FrameIoError,
   output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
@@ -561,6 +562,10 @@ async fn run_worker_impl(
   match assignment_validator {
     None => ()
     Some(validator) => validator(assignment)
+  }
+  match assignment_setup {
+    None => ()
+    Some(setup) => setup()
   }
   let causal_log : @causal.CausalLog[Json] = @causal.CausalLog::new() catch {
     error => raise FrameIoError::Handler(@debug.to_string(error))

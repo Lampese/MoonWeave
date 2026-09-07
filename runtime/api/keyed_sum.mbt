@@ -176,6 +176,23 @@ pub async fn KeyedSumJob::run_local_cluster(
 }
 
 ///|
+pub async fn KeyedSumJob::run_coordinator_node(
+  self : KeyedSumJob,
+  config : CoordinatorNodeConfig,
+  events : ArrayView[KeyedSumEvent],
+) -> CoordinatorNodeSummary raise ApiError {
+  self.compile().run_coordinator_node(config, events)
+}
+
+///|
+pub async fn KeyedSumJob::run_worker_node(
+  self : KeyedSumJob,
+  config : WorkerNodeConfig,
+) -> WorkerNodeSummary raise ApiError {
+  self.compile().run_worker_node(config)
+}
+
+///|
 /// A compiled keyed-sum plan. It exposes only deterministic placement and
 /// execution entry points, not the underlying JobSpec or TaskSpec.
 pub struct KeyedSumPlan {
@@ -223,6 +240,24 @@ pub async fn KeyedSumPlan::run_local_cluster(
     job_id: self.job_id(),
     summary: self.compiled.run_local_cluster(config, records),
   }
+}
+
+///|
+pub async fn KeyedSumPlan::run_coordinator_node(
+  self : KeyedSumPlan,
+  config : CoordinatorNodeConfig,
+  events : ArrayView[KeyedSumEvent],
+) -> CoordinatorNodeSummary raise ApiError {
+  let records = events.map(event => event.event)
+  self.compiled.run_coordinator_node(config, records)
+}
+
+///|
+pub async fn KeyedSumPlan::run_worker_node(
+  self : KeyedSumPlan,
+  config : WorkerNodeConfig,
+) -> WorkerNodeSummary raise ApiError {
+  self.compiled.run_worker_node(config)
 }
 
 ///|

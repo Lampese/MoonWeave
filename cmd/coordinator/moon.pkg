@@ -1,12 +1,9 @@
 import {
   "moonweave/moonweave/causal",
-  "moonweave/moonweave/protocol",
-  "moonweave/moonweave/runtime/async" @transport,
-  "moonweave/moonweave/runtime/control",
+  "moonweave/moonweave/runtime/api" @flow,
   "moonbitlang/async",
-  "moonbitlang/async/socket",
   "moonbitlang/core/env",
-  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
   "moonbitlang/core/strconv",
 }
 

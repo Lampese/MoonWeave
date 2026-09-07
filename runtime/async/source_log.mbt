@@ -184,6 +184,11 @@ pub fn SourceLog::event_count(self : SourceLog) -> Int {
 }
 
 ///|
+pub fn SourceLog::contains(self : SourceLog, id : @causal.EventId) -> Bool {
+  self.locations.contains(id)
+}
+
+///|
 pub fn SourceLog::next_offset(self : SourceLog, partition : Int) -> Int64? {
   self.next_offsets.get(partition)
 }

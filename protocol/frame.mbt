@@ -2,6 +2,9 @@
 /// Kinds of messages exchanged by the coordinator and workers.
 pub(all) enum FrameKind {
   Hello
+  DriverSubmit
+  DriverCommand
+  DriverStatus
   Welcome
   Assign
   Revoke

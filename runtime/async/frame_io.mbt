@@ -77,6 +77,40 @@ pub async fn[W : @io.Writer] write_frame(
 }
 
 ///|
+/// Unlike read_frame, clean EOF at a frame boundary is not an error. A
+/// truncated header/body still fails; it must never be mistaken for shutdown.
+pub async fn[R : @io.Reader] read_optional_frame(
+  reader : R,
+  maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+) -> @protocol.Frame? {
+  if maximum_frame_bytes <= 0 {
+    raise FrameIoError::InvalidMaximumFrameBytes(maximum_frame_bytes)
+  }
+  guard reader.read_some(max_len=4) is Some(first) else { return None }
+  let header = if first.length() < 4 {
+    let buffer = Buffer()
+    buffer.write_bytes(first)
+    buffer.write_bytes(reader.read_exactly(4 - first.length()))
+    buffer.to_bytes()
+  } else {
+    first
+  }
+  let length = (header[0].to_int() << 24) +
+    (header[1].to_int() << 16) +
+    (header[2].to_int() << 8) +
+    header[3].to_int()
+  if length < 0 || length > maximum_frame_bytes {
+    raise FrameIoError::FrameTooLarge(actual=length, limit=maximum_frame_bytes)
+  }
+  Some(
+    @protocol.Frame::decode_payload(
+      reader.read_exactly(length),
+      maximum_frame_bytes~,
+    ),
+  )
+}
+
+///|
 /// Serve one connection until the peer closes it. Each frame is echoed only
 /// after it has passed the protocol decoder.
 pub async fn serve_echo(

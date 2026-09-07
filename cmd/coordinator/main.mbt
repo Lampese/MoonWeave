@@ -11,63 +11,49 @@ fn option(args : Array[String], name : String, fallback : String) -> String {
 }
 
 ///|
+fn parse_endpoint(value : String) -> @flow.NodeEndpoint raise {
+  let parts = value.split(":").to_array()
+  if parts.length() != 2 {
+    raise @flow.ApiError::InvalidEndpoint(value)
+  }
+  let port : Int = @strconv.from_str(parts[1]) catch {
+    _ => raise @flow.ApiError::InvalidEndpoint(value)
+  }
+  @flow.NodeEndpoint::new(parts[0].to_owned(), port)
+}
+
+///|
 async fn main {
   let args = @env.args()
+  let bind = parse_endpoint(option(args, "--bind", "0.0.0.0:7801"))
+  let advertised = parse_endpoint(option(args, "--advertise", "127.0.0.1:7801"))
   let worker_id = option(args, "--worker", "worker-1")
-  let incarnation_text = option(args, "--incarnation", "boot-cli")
-  let port_text = option(args, "--port", "7801")
-  let journal_path = option(args, "--journal", "moonweave-coordinator.journal")
-  let checkpoint_path = option(
-    args, "--checkpoint", "moonweave-coordinator.json",
-  )
-  let port : Int = @strconv.from_str(port_text) catch {
-    _ => {
-      println("--port must be an integer")
-      panic()
-    }
-  }
-  let store = @transport.CoordinatorStore::open(
+  let incarnation = option(args, "--incarnation", "boot-cli")
+  let storage = option(args, "--storage", "moonweave-coordinator")
+  let job_id = option(args, "--job", "cli-job")
+  let job = @flow.JobDefinition::new(job_id, @flow.OperatorRef::reachability())
+    .with_workers([worker_id])
+    .compile()
+  let config = @flow.CoordinatorNodeConfig::new(
     "cli-cluster",
     "coordinator",
-    journal_path,
-    checkpoint_path~,
-  ) catch {
-    error => {
-      println(@debug.to_string(error))
-      panic()
-    }
-  }
-  let incarnation = @protocol.Incarnation::new(incarnation_text)
-  ignore(store.register_worker(worker_id, incarnation, ["reachability"]))
-  let assignment = store.assign(0, worker_id)
-  let event = @protocol.EventRecord::new(
+    bind,
+    storage,
+    [@flow.WorkerSlot::new(worker_id, incarnation)],
+  ).with_advertised_endpoint(advertised)
+  let event = @flow.Event::new(
     @causal.EventId::new("cli-source", 0),
     [],
     "cli",
     Json::object({ "source": Json::string("A"), "target": Json::string("B") }),
   )
-  let batch = @protocol.EventBatch::new(0, assignment.epoch(), 0L, [event])
-  let server = @socket.TcpServer(
-    @socket.Addr::parse("127.0.0.1:" + port.to_string()),
-    reuse_addr=true,
-  )
-  println("coordinator listening on \{server.addr}; worker=\{worker_id}")
-  let (connection, _) = server.accept()
-  let summary = @transport.run_durable_managed_coordinator(
-    connection,
-    store,
-    worker_id,
-    "cli-session",
-    0,
-    [batch],
-  ) catch {
-    error => {
-      println(@debug.to_string(error))
-      panic()
-    }
-  }
+  let summary = job.run_coordinator_node(config, [event])
+  println("coordinator endpoint=\{summary.endpoint().to_string()}")
   println(
-    "coordinator sent=\{summary.sent_batches()} applied=\{summary.applied_offset()}",
+    "completed=\{summary.completed_partitions()} failed=\{summary.failed_partitions()}",
   )
-  server.close()
+  println("sent_batches=\{summary.sent_batches()}")
+  for failure in summary.failures() {
+    println("failure=\{failure}")
+  }
 }

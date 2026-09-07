@@ -31,6 +31,8 @@ pub async fn coordinator_send_seal(@socket.Tcp, @protocol.CoordinatorSession, @p
 
 pub async fn[R : @io.Reader] read_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame raise FrameIoError
 
+pub async fn[R : @io.Reader] read_optional_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame?
+
 pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String) -> ReconciliationSummary raise ReconciliationError
 
 pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoError, RetryPolicy) -> Y raise FrameIoError
@@ -67,7 +69,7 @@ pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorSt
 
 pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int) -> WorkerRunSummary raise FrameIoError
 
-pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
 
@@ -717,6 +719,7 @@ pub struct SourceLog {
 pub async fn SourceLog::append(Self, Int, Int64, @protocol.EventRecord) -> Int64 raise SourceLogError
 pub fn SourceLog::batches(Self, Int, Int, Int64, maximum_batch_events? : Int) -> Array[@protocol.EventBatch] raise SourceLogError
 pub fn SourceLog::close(Self) -> Unit
+pub fn SourceLog::contains(Self, @causal.EventId) -> Bool
 pub fn SourceLog::event_count(Self) -> Int
 pub fn SourceLog::next_offset(Self, Int) -> Int64?
 pub async fn SourceLog::open(String) -> Self raise SourceLogError

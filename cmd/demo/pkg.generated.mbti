@@ -1,0 +1,17 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/cmd/demo"
+
+// Values
+
+// Errors
+
+// Types and methods
+type Order
+
+type RevenueOrder
+
+type WindowRevenue
+
+// Type aliases
+
+// Traits

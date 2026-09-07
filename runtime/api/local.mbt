@@ -177,3 +177,12 @@ pub fn LocalRun::close(self : LocalRun) -> Unit raise ApiError {
   }
   self.closed = true
 }
+
+///|
+pub fn LocalRun::cancel(self : LocalRun) -> Unit {
+  if self.closed {
+    return
+  }
+  self.task_set.fail()
+  self.closed = true
+}

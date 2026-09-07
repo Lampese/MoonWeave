@@ -19,9 +19,12 @@ pub async fn run_worker_task(
   heartbeat_interval_ms? : Int = 0,
   delta_wal_path? : String,
   output_log_path? : String,
+  dynamic_assignment? : Bool = false,
 ) -> WorkerRunSummary raise FrameIoError {
-  task.start() catch {
-    error => raise FrameIoError::Task(error)
+  if !dynamic_assignment {
+    task.start() catch {
+      error => raise FrameIoError::Task(error)
+    }
   }
   let output_log = match output_log_path {
     None => None
@@ -155,14 +158,33 @@ pub async fn run_worker_task(
       delta_handler~,
       delta_wal_path?,
       assignment_validator=assignment => {
-        task.validate_assignment(assignment) catch {
-          error => raise FrameIoError::Task(error)
+        if dynamic_assignment {
+          task.adopt_assignment(assignment) catch {
+            error => raise FrameIoError::Task(error)
+          }
+        } else {
+          task.validate_assignment(assignment) catch {
+            error => raise FrameIoError::Task(error)
+          }
         }
+      },
+      assignment_setup?=if dynamic_assignment {
+        Some(() => {
+          task.start() catch {
+            error => raise FrameIoError::Task(error)
+          }
+        })
+      } else {
+        None
       },
       state_restore~,
       state_snapshot~,
       output_barrier~,
-      requested_partition=task.partition(),
+      requested_partition?=if dynamic_assignment {
+        None
+      } else {
+        Some(task.partition())
+      },
       drain_handler=() => {
         task.drain() catch {
           error => raise FrameIoError::Task(error)

@@ -112,8 +112,8 @@ pub struct Task {
   operator_id : String
   operator : OperatorKind
   partition : Int
-  epoch : Int
-  start_offset : Int64
+  mut epoch : Int
+  mut start_offset : Int64
   mut phase : TaskPhase
   mut offset : Int64
   mut frontier : @causal.Frontier
@@ -251,6 +251,28 @@ pub fn Task::validate_assignment(
   if assignment.next_offset() != self.start_offset {
     raise TaskError::InvalidOffset(assignment.next_offset())
   }
+}
+
+///|
+/// Adopt a newly fenced lease before a dynamic Worker starts replay. This is
+/// only valid while the Task is still Created, before any operator state has
+/// been applied.
+pub fn Task::adopt_assignment(
+  self : Task,
+  assignment : @protocol.Assignment,
+) -> Unit raise TaskError {
+  if self.phase != TaskPhase::Created {
+    raise TaskError::WrongPhase(expected=TaskPhase::Created, actual=self.phase)
+  }
+  if assignment.partition() != self.partition {
+    raise TaskError::PartitionMismatch(
+      expected=self.partition,
+      actual=assignment.partition(),
+    )
+  }
+  self.epoch = assignment.epoch()
+  self.start_offset = assignment.next_offset()
+  self.offset = self.start_offset - 1L
 }
 
 ///|

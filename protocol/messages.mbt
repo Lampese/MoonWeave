@@ -34,6 +34,194 @@ pub fn EventRecord::new(
 }
 
 ///|
+pub(all) struct DriverSubmit {
+  submission_id : String
+  job : Json
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn DriverSubmit::new(
+  submission_id : String,
+  job : Json,
+) -> DriverSubmit raise ProtocolError {
+  if submission_id.is_empty() {
+    raise ProtocolError::InvalidFrameField
+  }
+  { submission_id, job, }
+}
+
+///|
+pub fn DriverSubmit::submission_id(self : DriverSubmit) -> String {
+  self.submission_id
+}
+
+///|
+pub fn DriverSubmit::job(self : DriverSubmit) -> Json {
+  self.job
+}
+
+///|
+pub fn DriverSubmit::to_payload(self : DriverSubmit) -> String {
+  encode_payload(self)
+}
+
+///|
+pub fn DriverSubmit::from_payload(
+  text : String,
+) -> DriverSubmit raise MessageError {
+  let value : DriverSubmit = decode_payload(text)
+  DriverSubmit::new(value.submission_id, value.job) catch {
+    error => raise MessageError::Protocol(error)
+  }
+}
+
+///|
+pub(all) struct DriverCommand {
+  command : String
+  payload : Json?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn DriverCommand::new(
+  command : String,
+  payload? : Json,
+) -> DriverCommand raise ProtocolError {
+  if command.is_empty() {
+    raise ProtocolError::InvalidFrameField
+  }
+  { command, payload, }
+}
+
+///|
+pub fn DriverCommand::command(self : DriverCommand) -> String {
+  self.command
+}
+
+///|
+pub fn DriverCommand::payload(self : DriverCommand) -> Json? {
+  self.payload
+}
+
+///|
+pub fn DriverCommand::to_payload(self : DriverCommand) -> String {
+  encode_payload(self)
+}
+
+///|
+pub fn DriverCommand::from_payload(
+  text : String,
+) -> DriverCommand raise MessageError {
+  let value : DriverCommand = decode_payload(text)
+  DriverCommand::new(value.command, payload?=value.payload) catch {
+    error => raise MessageError::Protocol(error)
+  }
+}
+
+///|
+pub(all) struct DriverStatus {
+  submission_id : String
+  job_id : String
+  plan_digest : String
+  phase : String
+  accepted_events : Int64
+  failure : String?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn DriverStatus::new(
+  submission_id : String,
+  job_id : String,
+  plan_digest : String,
+  phase : String,
+  accepted_events : Int64,
+  failure : String?,
+) -> DriverStatus {
+  { submission_id, job_id, plan_digest, phase, accepted_events, failure, }
+}
+
+///|
+pub fn DriverStatus::submission_id(self : DriverStatus) -> String {
+  self.submission_id
+}
+
+///|
+pub fn DriverStatus::job_id(self : DriverStatus) -> String {
+  self.job_id
+}
+
+///|
+pub fn DriverStatus::plan_digest(self : DriverStatus) -> String {
+  self.plan_digest
+}
+
+///|
+pub fn DriverStatus::phase(self : DriverStatus) -> String {
+  self.phase
+}
+
+///|
+pub fn DriverStatus::accepted_events(self : DriverStatus) -> Int64 {
+  self.accepted_events
+}
+
+///|
+pub fn DriverStatus::failure(self : DriverStatus) -> String? {
+  self.failure
+}
+
+///|
+pub fn DriverStatus::to_payload(self : DriverStatus) -> String {
+  encode_payload(self)
+}
+
+///|
+pub fn DriverStatus::from_payload(
+  text : String,
+) -> DriverStatus raise MessageError {
+  let value : DriverStatus = decode_payload(text)
+  if value.submission_id.is_empty() ||
+    value.job_id.is_empty() ||
+    value.plan_digest.is_empty() ||
+    value.accepted_events < 0L {
+    raise MessageError::Malformed
+  }
+  match value.phase {
+    "Created" | "Running" | "Draining" | "Succeeded" | "Failed" | "Cancelled" =>
+      ()
+    _ => raise MessageError::Malformed
+  }
+  value
+}
+
+///|
+/// Application rejection is separate from a terminal execution failure.
+pub(all) struct DriverReply {
+  request_id : String
+  result : Result[DriverStatus, String]
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn DriverReply::to_payload(self : DriverReply) -> String {
+  encode_payload(self)
+}
+
+///|
+pub fn DriverReply::from_payload(
+  text : String,
+) -> DriverReply raise MessageError {
+  let value : DriverReply = decode_payload(text)
+  if value.request_id.is_empty() {
+    raise MessageError::Malformed
+  }
+  match value.result {
+    Ok(status) => ignore(DriverStatus::from_payload(status.to_payload()))
+    Err("") => raise MessageError::Malformed
+    Err(_) => ()
+  }
+  value
+}
+
+///|
 pub fn EventRecord::id(self : EventRecord) -> @causal.EventId {
   self.id
 }

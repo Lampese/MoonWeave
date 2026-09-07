@@ -2,6 +2,7 @@
 package "moonweave/moonweave/runtime/api"
 
 import {
+  "moonbitlang/async/socket",
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
   "moonweave/moonweave/causal",
@@ -34,6 +35,17 @@ pub(all) suberror ApiError {
   SubmissionMismatch(String)
   LocalModeUnsupported
   InvalidEvent(String)
+  EmptyKey
+  InvalidWindowSize(Int)
+  InvalidEndpoint(String)
+  InvalidPort(Int)
+  InvalidWorkerAssignment(String)
+  EmptySubmissionId
+  InvalidJobPhase(expected~ : JobRunPhase, actual~ : JobRunPhase)
+  UnknownSubmission(String)
+  RequestConflict(String)
+  InvalidDriverCommand(String)
+  DriverClosed
   TaskFailed(String)
   Closed
   Cluster(String)
@@ -41,6 +53,13 @@ pub(all) suberror ApiError {
 } derive(Eq, @debug.Debug)
 
 // Types and methods
+pub struct Aggregate[T, S, U] {
+  initial : (String) -> S
+  add : (S, T) -> S
+  emit : (String, S) -> U
+}
+pub fn[T, S, U] Aggregate::new((String) -> S, (S, T) -> S, (String, S) -> U) -> Self[T, S, U]
+
 pub struct ClusterConfig {
   cluster_id : String
   coordinator_id : String
@@ -90,19 +109,198 @@ pub fn CompiledJob::partition_count(Self) -> Int
 pub fn CompiledJob::partition_for_key(Self, String) -> Int
 pub fn CompiledJob::partitioning(Self) -> Partitioning
 pub fn CompiledJob::plan_digest(Self) -> String
+pub async fn CompiledJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[Event]) -> CoordinatorNodeSummary raise ApiError
 pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
 pub async fn CompiledJob::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
+pub async fn CompiledJob::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
 pub fn CompiledJob::sink(Self) -> SinkSpec
 pub fn CompiledJob::submission(Self) -> ClusterSubmission
+pub fn CompiledJob::submission_with_id(Self, String) -> JobSubmission raise ApiError
+
+pub struct CoordinatorListener {
+  config : CoordinatorNodeConfig
+  server : @socket.TcpServer
+}
+pub fn CoordinatorListener::close(Self) -> Unit
+pub fn CoordinatorListener::endpoint(Self) -> NodeEndpoint raise ApiError
+pub async fn CoordinatorListener::run(Self, CompiledJob, ArrayView[Event]) -> CoordinatorNodeSummary raise ApiError
+
+pub enum CoordinatorNode {
+  Instance
+}
+pub async fn CoordinatorNode::bind(CoordinatorNodeConfig) -> CoordinatorListener raise ApiError
+pub fn CoordinatorNode::new() -> Self
+
+pub struct CoordinatorNodeConfig {
+  cluster_id : String
+  coordinator_id : String
+  bind : NodeEndpoint
+  advertised : NodeEndpoint?
+  storage_dir : String
+  workers : Array[WorkerSlot]
+} derive(Eq, @debug.Debug)
+pub fn CoordinatorNodeConfig::advertised_endpoint(Self) -> NodeEndpoint?
+pub fn CoordinatorNodeConfig::bind(Self) -> NodeEndpoint
+pub fn CoordinatorNodeConfig::cluster_id(Self) -> String
+pub fn CoordinatorNodeConfig::coordinator_id(Self) -> String
+pub fn CoordinatorNodeConfig::new(String, String, NodeEndpoint, String, ArrayView[WorkerSlot]) -> Self raise ApiError
+pub fn CoordinatorNodeConfig::storage_dir(Self) -> String
+pub fn CoordinatorNodeConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
+pub fn CoordinatorNodeConfig::workers(Self) -> ArrayView[WorkerSlot]
+
+pub(all) struct CoordinatorNodeSummary {
+  endpoint : NodeEndpoint
+  plan_digest : String
+  worker_count : Int
+  completed_partitions : Int
+  failed_partitions : Int
+  sent_batches : Int
+  failures : Array[String]
+} derive(Eq, @debug.Debug)
+pub fn CoordinatorNodeSummary::completed_partitions(Self) -> Int
+pub fn CoordinatorNodeSummary::endpoint(Self) -> NodeEndpoint
+pub fn CoordinatorNodeSummary::failed_partitions(Self) -> Int
+pub fn CoordinatorNodeSummary::failures(Self) -> ArrayView[String]
+pub fn CoordinatorNodeSummary::plan_digest(Self) -> String
+pub fn CoordinatorNodeSummary::sent_batches(Self) -> Int
+pub fn CoordinatorNodeSummary::worker_count(Self) -> Int
+
+pub(all) enum DeliveryGuarantee {
+  AtLeastOnce
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DeliveryGuarantee::at_least_once() -> Self
+
+pub struct DriverClient {
+  config : DriverConfig
+  connection : @socket.Tcp
+  outbound : @protocol.FrameBuilder
+  session : @protocol.DriverClientSession
+  mut closed : Bool
+  operation_lock : @moonbitlang/async.Mutex
+  mut submitted : JobSubmission?
+}
+pub async fn DriverClient::await_completion(Self, poll_interval_ms? : Int, timeout_ms? : Int) -> JobRunStatus
+pub async fn DriverClient::cancel(Self) -> JobRunStatus raise ApiError
+pub fn DriverClient::close(Self) -> Unit
+pub async fn DriverClient::command(Self, JobCommand) -> JobRunStatus raise ApiError
+pub async fn DriverClient::connect(DriverConfig) -> Self raise ApiError
+pub async fn DriverClient::drain(Self) -> JobRunStatus raise ApiError
+pub async fn DriverClient::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
+pub async fn DriverClient::status(Self) -> JobRunStatus raise ApiError
+pub async fn DriverClient::submit(Self, JobSubmission) -> JobRunStatus raise ApiError
+
+pub(all) struct DriverConfig {
+  cluster_id : String
+  coordinator_id : String
+  driver_id : String
+  endpoint : NodeEndpoint
+  incarnation : String
+} derive(Eq, @debug.Debug)
+pub fn DriverConfig::cluster_id(Self) -> String
+pub fn DriverConfig::coordinator_id(Self) -> String
+pub fn DriverConfig::driver_id(Self) -> String
+pub fn DriverConfig::endpoint(Self) -> NodeEndpoint
+pub fn DriverConfig::incarnation(Self) -> String
+pub fn DriverConfig::new(String, String, String, NodeEndpoint) -> Self raise ApiError
+pub fn DriverConfig::with_incarnation(Self, String) -> Self raise ApiError
+
+pub(all) struct DriverControlConfig {
+  cluster_id : String
+  coordinator_id : String
+  bind : NodeEndpoint
+  advertised : NodeEndpoint?
+} derive(Eq, @debug.Debug)
+pub fn DriverControlConfig::advertised_endpoint(Self) -> NodeEndpoint?
+pub fn DriverControlConfig::bind(Self) -> NodeEndpoint
+pub fn DriverControlConfig::cluster_id(Self) -> String
+pub fn DriverControlConfig::coordinator_id(Self) -> String
+pub fn DriverControlConfig::new(String, String, NodeEndpoint) -> Self raise ApiError
+pub fn DriverControlConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
+
+pub struct DriverControlListener {
+  config : DriverControlConfig
+  server : @socket.TcpServer
+}
+pub async fn DriverControlListener::bind(DriverControlConfig) -> Self raise ApiError
+pub fn DriverControlListener::close(Self) -> Unit
+pub fn DriverControlListener::endpoint(Self) -> NodeEndpoint raise ApiError
+pub async fn DriverControlListener::run(Self, async (JobCommand) -> Result[JobRunStatus, String], max_connections? : Int) -> Unit
+pub async fn DriverControlListener::run_once(Self, async (JobCommand) -> Result[JobRunStatus, String]) -> Unit
+pub async fn DriverControlListener::run_store(Self, DriverStore, max_connections? : Int) -> Unit
+
+pub struct DriverCoordinator {
+  data_listener : CoordinatorListener
+  control_listener : DriverControlListener
+  store : DriverStore
+  execution_lock : @moonbitlang/async.Mutex
+  mut execution : CoordinatorNodeSummary?
+}
+pub async fn DriverCoordinator::bind(CoordinatorNodeConfig, DriverControlConfig, DriverStore) -> Self raise ApiError
+pub fn DriverCoordinator::close(Self) -> Unit
+pub fn DriverCoordinator::control_endpoint(Self) -> NodeEndpoint raise ApiError
+pub fn DriverCoordinator::data_endpoint(Self) -> NodeEndpoint raise ApiError
+pub async fn DriverCoordinator::run(Self) -> DriverCoordinatorSummary raise ApiError
+
+pub(all) struct DriverCoordinatorSummary {
+  status : JobRunStatus
+  execution : CoordinatorNodeSummary?
+} derive(Eq, @debug.Debug)
+pub fn DriverCoordinatorSummary::execution(Self) -> CoordinatorNodeSummary?
+pub fn DriverCoordinatorSummary::status(Self) -> JobRunStatus
+
+type DriverJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct DriverStore {
+  path : String
+  journal : @moonweave/moonweave/runtime/async.Wal
+  mut submission : JobSubmission?
+  mut compiled : CompiledJob?
+  mut phase : JobRunPhase
+  mut accepted_events : Int64
+  mut failure : String?
+  inputs : Array[Event]
+  event_index : Map[@causal.EventId, Event]
+  write_lock : @moonbitlang/async.Mutex
+}
+pub fn DriverStore::accepted_events(Self) -> Int64
+pub async fn DriverStore::cancel(Self) -> JobRunStatus raise ApiError
+pub fn DriverStore::close(Self) -> Unit
+pub async fn DriverStore::compact(Self) -> Unit raise ApiError
+pub async fn DriverStore::drain(Self) -> JobRunStatus raise ApiError
+pub async fn DriverStore::fail(Self, String) -> JobRunStatus raise ApiError
+pub async fn DriverStore::handle(Self, JobCommand) -> Result[JobRunStatus, String]
+pub async fn DriverStore::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
+pub fn DriverStore::inputs(Self) -> Array[Event] raise ApiError
+pub async fn DriverStore::open(String) -> Self raise ApiError
+pub fn DriverStore::path(Self) -> String
+pub fn DriverStore::phase(Self) -> JobRunPhase
+pub fn DriverStore::stats(Self) -> @moonweave/moonweave/runtime/async.WalStats
+pub fn DriverStore::status(Self) -> JobRunStatus raise ApiError
+pub fn DriverStore::submission(Self) -> JobSubmission? raise ApiError
+pub async fn DriverStore::submit(Self, JobSubmission) -> JobRunStatus raise ApiError
+pub async fn DriverStore::succeed(Self) -> JobRunStatus raise ApiError
 
 pub struct Event {
   record : @protocol.EventRecord
-} derive(Eq, @debug.Debug)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Event::id(Self) -> @causal.EventId
 pub fn Event::key(Self) -> String
 pub fn Event::keyed_sum(@causal.EventId, String, Int64) -> Self raise ApiError
 pub fn Event::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ApiError
 pub fn Event::payload(Self) -> Json
+
+pub(all) enum JobCommand {
+  Submit(JobSubmission)
+  Input(Array[Event])
+  Status
+  Drain
+  Cancel
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobCommand::cancel() -> Self
+pub fn JobCommand::drain() -> Self
+pub fn JobCommand::input(ArrayView[Event]) -> Self
+pub fn JobCommand::status() -> Self
+pub fn JobCommand::submit(JobSubmission) -> Self
 
 pub struct JobDefinition {
   job_id : String
@@ -136,6 +334,53 @@ pub fn JobDefinition::with_source(Self, SourceSpec) -> Self
 pub fn JobDefinition::with_workers(Self, ArrayView[String]) -> Self raise ApiError
 pub fn JobDefinition::workers(Self) -> ArrayView[String]
 
+pub(all) enum JobRunPhase {
+  Created
+  Running
+  Draining
+  Succeeded
+  Failed
+  Cancelled
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct JobRunStatus {
+  submission_id : String
+  job_id : String
+  plan_digest : String
+  phase : JobRunPhase
+  accepted_events : Int64
+  failure : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobRunStatus::accepted_events(Self) -> Int64
+pub fn JobRunStatus::failure(Self) -> String?
+pub fn JobRunStatus::job_id(Self) -> String
+pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?) -> Self
+pub fn JobRunStatus::phase(Self) -> JobRunPhase
+pub fn JobRunStatus::plan_digest(Self) -> String
+pub fn JobRunStatus::submission_id(Self) -> String
+
+pub(all) struct JobSubmission {
+  submission_id : String
+  job : ClusterSubmission
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobSubmission::compile(Self) -> CompiledJob raise ApiError
+pub fn JobSubmission::job(Self) -> ClusterSubmission
+pub fn JobSubmission::new(String, ClusterSubmission) -> Self raise ApiError
+pub fn JobSubmission::run_local(Self) -> LocalJobHandle raise ApiError
+pub fn JobSubmission::submission_id(Self) -> String
+
+pub struct KeyBy[T] {
+  selector : (T) -> String
+}
+pub fn[T] KeyBy::new((T) -> String) -> Self[T]
+
+pub struct KeyedStream[T] {
+  records : Array[(String, T)]
+}
+pub fn[T, S, U] KeyedStream::aggregate(Self[T], Aggregate[T, S, U]) -> Stream[U]
+pub fn[T] KeyedStream::records(Self[T]) -> ArrayView[(String, T)]
+pub fn[T] KeyedStream::window(Self[T], Window) -> WindowedKeyedStream[T]
+
 pub(all) struct KeyedSumEvent {
   event : Event
   value : Int64
@@ -152,8 +397,10 @@ pub struct KeyedSumJob {
 pub fn KeyedSumJob::compile(Self) -> KeyedSumPlan raise ApiError
 pub fn KeyedSumJob::job_id(Self) -> String
 pub fn KeyedSumJob::new(String) -> Self raise ApiError
+pub async fn KeyedSumJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[KeyedSumEvent]) -> CoordinatorNodeSummary raise ApiError
 pub fn KeyedSumJob::run_local(Self) -> KeyedSumRun raise ApiError
 pub async fn KeyedSumJob::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError
+pub async fn KeyedSumJob::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
 pub fn KeyedSumJob::with_durable_sink(Self, String) -> Self raise ApiError
 pub fn KeyedSumJob::with_partition_count(Self, Int) -> Self raise ApiError
 pub fn KeyedSumJob::with_workers(Self, ArrayView[String]) -> Self raise ApiError
@@ -166,8 +413,10 @@ pub fn KeyedSumPlan::job_id(Self) -> String
 pub fn KeyedSumPlan::partition_count(Self) -> Int
 pub fn KeyedSumPlan::partition_for_key(Self, String) -> Int
 pub fn KeyedSumPlan::plan_digest(Self) -> String
+pub async fn KeyedSumPlan::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[KeyedSumEvent]) -> CoordinatorNodeSummary raise ApiError
 pub fn KeyedSumPlan::run_local(Self) -> KeyedSumRun raise ApiError
 pub async fn KeyedSumPlan::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError
+pub async fn KeyedSumPlan::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
 
 pub struct KeyedSumRun {
   run : LocalRun
@@ -203,6 +452,21 @@ pub fn KeyedSumUpdate::key(Self) -> String
 pub fn KeyedSumUpdate::new(String, Int64) -> Self
 pub fn KeyedSumUpdate::total(Self) -> Int64
 
+pub struct LocalJobHandle {
+  submission : JobSubmission
+  compiled : CompiledJob
+  run : LocalRun
+  mut phase : JobRunPhase
+  mut accepted_events : Int64
+  failure : String?
+}
+pub fn LocalJobHandle::await_completion(Self) -> JobRunStatus
+pub fn LocalJobHandle::cancel(Self) -> Unit
+pub fn LocalJobHandle::close(Self) -> Unit raise ApiError
+pub fn LocalJobHandle::drain(Self) -> Unit raise ApiError
+pub fn LocalJobHandle::status(Self) -> JobRunStatus
+pub fn LocalJobHandle::submit(Self, ArrayView[Event]) -> Array[Output] raise ApiError
+
 pub(all) struct LocalProgress {
   job_id : String
   task_id : String
@@ -228,6 +492,7 @@ pub struct LocalRun {
   next_offsets : Map[Int, Int64]
   mut closed : Bool
 }
+pub fn LocalRun::cancel(Self) -> Unit
 pub fn LocalRun::close(Self) -> Unit raise ApiError
 pub fn LocalRun::job_id(Self) -> String
 pub fn LocalRun::phase(Self) -> LocalRunPhase
@@ -244,6 +509,15 @@ pub(all) enum LocalRunPhase {
   Failed
   Mixed
 } derive(Compare, Eq, @debug.Debug)
+
+pub(all) struct NodeEndpoint {
+  host : String
+  port : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NodeEndpoint::host(Self) -> String
+pub fn NodeEndpoint::new(String, Int) -> Self raise ApiError
+pub fn NodeEndpoint::port(Self) -> Int
+pub fn NodeEndpoint::to_string(Self) -> String
 
 pub struct OperatorArtifact {
   reference : OperatorRef
@@ -329,17 +603,130 @@ pub(all) enum Partitioning {
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Partitioning::by_key() -> Self
 
+pub struct RunHandle[T] {
+  mut status : RunStatus
+  outputs : Array[T]
+}
+pub fn[T] RunHandle::await_completion(Self[T]) -> RunStatus
+pub fn[T] RunHandle::close(Self[T]) -> Unit
+pub fn[T] RunHandle::outputs(Self[T]) -> ArrayView[T]
+pub fn[T] RunHandle::status(Self[T]) -> RunStatus
+
+pub(all) enum RunStatus {
+  Created
+  Running
+  Succeeded
+  Closed
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct Sink[T] {
+  mode : SinkMode
+  phantom : T?
+}
+pub fn[T] Sink::collect() -> Self[T]
+pub fn[T] Sink::discard() -> Self[T]
+
+pub(all) enum SinkMode {
+  Collect
+  Discard
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub(all) enum SinkSpec {
   Discard
   Durable(String)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SinkSpec::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn SinkSpec::discard() -> Self
 pub fn SinkSpec::durable(String) -> Self raise ApiError
+
+pub struct Source[T] {
+  records : Array[T]
+}
+pub fn[T] Source::from_array(ArrayView[T]) -> Self[T]
+pub fn[T] Source::records(Self[T]) -> ArrayView[T]
+pub fn[T] Source::run(Self[T], Sink[T]) -> RunHandle[T]
+pub fn[T] Source::stream(Self[T]) -> Stream[T]
 
 pub(all) enum SourceSpec {
   Events
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SourceSpec::events() -> Self
+
+pub struct Stream[T] {
+  records : Array[T]
+}
+pub fn[T] Stream::collect(Self[T]) -> RunHandle[T]
+pub fn[T] Stream::discard(Self[T]) -> RunHandle[T]
+pub fn[T] Stream::filter(Self[T], (T) -> Bool) -> Self[T]
+pub fn[T] Stream::key_by(Self[T], KeyBy[T]) -> KeyedStream[T] raise ApiError
+pub fn[T] Stream::key_by_fn(Self[T], (T) -> String) -> KeyedStream[T] raise ApiError
+pub fn[T, U] Stream::map(Self[T], (T) -> U) -> Self[U]
+pub fn[T] Stream::records(Self[T]) -> ArrayView[T]
+pub fn[T] Stream::run(Self[T], Sink[T]) -> RunHandle[T]
+
+pub(all) enum Window {
+  Global
+  Count(Int)
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Window::count(Int) -> Self raise ApiError
+pub fn Window::global() -> Self
+
+pub struct WindowedKeyedStream[T] {
+  records : Array[(String, T)]
+  window : Window
+}
+pub fn[T, S, U] WindowedKeyedStream::aggregate(Self[T], Aggregate[T, S, U]) -> Stream[U]
+
+pub struct WorkerNodeConfig {
+  cluster_id : String
+  coordinator_id : String
+  coordinator : NodeEndpoint
+  worker_id : String
+  incarnation : String
+  storage_dir : String
+  partition : Int
+  epoch : Int
+  start_offset : Int64
+  assignment_known : Bool
+} derive(Eq, @debug.Debug)
+pub fn WorkerNodeConfig::cluster_id(Self) -> String
+pub fn WorkerNodeConfig::coordinator(Self) -> NodeEndpoint
+pub fn WorkerNodeConfig::coordinator_id(Self) -> String
+pub fn WorkerNodeConfig::epoch(Self) -> Int
+pub fn WorkerNodeConfig::incarnation(Self) -> String
+pub fn WorkerNodeConfig::new(String, String, NodeEndpoint, String, String, String, Int) -> Self raise ApiError
+pub fn WorkerNodeConfig::new_auto(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
+pub fn WorkerNodeConfig::new_auto_for_partition(String, String, NodeEndpoint, String, String, String, Int) -> Self raise ApiError
+pub fn WorkerNodeConfig::partition(Self) -> Int
+pub fn WorkerNodeConfig::start_offset(Self) -> Int64
+pub fn WorkerNodeConfig::storage_dir(Self) -> String
+pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
+pub fn WorkerNodeConfig::worker_id(Self) -> String
+
+pub(all) struct WorkerNodeSummary {
+  worker_id : String
+  partition : Int
+  replayed_batches : Int
+  replayed_deltas : Int
+  live_batches : Int
+  persisted_offset : Int64
+  applied_offset : Int64
+} derive(Eq, @debug.Debug)
+pub fn WorkerNodeSummary::applied_offset(Self) -> Int64
+pub fn WorkerNodeSummary::live_batches(Self) -> Int
+pub fn WorkerNodeSummary::partition(Self) -> Int
+pub fn WorkerNodeSummary::persisted_offset(Self) -> Int64
+pub fn WorkerNodeSummary::replayed_batches(Self) -> Int
+pub fn WorkerNodeSummary::replayed_deltas(Self) -> Int
+pub fn WorkerNodeSummary::worker_id(Self) -> String
+
+pub(all) struct WorkerSlot {
+  worker_id : String
+  incarnation : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn WorkerSlot::incarnation(Self) -> String
+pub fn WorkerSlot::new(String, String) -> Self raise ApiError
+pub fn WorkerSlot::worker_id(Self) -> String
 
 // Type aliases
 

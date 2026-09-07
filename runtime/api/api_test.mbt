@@ -16,6 +16,10 @@ test "job definitions compile to deterministic built-in plans" {
   assert_eq(compiled.partition_count(), 2)
   assert_eq(compiled.operator(), OperatorRef::reachability())
   assert_eq(compiled.sink(), SinkSpec::Durable("alerts"))
+  assert_eq(
+    compiled.sink().delivery_guarantee(),
+    DeliveryGuarantee::AtLeastOnce,
+  )
   assert_true(compiled.plan_digest().has_prefix("plan-"))
   assert_eq(compiled.plan_digest(), second.compile().plan_digest())
 }

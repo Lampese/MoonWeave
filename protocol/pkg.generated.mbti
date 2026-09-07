@@ -208,6 +208,95 @@ pub fn DrainRequest::from_payload(String) -> Self raise MessageError
 pub fn DrainRequest::new(Int, Int, Int64) -> Self raise ProtocolError
 pub fn DrainRequest::to_payload(Self) -> String
 
+pub struct DriverClientSession {
+  cluster_id : String
+  coordinator_id : String
+  driver_id : String
+  mut session_id : String
+  mut phase : DriverSessionPhase
+  mut next_sequence : Int64
+}
+pub fn DriverClientSession::accept_reply(Self, Frame, String) -> DriverReply raise SessionError
+pub fn DriverClientSession::accept_status(Self, Frame) -> DriverStatus raise SessionError
+pub fn DriverClientSession::close(Self) -> Unit
+pub fn DriverClientSession::new(String, String, String) -> Self raise SessionError
+pub fn DriverClientSession::phase(Self) -> DriverSessionPhase
+pub fn DriverClientSession::session_id(Self) -> String
+
+pub(all) struct DriverCommand {
+  command : String
+  payload : Json?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DriverCommand::command(Self) -> String
+pub fn DriverCommand::from_payload(String) -> Self raise MessageError
+pub fn DriverCommand::new(String, payload? : Json) -> Self raise ProtocolError
+pub fn DriverCommand::payload(Self) -> Json?
+pub fn DriverCommand::to_payload(Self) -> String
+
+pub(all) enum DriverInbound {
+  Submit(DriverSubmit)
+  Command(DriverCommand)
+} derive(Eq, @debug.Debug)
+
+pub(all) struct DriverReply {
+  request_id : String
+  result : Result[DriverStatus, String]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DriverReply::from_payload(String) -> Self raise MessageError
+pub fn DriverReply::to_payload(Self) -> String
+
+pub struct DriverSession {
+  cluster_id : String
+  coordinator_id : String
+  driver_id : String
+  mut session_id : String
+  mut phase : DriverSessionPhase
+  mut next_sequence : Int64
+  mut incarnation : String
+  seen_messages : Map[String, Frame]
+}
+pub fn DriverSession::accept_frame(Self, Frame) -> DriverInbound raise SessionError
+pub fn DriverSession::close(Self) -> Unit
+pub fn DriverSession::has_seen(Self, String) -> Bool
+pub fn DriverSession::new(String, String, String) -> Self raise SessionError
+pub fn DriverSession::next_sequence(Self) -> Int64
+pub fn DriverSession::phase(Self) -> DriverSessionPhase
+pub fn DriverSession::session_id(Self) -> String
+
+pub(all) enum DriverSessionPhase {
+  Disconnected
+  Running
+  Closed
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct DriverStatus {
+  submission_id : String
+  job_id : String
+  plan_digest : String
+  phase : String
+  accepted_events : Int64
+  failure : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DriverStatus::accepted_events(Self) -> Int64
+pub fn DriverStatus::failure(Self) -> String?
+pub fn DriverStatus::from_payload(String) -> Self raise MessageError
+pub fn DriverStatus::job_id(Self) -> String
+pub fn DriverStatus::new(String, String, String, String, Int64, String?) -> Self
+pub fn DriverStatus::phase(Self) -> String
+pub fn DriverStatus::plan_digest(Self) -> String
+pub fn DriverStatus::submission_id(Self) -> String
+pub fn DriverStatus::to_payload(Self) -> String
+
+pub(all) struct DriverSubmit {
+  submission_id : String
+  job : Json
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn DriverSubmit::from_payload(String) -> Self raise MessageError
+pub fn DriverSubmit::job(Self) -> Json
+pub fn DriverSubmit::new(String, Json) -> Self raise ProtocolError
+pub fn DriverSubmit::submission_id(Self) -> String
+pub fn DriverSubmit::to_payload(Self) -> String
+
 pub(all) struct EventBatch {
   partition : Int
   epoch : Int
@@ -283,6 +372,9 @@ pub fn FrameBuilder::worker_incarnation(Self) -> String
 
 pub(all) enum FrameKind {
   Hello
+  DriverSubmit
+  DriverCommand
+  DriverStatus
   Welcome
   Assign
   Revoke
