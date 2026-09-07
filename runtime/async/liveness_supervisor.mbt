@@ -62,7 +62,17 @@ pub async fn run_liveness_scan(
     })
   // A Job-backed scan needs a durable CoordinatorStore for its two-store
   // recovery intent. Reject this topology before touching liveness state.
-  if store is None && job_store is Some(_) && !stale.is_empty() {
+  let terminal_job = match job_store {
+    Some(job) =>
+      match job.phase() {
+        @control.JobPhase::Succeeded
+        | @control.JobPhase::Failed
+        | @control.JobPhase::Cancelled => true
+        _ => false
+      }
+    None => false
+  }
+  if store is None && job_store is Some(_) && !stale.is_empty() && !terminal_job {
     raise FrameIoError::Handler(
       "JobStore liveness recovery requires a durable CoordinatorStore",
     )
@@ -71,6 +81,11 @@ pub async fn run_liveness_scan(
   let actions = []
   for worker_id in stale {
     guard control.worker(worker_id) is Some(worker) else { continue }
+    // Terminal jobs are immutable. Heartbeat expiry after completion must not
+    // trigger either recovery or a Worker lifecycle transition.
+    if terminal_job {
+      continue
+    }
     let mut replacement : String? = None
     for worker_id_2 in replacements {
       if replacement is None &&
@@ -81,23 +96,7 @@ pub async fn run_liveness_scan(
       }
     }
     match replacement {
-      None => {
-        // A terminal Job must remain an immutable record. In particular, do
-        // not turn its Workers into Suspect merely because their last
-        // heartbeat predates the terminal transition.
-        let terminal = match job_store {
-          Some(job) =>
-            match job.phase() {
-              @control.JobPhase::Succeeded
-              | @control.JobPhase::Failed
-              | @control.JobPhase::Cancelled => true
-              _ => false
-            }
-          None => false
-        }
-        if terminal {
-          continue
-        }
+      None =>
         if worker.lifecycle() is @control.WorkerLifecycle::Active {
           match store {
             Some(durable) =>
@@ -110,7 +109,6 @@ pub async fn run_liveness_scan(
               }
           }
         }
-      }
       Some(replacement_id) =>
         match (store, job_store) {
           (Some(durable), Some(job)) => {

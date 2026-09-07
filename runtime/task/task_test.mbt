@@ -411,3 +411,23 @@ test "task snapshot preserves pending causal state and resumes deterministically
   ])
   assert_eq(restored.pending_count(), 0)
 }
+
+///|
+test "task snapshot JSON round-trip preserves operator schema identity" {
+  let task = Task::new(
+    "snapshot-json",
+    "reachability",
+    OperatorKind::Reachability,
+    0,
+    0,
+  )
+  task.start()
+  ignore(
+    task.process(0L, TaskInput::new(edge_event("snapshot-json", 0, "A", "B"))),
+  )
+  let snapshot = task.snapshot()
+  let decoded : TaskSnapshot = @json.from_json(@json.to_json(snapshot))
+  assert_eq(decoded, snapshot)
+  assert_eq(decoded.state_schema(), "reachability-state:v1")
+  assert_eq(decoded.operator_capability(), snapshot.operator_capability())
+}

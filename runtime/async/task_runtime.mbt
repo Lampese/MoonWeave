@@ -180,11 +180,7 @@ pub async fn run_worker_task(
       state_restore~,
       state_snapshot~,
       output_barrier~,
-      requested_partition?=if dynamic_assignment {
-        None
-      } else {
-        Some(task.partition())
-      },
+      requested_partition=task.partition(),
       state_schema=task.operator().state_schema(),
       drain_handler=() => {
         task.drain() catch {

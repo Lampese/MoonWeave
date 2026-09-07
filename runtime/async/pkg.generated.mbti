@@ -1001,12 +1001,13 @@ pub struct WorkerTaskWork {
   checkpoint_path : String?
   delta_wal_path : String?
   output_log_path : String?
+  dynamic_assignment : Bool
   maximum_frame_bytes : Int
   initial_credit_events : Int64
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
 }
-pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
 pub fn WorkerTaskWork::partition(Self) -> Int
 pub fn WorkerTaskWork::task(Self) -> @task.Task
 pub fn WorkerTaskWork::task_id(Self) -> String

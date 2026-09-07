@@ -14,6 +14,7 @@ pub struct WorkerTaskWork {
   checkpoint_path : String?
   delta_wal_path : String?
   output_log_path : String?
+  dynamic_assignment : Bool
   maximum_frame_bytes : Int
   initial_credit_events : Int64
   initial_credit_bytes : Int64
@@ -33,6 +34,7 @@ pub fn WorkerTaskWork::new(
   checkpoint_path? : String,
   delta_wal_path? : String,
   output_log_path? : String,
+  dynamic_assignment? : Bool = false,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   initial_credit_events? : Int64 = 128L,
   initial_credit_bytes? : Int64 = 4L * 1024L * 1024L,
@@ -50,6 +52,7 @@ pub fn WorkerTaskWork::new(
     checkpoint_path,
     delta_wal_path,
     output_log_path,
+    dynamic_assignment,
     maximum_frame_bytes,
     initial_credit_events,
     initial_credit_bytes,
@@ -220,6 +223,7 @@ pub async fn run_worker_task_set(
             heartbeat_interval_ms=work.heartbeat_interval_ms,
             delta_wal_path?=work.delta_wal_path,
             output_log_path?=work.output_log_path,
+            dynamic_assignment=work.dynamic_assignment,
           ),
         ) catch {
           error => Err(error)

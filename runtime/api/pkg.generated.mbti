@@ -767,13 +767,16 @@ pub struct WorkerNodeSetConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  partitions : Array[Int]?
 } derive(Eq, @debug.Debug)
 pub fn WorkerNodeSetConfig::cluster_id(Self) -> String
 pub fn WorkerNodeSetConfig::coordinator(Self) -> NodeEndpoint
 pub fn WorkerNodeSetConfig::coordinator_id(Self) -> String
 pub fn WorkerNodeSetConfig::incarnation(Self) -> String
 pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
+pub fn WorkerNodeSetConfig::partitions(Self) -> ArrayView[Int]
 pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
+pub fn WorkerNodeSetConfig::with_partitions(Self, ArrayView[Int]) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::worker_id(Self) -> String
 
 pub(all) struct WorkerNodeSetSummary {

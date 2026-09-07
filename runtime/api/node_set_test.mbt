@@ -81,3 +81,40 @@ async test "one Worker process runs every owned partition through independent TC
     }
   })
 }
+
+///|
+test "WorkerNodeSetConfig validates explicit partition hints" {
+  let config = WorkerNodeSetConfig::new(
+    "cluster",
+    "coordinator",
+    NodeEndpoint::new("127.0.0.1", 7000),
+    "worker-a",
+    "incarnation-a",
+    "/tmp/moonweave-worker",
+  )
+  assert_eq(config.partitions(), [])
+  let selected = config.with_partitions([3, 1, 2])
+  assert_eq(selected.partitions(), [1, 2, 3])
+  try config.with_partitions([]) catch {
+    ApiError::InvalidWorkerAssignment(reason) =>
+      assert_eq(reason, "partition list is empty")
+    error =>
+      fail("unexpected empty partition error: " + @debug.to_string(error))
+  } noraise {
+    _ => fail("empty partition list was accepted")
+  }
+  try config.with_partitions([1, 1]) catch {
+    ApiError::InvalidWorkerAssignment(reason) => assert_eq(reason, "1")
+    error =>
+      fail("unexpected duplicate partition error: " + @debug.to_string(error))
+  } noraise {
+    _ => fail("duplicate partition was accepted")
+  }
+  try config.with_partitions([-1]) catch {
+    ApiError::InvalidWorkerAssignment(reason) => assert_eq(reason, "-1")
+    error =>
+      fail("unexpected negative partition error: " + @debug.to_string(error))
+  } noraise {
+    _ => fail("negative partition was accepted")
+  }
+}

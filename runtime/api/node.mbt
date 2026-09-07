@@ -363,6 +363,7 @@ pub struct WorkerNodeSetConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  partitions : Array[Int]?
 } derive(Debug, Eq)
 
 ///|
@@ -396,6 +397,42 @@ pub fn WorkerNodeSetConfig::new(
     worker_id,
     incarnation,
     storage_dir,
+    partitions: None,
+  }
+}
+
+///|
+/// Override static JobSpec placement when this Worker is a recovery target.
+/// Each listed partition still receives its authoritative epoch/start offset
+/// from the Coordinator during the handshake.
+pub fn WorkerNodeSetConfig::with_partitions(
+  self : WorkerNodeSetConfig,
+  partitions : ArrayView[Int],
+) -> WorkerNodeSetConfig raise ApiError {
+  if partitions.is_empty() {
+    raise ApiError::InvalidWorkerAssignment("partition list is empty")
+  }
+  let seen : Set[Int] = Set([])
+  let copied : Array[Int] = []
+  for partition in partitions {
+    if partition < 0 || !seen.add_and_check(partition) {
+      raise ApiError::InvalidWorkerAssignment(partition.to_string())
+    }
+    copied.push(partition)
+  }
+  copied.sort()
+  { ..self, partitions: Some(copied), }
+}
+
+///|
+/// Return the explicit partition hint, or an empty view when static placement
+/// from the compiled JobSpec is used.
+pub fn WorkerNodeSetConfig::partitions(
+  self : WorkerNodeSetConfig,
+) -> ArrayView[Int] {
+  match self.partitions {
+    Some(value) => value[:]
+    None => []
   }
 }
 
@@ -1165,14 +1202,23 @@ pub async fn CompiledJob::run_worker_node_set(
   if !self.definition.workers.any(worker => worker == config.worker_id) {
     raise ApiError::InvalidWorkerAssignment(config.worker_id)
   }
-  let partitions : Array[Int] = []
-  for partition in 0..<self.spec.partition_count() {
-    let owner = self.spec.owner(partition) catch {
-      error => raise ApiError::Plan(error)
+  let partitions = match config.partitions {
+    Some(value) => value.copy()
+    None => {
+      let result : Array[Int] = []
+      for partition in 0..<self.spec.partition_count() {
+        let owner = self.spec.owner(partition) catch {
+          error => raise ApiError::Plan(error)
+        }
+        if owner == config.worker_id {
+          result.push(partition)
+        }
+      }
+      result
     }
-    if owner == config.worker_id {
-      partitions.push(partition)
-    }
+  }
+  if partitions.any(partition => partition >= self.spec.partition_count()) {
+    raise ApiError::InvalidWorkerAssignment("partition is outside JobSpec")
   }
   if partitions.is_empty() {
     raise ApiError::InvalidWorkerAssignment("Worker has no partitions")
@@ -1232,6 +1278,7 @@ pub async fn CompiledJob::run_worker_node_set(
         checkpoint_path=prefix + ".json",
         delta_wal_path=prefix + ".delta.wal",
         output_log_path?,
+        dynamic_assignment=config.partitions is Some(_),
       ),
     )
   }
