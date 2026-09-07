@@ -353,6 +353,87 @@ pub fn WorkerNodeConfig::start_offset(self : WorkerNodeConfig) -> Int64 {
 }
 
 ///|
+/// Identity and storage configuration for one Worker process that hosts every
+/// partition assigned to it by the compiled Job. Per-partition Task sessions
+/// are created by `run_worker_node_set`.
+pub struct WorkerNodeSetConfig {
+  cluster_id : String
+  coordinator_id : String
+  coordinator : NodeEndpoint
+  worker_id : String
+  incarnation : String
+  storage_dir : String
+} derive(Debug, Eq)
+
+///|
+pub fn WorkerNodeSetConfig::new(
+  cluster_id : String,
+  coordinator_id : String,
+  coordinator : NodeEndpoint,
+  worker_id : String,
+  incarnation : String,
+  storage_dir : String,
+) -> WorkerNodeSetConfig raise ApiError {
+  if cluster_id.is_empty() || coordinator_id.is_empty() {
+    raise ApiError::Cluster("cluster and coordinator ids are required")
+  }
+  coordinator.validate_connect()
+  if worker_id.is_empty() {
+    raise ApiError::EmptyWorkerId
+  }
+  ignore(
+    @protocol.Incarnation::new(incarnation) catch {
+      _ => raise ApiError::Cluster("worker incarnation is empty")
+    },
+  )
+  if storage_dir.is_empty() {
+    raise ApiError::Cluster("Worker storage directory is required")
+  }
+  {
+    cluster_id,
+    coordinator_id,
+    coordinator,
+    worker_id,
+    incarnation,
+    storage_dir,
+  }
+}
+
+///|
+pub fn WorkerNodeSetConfig::cluster_id(self : WorkerNodeSetConfig) -> String {
+  self.cluster_id
+}
+
+///|
+pub fn WorkerNodeSetConfig::coordinator_id(
+  self : WorkerNodeSetConfig,
+) -> String {
+  self.coordinator_id
+}
+
+///|
+pub fn WorkerNodeSetConfig::coordinator(
+  self : WorkerNodeSetConfig,
+) -> NodeEndpoint {
+  self.coordinator
+}
+
+///|
+pub fn WorkerNodeSetConfig::worker_id(self : WorkerNodeSetConfig) -> String {
+  self.worker_id
+}
+
+///|
+pub fn WorkerNodeSetConfig::incarnation(self : WorkerNodeSetConfig) -> String {
+  self.incarnation
+}
+
+///|
+pub fn WorkerNodeSetConfig::storage_dir(self : WorkerNodeSetConfig) -> String {
+  self.storage_dir
+}
+
+///|
 /// A Coordinator listener bound to a concrete endpoint. The listener can be
 /// started before a Worker process is launched, which makes port zero useful
 /// for tests and supervised local deployments.
@@ -488,6 +569,44 @@ pub(all) struct WorkerNodeSummary {
 ///|
 pub fn WorkerNodeSummary::worker_id(self : WorkerNodeSummary) -> String {
   self.worker_id
+}
+
+///|
+pub(all) struct WorkerNodeSetSummary {
+  worker_id : String
+  completed_tasks : Int
+  failed_tasks : Int
+  replayed_batches : Int
+  live_batches : Int
+} derive(Debug, Eq)
+
+///|
+pub fn WorkerNodeSetSummary::worker_id(self : WorkerNodeSetSummary) -> String {
+  self.worker_id
+}
+
+///|
+pub fn WorkerNodeSetSummary::completed_tasks(
+  self : WorkerNodeSetSummary,
+) -> Int {
+  self.completed_tasks
+}
+
+///|
+pub fn WorkerNodeSetSummary::failed_tasks(self : WorkerNodeSetSummary) -> Int {
+  self.failed_tasks
+}
+
+///|
+pub fn WorkerNodeSetSummary::replayed_batches(
+  self : WorkerNodeSetSummary,
+) -> Int {
+  self.replayed_batches
+}
+
+///|
+pub fn WorkerNodeSetSummary::live_batches(self : WorkerNodeSetSummary) -> Int {
+  self.live_batches
 }
 
 ///|
@@ -994,5 +1113,99 @@ pub async fn CompiledJob::run_worker_node(
     state_events: task.event_count(),
     pending_events: task.pending_count(),
     state_schema: self.descriptor.state_schema(),
+  }
+}
+
+///|
+/// Run every statically owned partition inside one Worker process. Each
+/// partition retains independent WAL/checkpoint/output paths and a distinct
+/// Task identity; the existing TaskSet runtime owns concurrent sessions.
+pub async fn CompiledJob::run_worker_node_set(
+  self : CompiledJob,
+  config : WorkerNodeSetConfig,
+) -> WorkerNodeSetSummary raise ApiError {
+  if !self.definition.workers.any(worker => worker == config.worker_id) {
+    raise ApiError::InvalidWorkerAssignment(config.worker_id)
+  }
+  let partitions : Array[Int] = []
+  for partition in 0..<self.spec.partition_count() {
+    let owner = self.spec.owner(partition) catch {
+      error => raise ApiError::Plan(error)
+    }
+    if owner == config.worker_id {
+      partitions.push(partition)
+    }
+  }
+  if partitions.is_empty() {
+    raise ApiError::InvalidWorkerAssignment("Worker has no partitions")
+  }
+  let storage_exists = @fs.exists(config.storage_dir) catch {
+    error =>
+      raise ApiError::Cluster(
+        "check Worker storage: " + @debug.to_string(error),
+      )
+  }
+  if !storage_exists {
+    @fs.mkdir(config.storage_dir, recursive=true) catch {
+      error =>
+        raise ApiError::Cluster(
+          "mkdir Worker storage: " + @debug.to_string(error),
+        )
+    }
+  }
+  let works : Array[@runtime.WorkerTaskWork] = []
+  for partition in partitions {
+    let connection = @socket.Tcp::connect_to_host(
+      config.coordinator.host(),
+      port=config.coordinator.port(),
+    ) catch {
+      error =>
+        raise ApiError::Cluster(
+          "connect Coordinator: " + @debug.to_string(error),
+        )
+    }
+    let task = self.descriptor.create_task(
+      self.definition.job_id + "/p" + partition.to_string() + "/e0",
+      partition,
+      0,
+      0L,
+      self.definition.max_state_events.unwrap_or(0),
+    )
+    let prefix = config.storage_dir + "/p" + partition.to_string()
+    let output_log_path = match self.definition.sink {
+      SinkSpec::Discard => None
+      SinkSpec::Durable(_) => Some(prefix + ".output.wal")
+    }
+    works.push(
+      @runtime.WorkerTaskWork::new(
+        connection,
+        config.cluster_id,
+        config.coordinator_id,
+        config.worker_id,
+        config.incarnation,
+        [
+          self.definition.operator.id(),
+          self.descriptor.capability(),
+          "causal-frontier",
+          self.descriptor.code_digest(),
+        ],
+        prefix + ".wal",
+        task,
+        checkpoint_path=prefix + ".json",
+        delta_wal_path=prefix + ".delta.wal",
+        output_log_path?,
+      ),
+    )
+  }
+  let summary = @runtime.run_worker_task_set(works, (_, _, _) => ()) catch {
+    error =>
+      raise ApiError::Cluster("run Worker TaskSet: " + @debug.to_string(error))
+  }
+  {
+    worker_id: config.worker_id,
+    completed_tasks: summary.completed_tasks(),
+    failed_tasks: summary.failed_tasks(),
+    replayed_batches: summary.replayed_batches(),
+    live_batches: summary.live_batches(),
   }
 }
