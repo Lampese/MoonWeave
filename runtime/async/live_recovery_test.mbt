@@ -227,6 +227,7 @@ async test "live reconnect expires without another Worker" {
       connection.close()
       let result = supervisor.wait()
       assert_eq(result.failed_partitions(), 1)
+      assert_true(result.recoverable_failures())
       assert_eq(result.failures()[0].attempts(), 2)
       assert_true(result.failures()[0].reason().contains("reconnect deadline"))
     }

@@ -665,10 +665,12 @@ pub(all) struct LiveSupervisorSummary {
   sent_batches : Int
   sent_deltas : Int
   failures : Array[SupervisorFailure]
+  recoverable_failures : Bool
 } derive(Eq, @debug.Debug)
 pub fn LiveSupervisorSummary::completed_partitions(Self) -> Int
 pub fn LiveSupervisorSummary::failed_partitions(Self) -> Int
 pub fn LiveSupervisorSummary::failures(Self) -> ArrayView[SupervisorFailure]
+pub fn LiveSupervisorSummary::recoverable_failures(Self) -> Bool
 pub fn LiveSupervisorSummary::sent_batches(Self) -> Int
 pub fn LiveSupervisorSummary::sent_deltas(Self) -> Int
 

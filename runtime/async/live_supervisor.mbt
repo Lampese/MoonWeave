@@ -355,6 +355,7 @@ pub(all) struct LiveSupervisorSummary {
   sent_batches : Int
   sent_deltas : Int
   failures : Array[SupervisorFailure]
+  recoverable_failures : Bool
 } derive(Debug, Eq)
 
 ///|
@@ -386,6 +387,13 @@ pub fn LiveSupervisorSummary::failures(
   self : LiveSupervisorSummary,
 ) -> ArrayView[SupervisorFailure] {
   self.failures[:]
+}
+
+///|
+pub fn LiveSupervisorSummary::recoverable_failures(
+  self : LiveSupervisorSummary,
+) -> Bool {
+  self.recoverable_failures
 }
 
 ///|
@@ -1010,6 +1018,12 @@ pub async fn run_live_source_supervisor(
     let completed : Set[Int] = Set([])
     let mut stopped = live.plan.partition_count() - active.length()
     let mut drain_started : Int64? = None
+    let mut failure_started : Int64? = None
+    let failure_collection_ms = if poll_interval_ms.to_int64() * 10L > 100L {
+      poll_interval_ms.to_int64() * 10L
+    } else {
+      100L
+    }
     while completed.length() < tasks.length() {
       if lifecycle.phase() == LiveJobPhase::Cancelled {
         raise FrameIoError::Handler("live job cancelled")
@@ -1035,21 +1049,59 @@ pub async fn run_live_source_supervisor(
             sent_deltas += summary.sent_deltas()
           }
           Some(Err(error)) => {
-            failures.push({
-              worker_id: attempts[index].worker_id,
-              partition: attempts[index].partition,
-              attempts: attempts[index].attempts,
-              reason: @debug.to_string(error),
-            })
-            group.return_immediately(LiveSupervisorSummary::{
-              completed_partitions: stopped,
-              failed_partitions: live.plan.partition_count() - stopped,
-              sent_batches,
-              sent_deltas,
-              failures,
-            })
+            let recoverable = match error {
+              FrameIoError::Io(_) => true
+              FrameIoError::Handler(message) =>
+                message.has_prefix("Worker reconnect deadline") ||
+                message.has_prefix("Worker handshake failed")
+              _ => false
+            }
+            if recoverable {
+              if failure_started is None {
+                failure_started = Some(@async.now())
+              }
+              completed.add(index)
+              stopped += 1
+              failures.push({
+                worker_id: attempts[index].worker_id,
+                partition: attempts[index].partition,
+                attempts: attempts[index].attempts,
+                reason: @debug.to_string(error),
+              })
+            } else {
+              // Protocol and state-machine errors are deterministic. Do
+              // not wait for unrelated sessions after a fail-closed error.
+              group.return_immediately(LiveSupervisorSummary::{
+                completed_partitions: stopped,
+                failed_partitions: live.plan.partition_count() - stopped,
+                sent_batches,
+                sent_deltas,
+                failures: failures +
+                [
+                  {
+                    worker_id: attempts[index].worker_id,
+                    partition: attempts[index].partition,
+                    attempts: attempts[index].attempts,
+                    reason: @debug.to_string(error),
+                  },
+                ],
+                recoverable_failures: false,
+              })
+            }
           }
         }
+      }
+      match failure_started {
+        Some(start) if @async.now() - start >= failure_collection_ms =>
+          group.return_immediately(LiveSupervisorSummary::{
+            completed_partitions: stopped,
+            failed_partitions: failures.length(),
+            sent_batches,
+            sent_deltas,
+            failures,
+            recoverable_failures: true,
+          })
+        _ => ()
       }
       if completed.length() < tasks.length() {
         @async.sleep(poll_interval_ms)
@@ -1061,6 +1113,7 @@ pub async fn run_live_source_supervisor(
       sent_batches,
       sent_deltas,
       failures,
+      recoverable_failures: !failures.is_empty(),
     }
   }) catch {
     error => raise FrameIoError::Io(@debug.to_string(error))

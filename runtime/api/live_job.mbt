@@ -258,6 +258,122 @@ fn source_backed_summary_failures(
 }
 
 ///|
+fn live_replacement_worker(
+  config : CoordinatorNodeConfig,
+  failed_worker : String,
+) -> String? {
+  if config.workers.length() <= 1 {
+    return None
+  }
+  for slot in config.workers {
+    if slot.worker_id() != failed_worker {
+      return Some(slot.worker_id())
+    }
+  }
+  None
+}
+
+///|
+fn live_worker_incarnation(
+  config : CoordinatorNodeConfig,
+  worker_id : String,
+) -> @protocol.Incarnation raise ApiError {
+  for slot in config.workers {
+    if slot.worker_id() == worker_id {
+      return @protocol.Incarnation::new(slot.incarnation()) catch {
+        error =>
+          raise live_execution_error("parse live Worker incarnation", error)
+      }
+    }
+  }
+  raise ApiError::InvalidWorkerAssignment(worker_id)
+}
+
+///|
+async fn SourceBackedExecution::recover_live_failures(
+  self : SourceBackedExecution,
+  summary : @runtime.LiveSupervisorSummary,
+) -> Bool raise ApiError {
+  let failed_workers : Array[String] = []
+  let failed_partitions : Map[String, Array[Int]] = Map([])
+  for failure in summary.failures() {
+    guard failure.partition() is Some(partition) else { return false }
+    let worker = failure.worker_id()
+    if worker.is_empty() {
+      return false
+    }
+    if !failed_workers.any(value => value == worker) {
+      failed_workers.push(worker)
+    }
+    match failed_partitions.get(worker) {
+      Some(values) =>
+        if !values.any(value => value == partition) {
+          values.push(partition)
+        }
+      None => failed_partitions[worker] = [partition]
+    }
+  }
+  if failed_workers.length() != 1 {
+    return false
+  }
+  let failed_worker = failed_workers[0]
+  let replacement = match
+    live_replacement_worker(self.listener.config, failed_worker) {
+    Some(value) => value
+    None => return false
+  }
+  let owned = self.coordinator
+    .snapshot()
+    .assignments()
+    .filter(assignment => assignment.worker_id() == failed_worker)
+  if owned.is_empty() {
+    return false
+  }
+  guard failed_partitions.get(failed_worker) is Some(failed) else {
+    return false
+  }
+  let owned_ids = owned.map(assignment => assignment.partition())
+  let failed_ids = failed.copy()
+  owned_ids.sort()
+  failed_ids.sort()
+  if owned_ids != failed_ids {
+    return false
+  }
+  let job_snapshot = self.job_store.snapshot()
+  for assignment in owned {
+    let saved = job_snapshot.partitions()[assignment.partition()]
+    if saved.worker_id() != assignment.worker_id() ||
+      saved.epoch() != assignment.epoch() ||
+      saved.phase() == @control.JobPartitionPhase::Succeeded {
+      return false
+    }
+  }
+  for assignment in owned {
+    self.job_store.fail_partition(
+      assignment.partition(),
+      assignment.worker_id(),
+      assignment.epoch(),
+      "live Worker transport disconnected",
+    ) catch {
+      error => raise live_execution_error("record live failed lease", error)
+    }
+  }
+  ignore(
+    @runtime.recover_worker_leases(
+      self.coordinator,
+      self.job_store,
+      failed_worker,
+      live_worker_incarnation(self.listener.config, failed_worker),
+      replacement,
+      reconcile_path=self.listener.config.storage_dir + "/live-reconcile.wal",
+    ) catch {
+      error => raise live_execution_error("recover live Worker leases", error)
+    },
+  )
+  true
+}
+
+///|
 /// Run all assigned Worker sessions until ingress is sealed and every source
 /// cursor has passed the existing drain barrier. This function is intentionally
 /// long-lived while the Driver phase is Running.
@@ -276,7 +392,7 @@ async fn SourceBackedExecution::run(
       failures: [],
     }
   }
-  let summary = @runtime.run_live_source_supervisor(
+  let mut summary = @runtime.run_live_source_supervisor(
     self.listener.server,
     self.source,
     output_manifest?=self.output_manifest,
@@ -296,20 +412,38 @@ async fn SourceBackedExecution::run(
     }
   }
   if summary.failed_partitions() > 0 {
-    let reason = source_backed_summary_failures(summary.failures()).join(", ")
-    if self.job_store.phase() == @control.JobPhase::Running ||
-      self.job_store.phase() == @control.JobPhase::Draining {
-      self.job_store.fail(
-        if reason.is_empty() {
-          "live Worker execution failed"
-        } else {
-          reason
-        },
+    let recovered = if summary.recoverable_failures() {
+      self.recover_live_failures(summary)
+    } else {
+      false
+    }
+    if recovered {
+      summary = @runtime.run_live_source_supervisor(
+        self.listener.server,
+        self.source,
+        output_manifest?=self.output_manifest,
       ) catch {
-        error => raise live_execution_error("record live Job failure", error)
+        error =>
+          raise live_execution_error("resume live source supervisor", error)
       }
     }
-  } else {
+    if summary.failed_partitions() > 0 {
+      let reason = source_backed_summary_failures(summary.failures()).join(", ")
+      if self.job_store.phase() == @control.JobPhase::Running ||
+        self.job_store.phase() == @control.JobPhase::Draining {
+        self.job_store.fail(
+          if reason.is_empty() {
+            "live Worker execution failed"
+          } else {
+            reason
+          },
+        ) catch {
+          error => raise live_execution_error("record live Job failure", error)
+        }
+      }
+    }
+  }
+  if summary.failed_partitions() == 0 {
     ignore(
       @runtime.reconcile_job_coordinator(
         self.coordinator,
