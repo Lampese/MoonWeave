@@ -55,6 +55,7 @@ pub struct SourceBackedJob {
   lifecycle : LiveJobControl
   mut failed : Bool
   mut closed : Bool
+  mut session_sequence : Int64
 }
 
 ///|
@@ -81,6 +82,7 @@ pub async fn SourceBackedJob::open(
     lifecycle: LiveJobControl::new(),
     failed: false,
     closed: false,
+    session_sequence: 0L,
   }
 }
 
@@ -581,7 +583,7 @@ async fn run_live_source_session(
   output_manifest : JobOutputManifest?,
 ) -> CoordinatorRunSummary raise FrameIoError {
   defer connection.close()
-  (@async.with_task_group <| group => {
+  let result : Result[CoordinatorRunSummary, FrameIoError] = (@async.with_task_group <| group => {
     let inbox = LiveFrameInbox::new()
     let pump = group.spawn(allow_failure=true) <| () => {
       inbox.pump(connection, maximum_frame_bytes)
@@ -596,12 +598,13 @@ async fn run_live_source_session(
     }
     pump.cancel()
     ignore(pump.wait() catch { _ => () })
-    match result {
-      Ok(value) => value
-      Err(error) => raise error
-    }
+    result
   }) catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  match result {
+    Ok(value) => value
+    Err(error) => raise error
   }
 }
 
@@ -776,12 +779,26 @@ async fn supervise_live_source_connection(
   poll_interval_ms : Int,
   drain_timeout_ms : Int,
   output_manifest : JobOutputManifest?,
+  attempt : LiveConnectionAttempt,
+  reconnect_timeout_ms : Int,
 ) -> CoordinatorRunSummary raise FrameIoError {
   let mut claimed_id = ""
   let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
-    let (connection, _) = accept_supervisor_connection(server, accept_lock)
+    let (connection, _) = if attempt.attempts == 1 {
+      accept_supervisor_connection(server, accept_lock)
+    } else {
+      @async.with_timeout(reconnect_timeout_ms, () => {
+        accept_supervisor_connection(server, accept_lock)
+      }) catch {
+        error => raise FrameIoError::Handler("Worker reconnect deadline: " + @debug.to_string(error))
+      }
+    }
     defer connection.close()
-    let hello_frame = read_frame(connection, maximum_frame_bytes~)
+    let hello_frame = @async.with_timeout(reconnect_timeout_ms, () => {
+      read_frame(connection, maximum_frame_bytes~)
+    }) catch {
+      error => raise FrameIoError::Handler("Worker handshake failed: " + @debug.to_string(error))
+    }
     let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
       error => raise FrameIoError::Message(error)
     }
@@ -791,6 +808,11 @@ async fn supervise_live_source_connection(
       hello.worker_id(),
       hello.requested_partition(),
     )
+    attempt.worker_id = worker.worker_id()
+    attempt.partition = Some(assignment.partition())
+    if job_store_partition(live.job_store, assignment.partition()).phase() == @control.JobPartitionPhase::Succeeded {
+      raise FrameIoError::Handler("Worker partition is already complete")
+    }
     let claim_key = hello.worker_id() + "#" + assignment.partition().to_string()
     claim_lock.acquire() catch {
       error => raise FrameIoError::Io(@debug.to_string(error))
@@ -820,13 +842,15 @@ async fn supervise_live_source_connection(
         )
       _ => ()
     }
+    live.session_sequence += 1L
     let (session, outbound) = coordinator_handshake_after_hello(
       connection,
       hello_frame,
       live.coordinator.state().cluster_id(),
       live.coordinator.state().coordinator_id(),
       hello.worker_id(),
-      live.plan.job_id() + "-live-p" + assignment.partition().to_string(),
+      live.plan.job_id() + "-live-p" + assignment.partition().to_string() +
+        "-s" + live.session_sequence.to_string(),
       assignment=spec,
       maximum_frame_bytes~,
     )
@@ -839,12 +863,71 @@ async fn supervise_live_source_connection(
   } catch {
     error => Err(error)
   }
-  if !claimed_id.is_empty() {
+  if outcome is Err(_) && !claimed_id.is_empty() {
     release_supervisor_claim(claimed, claim_lock, claimed_id)
   }
   match outcome {
     Ok(value) => value
     Err(error) => raise error
+  }
+}
+
+///|
+priv struct LiveConnectionAttempt {
+  mut worker_id : String
+  mut partition : Int?
+  mut attempts : Int
+}
+
+///|
+/// Retry only transport failures. The durable assignment and source cursor are
+/// retained; a fresh Worker Resume determines the unconfirmed suffix.
+async fn supervise_live_source_connection_with_retry(
+  server : @socket.TcpServer,
+  live : SourceBackedJob,
+  claimed : Set[String],
+  claim_lock : @async.Mutex,
+  accept_lock : @async.Mutex,
+  maximum_frame_bytes : Int,
+  poll_interval_ms : Int,
+  drain_timeout_ms : Int,
+  output_manifest : JobOutputManifest?,
+  reconnect_attempts : Int,
+  reconnect_backoff_ms : Int,
+  reconnect_timeout_ms : Int,
+  attempt : LiveConnectionAttempt,
+) -> CoordinatorRunSummary raise FrameIoError {
+  for ;; {
+    let result : Result[CoordinatorRunSummary, FrameIoError] = Ok(
+      supervise_live_source_connection(
+        server,
+        live,
+        live.lifecycle,
+        claimed,
+        claim_lock,
+        accept_lock,
+        maximum_frame_bytes,
+        poll_interval_ms,
+        drain_timeout_ms,
+        output_manifest,
+        attempt,
+        reconnect_timeout_ms,
+      ),
+    ) catch {
+      error => Err(error)
+    }
+    match result {
+      Ok(summary) => return summary
+      Err(FrameIoError::Io(_)) if attempt.attempts <= reconnect_attempts => {
+        attempt.attempts += 1
+        if reconnect_backoff_ms > 0 {
+          @async.sleep(reconnect_backoff_ms) catch {
+            error => raise FrameIoError::Io(@debug.to_string(error))
+          }
+        }
+      }
+      Err(error) => raise error
+    }
   }
 }
 
@@ -860,8 +943,15 @@ pub async fn run_live_source_supervisor(
   poll_interval_ms? : Int = 10,
   drain_timeout_ms? : Int = 5000,
   output_manifest? : JobOutputManifest,
+  reconnect_attempts? : Int = 3,
+  reconnect_backoff_ms? : Int = 10,
+  reconnect_timeout_ms? : Int = 5000,
 ) -> LiveSupervisorSummary raise FrameIoError {
-  if maximum_frame_bytes <= 0 || poll_interval_ms <= 0 || drain_timeout_ms <= 0 {
+  if maximum_frame_bytes <= 0 ||
+    poll_interval_ms <= 0 ||
+    drain_timeout_ms <= 0 ||
+    reconnect_attempts < 0 ||
+    reconnect_backoff_ms < 0 || reconnect_timeout_ms <= 0 {
     raise FrameIoError::Handler("invalid live supervisor configuration")
   }
   if !live.job_store.supervisor_lock.try_acquire() {
@@ -875,6 +965,7 @@ pub async fn run_live_source_supervisor(
     let claim_lock = @async.Mutex::Mutex()
     let accept_lock = @async.Mutex::Mutex()
     let tasks : Array[@async.Task[Result[CoordinatorRunSummary, FrameIoError]]] = []
+    let attempts : Array[LiveConnectionAttempt] = []
     let active = live.job_store
       .snapshot()
       .partitions()
@@ -882,12 +973,17 @@ pub async fn run_live_source_supervisor(
         partition.phase() != @control.JobPartitionPhase::Succeeded
       })
     for _ in active {
+      let attempt : LiveConnectionAttempt = { worker_id: "", partition: None, attempts: 1 }
+      attempts.push(attempt)
       tasks.push(
         group.spawn(allow_failure=true) <| () => {
           Ok(
-            supervise_live_source_connection(
-              server, live, lifecycle, claimed, claim_lock, accept_lock, maximum_frame_bytes,
-              poll_interval_ms, drain_timeout_ms, output_manifest,
+            supervise_live_source_connection_with_retry(
+              server, live, claimed, claim_lock, accept_lock, maximum_frame_bytes,
+              poll_interval_ms, drain_timeout_ms, output_manifest, reconnect_attempts,
+              reconnect_backoff_ms,
+              reconnect_timeout_ms,
+              attempt,
             ),
           ) catch {
             error => Err(error)
@@ -927,9 +1023,9 @@ pub async fn run_live_source_supervisor(
           }
           Some(Err(error)) => {
             failures.push({
-              worker_id: "",
-              partition: None,
-              attempts: 1,
+              worker_id: attempts[index].worker_id,
+              partition: attempts[index].partition,
+              attempts: attempts[index].attempts,
               reason: @debug.to_string(error),
             })
             group.return_immediately(LiveSupervisorSummary::{
