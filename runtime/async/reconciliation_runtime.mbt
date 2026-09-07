@@ -215,7 +215,7 @@ fn build_reconciliation_plan(
     }
   }
   repairs.sort_by((left, right) => left.partition.compare(right.partition))
-  { job_id: job_snapshot.job_id(), partitions: repairs, }
+  { job_id: job_snapshot.job_id(), partitions: repairs, recovery: None, }
 }
 
 ///|
@@ -460,17 +460,7 @@ pub async fn reconcile_job_coordinator(
   job : JobStore,
   reconcile_path? : String,
 ) -> ReconciliationSummary raise ReconciliationError {
-  let path = match reconcile_path {
-    Some(value) if !value.is_empty() => value
-    Some(_) => raise ReconciliationError::EmptyPath
-    None => job.journal_path() + ".coordinator-reconcile"
-  }
-  if path == coordinator.journal_path() ||
-    path == job.journal_path() ||
-    path == coordinator.checkpoint_path() ||
-    path == job.checkpoint_path() {
-    raise ReconciliationError::PathConflict
-  }
+  let path = reconciliation_sidecar_path(coordinator, job, reconcile_path)
   let log = ReconciliationLog::open(path)
   defer log.close()
   job.write_lock.acquire() catch {
@@ -487,24 +477,10 @@ pub async fn reconcile_job_coordinator(
       )
   }
   defer coordinator.write_lock.release()
-  let job_id = job.job_id()
-  let mut recovered_transactions = 0
-  let mut repaired_partitions = 0
-  for transaction_id in log.pending_ids() {
-    guard log.pending.get(transaction_id) is Some(plan) else {
-      raise ReconciliationError::Malformed
-    }
-    if plan.job_id != job_id {
-      raise ReconciliationError::StaleIntent(transaction_id)
-    }
-    ignore(validate_reconciliation_plan(plan))
-    for target in plan.partitions {
-      apply_reconciliation_partition(coordinator, job, target)
-      repaired_partitions += 1
-    }
-    log.commit(transaction_id)
-    recovered_transactions += 1
-  }
+  let (recovered_transactions, recovered_partitions) = replay_reconciliation_unlocked(
+    log, coordinator, job,
+  )
+  let mut repaired_partitions = recovered_partitions
   let plan = build_reconciliation_plan(coordinator, job)
   if plan.partitions.is_empty() {
     log.compact()
@@ -516,10 +492,8 @@ pub async fn reconcile_job_coordinator(
   }
   let transaction_id = log.transaction_id(plan)
   log.prepare(transaction_id, plan)
-  for target in plan.partitions {
-    apply_reconciliation_partition(coordinator, job, target)
-    repaired_partitions += 1
-  }
+  apply_reconciliation_plan(coordinator, job, plan)
+  repaired_partitions += plan.partitions.length()
   log.commit(transaction_id)
   log.compact()
   { repaired_transactions: 1, recovered_transactions, repaired_partitions, }

@@ -29,6 +29,7 @@ struct JobJournalEntry {
   applied_offset : Int64
   pending_events : Int
   reason : String
+  reassignments : Array[@control.JobReassignment]?
   work_plan : JobExecutionPlan?
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -130,6 +131,7 @@ fn empty_job_entry(kind : String) -> JobJournalEntry {
     applied_offset: -1L,
     pending_events: -1,
     reason: "",
+    reassignments: None,
     work_plan: None,
   }
 }
@@ -211,6 +213,16 @@ fn apply_job_entry(
           error => raise JobStoreError::Job(error)
         },
       )
+    "reassign_many" => {
+      guard entry.reassignments is Some(reassignments) else {
+        raise JobStoreError::Malformed
+      }
+      ignore(
+        state.reassign_many(reassignments[:]) catch {
+          error => raise JobStoreError::Job(error)
+        },
+      )
+    }
     "fail" =>
       state.fail(entry.reason) catch {
         error => raise JobStoreError::Job(error)
@@ -862,6 +874,43 @@ pub async fn JobStore::reassign(
     },
   )
   assignment
+}
+
+///|
+/// Persist a complete failed-Worker recovery decision as one Job WAL command.
+pub async fn JobStore::reassign_many(
+  self : JobStore,
+  reassignments : ArrayView[@control.JobReassignment],
+) -> Array[@control.JobPartition] raise JobStoreError {
+  let copied = reassignments.to_owned()
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  self.reconcile_reassign_many_unlocked(copied[:])
+}
+
+///|
+async fn JobStore::reconcile_reassign_many_unlocked(
+  self : JobStore,
+  reassignments : ArrayView[@control.JobReassignment],
+) -> Array[@control.JobPartition] raise JobStoreError {
+  let copied = reassignments.to_owned()
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("reassign_many"),
+    reassignments: Some(copied),
+  }
+  let preview = self.preview_state()
+  let assignments = preview.reassign_many(copied[:]) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.reassign_many(copied[:]) catch {
+      error => raise JobStoreError::Job(error)
+    },
+  )
+  assignments
 }
 
 ///|

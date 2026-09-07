@@ -35,6 +35,8 @@ pub async fn[R : @io.Reader] read_optional_frame(R, maximum_frame_bytes? : Int) 
 
 pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String) -> ReconciliationSummary raise ReconciliationError
 
+pub async fn recover_worker_leases(CoordinatorStore, JobStore, String, @protocol.Incarnation, String, reconcile_path? : String) -> Array[@control.PartitionAssignment] raise ReconciliationError
+
 pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoError, RetryPolicy) -> Y raise FrameIoError
 
 pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @protocol.AssignmentSpec, Array[@protocol.EventBatch], maximum_frame_bytes? : Int) -> CoordinatorRunSummary raise FrameIoError
@@ -51,7 +53,7 @@ pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorSto
 
 pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> LiveSupervisorSummary raise FrameIoError
+pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconnect_attempts? : Int, reconnect_backoff_ms? : Int, reconnect_timeout_ms? : Int) -> LiveSupervisorSummary raise FrameIoError
 
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
 
@@ -644,6 +646,7 @@ pub fn JobStore::journal_path(Self) -> String
 pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String) -> Self raise JobStoreError
 pub fn JobStore::phase(Self) -> @control.JobPhase
 pub async fn JobStore::reassign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
+pub async fn JobStore::reassign_many(Self, ArrayView[@control.JobReassignment]) -> Array[@control.JobPartition] raise JobStoreError
 pub async fn JobStore::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobStoreError
 pub async fn JobStore::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobStoreError
 pub fn JobStore::snapshot(Self) -> @control.JobSnapshot
@@ -736,6 +739,7 @@ pub struct SourceBackedJob {
   lifecycle : LiveJobControl
   mut failed : Bool
   mut closed : Bool
+  mut session_sequence : Int64
 }
 pub async fn SourceBackedJob::cancel(Self) -> Unit raise FrameIoError
 pub fn SourceBackedJob::close(Self) -> Unit
@@ -941,6 +945,8 @@ pub fn WalStats::payload_bytes(Self) -> Int64
 pub fn WalStats::physical_bytes(Self) -> Int64
 pub fn WalStats::record_count(Self) -> Int
 pub fn WalStats::repaired_tail_bytes(Self) -> Int64
+
+type WorkerRecoveryIntent derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct WorkerRunSummary {
   replayed_batches : Int

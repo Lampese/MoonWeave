@@ -857,6 +857,18 @@ pub async fn CoordinatorStore::fence_and_reassign(
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  self.reconcile_fence_and_reassign_unlocked(
+    worker_id, incarnation, replacement_worker_id,
+  )
+}
+
+///|
+async fn CoordinatorStore::reconcile_fence_and_reassign_unlocked(
+  self : CoordinatorStore,
+  worker_id : String,
+  incarnation : @protocol.Incarnation,
+  replacement_worker_id : String,
+) -> Array[@control.PartitionAssignment] raise CoordinatorStoreError {
   let preview = self.preview_state()
   let moved = preview.fence_and_reassign(
     worker_id, incarnation, replacement_worker_id,

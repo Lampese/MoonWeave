@@ -748,21 +748,12 @@ fn build_node_works(
 }
 
 ///|
-fn replacement_for_failed_partition(
+fn replacement_for_failed_worker(
   config : CoordinatorNodeConfig,
-  assignments : Map[Int, @control.PartitionAssignment],
-  partition : Int,
+  worker_id : String,
 ) -> String? {
-  guard assignments.get(partition) is Some(failed) else { return None }
-  let owned_count = assignments
-    .values()
-    .filter(value => value.worker_id() == failed.worker_id())
-    .length()
-  if owned_count != 1 {
-    return None
-  }
   for worker in config.workers {
-    if worker.worker_id() != failed.worker_id() {
+    if worker.worker_id() != worker_id {
       return Some(worker.worker_id())
     }
   }
@@ -770,55 +761,96 @@ fn replacement_for_failed_partition(
 }
 
 ///|
-async fn recover_node_partition(
+fn failed_worker_partitions(
+  summary : @runtime.SupervisorRunSummary,
+  assignments : Map[Int, @control.PartitionAssignment],
+) -> (Array[String], Map[String, Array[Int]]) raise ApiError {
+  let workers : Array[String] = []
+  let partitions : Map[String, Array[Int]] = Map([])
+  for failure in summary.failures() {
+    let worker_id = failure.worker_id()
+    guard !worker_id.is_empty() else {
+      raise ApiError::Cluster("failed Worker identity is missing")
+    }
+    guard failure.partition() is Some(partition) else {
+      raise ApiError::Cluster("failed Worker did not identify a partition")
+    }
+    guard assignments.get(partition) is Some(assignment) else {
+      raise ApiError::InvalidWorkerAssignment(partition.to_string())
+    }
+    if assignment.worker_id() != worker_id {
+      raise ApiError::InvalidWorkerAssignment(
+        "failure partition does not belong to failed Worker",
+      )
+    }
+    if !workers.any(value => value == worker_id) {
+      workers.push(worker_id)
+    }
+    match partitions.get(worker_id) {
+      Some(values) =>
+        if !values.any(value => value == partition) {
+          values.push(partition)
+        }
+      None => partitions[worker_id] = [partition]
+    }
+  }
+  (workers, partitions)
+}
+
+///|
+async fn recover_node_worker(
   coordinator : @runtime.CoordinatorStore,
   job_store : @runtime.JobStore,
   config : CoordinatorNodeConfig,
   assignments : Map[Int, @control.PartitionAssignment],
-  partition : Int,
-) -> @control.PartitionAssignment raise ApiError {
-  let old = match assignments.get(partition) {
-    Some(value) => value
-    None => raise ApiError::InvalidWorkerAssignment(partition.to_string())
+  worker_id : String,
+  failed_partitions : ArrayView[Int],
+) -> Array[@control.PartitionAssignment] raise ApiError {
+  let owned = assignments
+    .values()
+    .filter(value => value.worker_id() == worker_id)
+    .map(value => value.partition())
+    .to_array()
+  owned.sort()
+  let failed = failed_partitions.to_owned()
+  failed.sort()
+  if owned != failed {
+    raise ApiError::InvalidWorkerAssignment(
+      "automatic recovery requires every lease of a failed Worker to fail",
+    )
   }
-  let replacement = match
-    replacement_for_failed_partition(config, assignments, partition) {
+  guard assignments.get(failed[0]) is Some(old) else {
+    raise ApiError::InvalidWorkerAssignment("failed Worker has no lease")
+  }
+  let replacement = match replacement_for_failed_worker(config, worker_id) {
     Some(value) => value
     None =>
       raise ApiError::InvalidWorkerAssignment(
-        "automatic recovery requires one partition per failed Worker and a replacement",
+        "automatic recovery requires a replacement Worker",
       )
   }
-  let moved = coordinator.fence_and_reassign(
-    old.worker_id(),
+  let moved = @runtime.recover_worker_leases(
+    coordinator,
+    job_store,
+    worker_id,
     old.incarnation(),
     replacement,
+    reconcile_path=config.storage_dir + "/node-reconcile.wal",
   ) catch {
     error =>
       raise ApiError::Cluster(
-        "fence/reassign Worker: " + @debug.to_string(error),
+        "recover Worker leases: " + @debug.to_string(error),
       )
   }
-  guard moved.length() == 1 && moved[0].partition() == partition else {
+  guard moved.length() == owned.length() else {
     raise ApiError::InvalidWorkerAssignment(
       "recovery moved an unexpected lease",
     )
   }
-  ignore(
-    job_store.reassign(
-      partition,
-      replacement,
-      moved[0].epoch(),
-      moved[0].start_offset(),
-    ) catch {
-      error =>
-        raise ApiError::Cluster(
-          "persist Worker reassign: " + @debug.to_string(error),
-        )
-    },
-  )
-  assignments[partition] = moved[0]
-  moved[0]
+  for lease in moved {
+    assignments[lease.partition()] = lease
+  }
+  moved
 }
 
 ///|
@@ -952,37 +984,43 @@ pub async fn CoordinatorListener::run(
         "run Coordinator supervisor: " + @debug.to_string(error),
       )
   }
-  if summary.failed_workers() == 1 {
-    guard summary.failures()[0].partition() is Some(failed_partition) else {
-      raise ApiError::Cluster("failed Worker did not identify a partition")
-    }
-    if replacement_for_failed_partition(
-        self.config,
-        assignments,
-        failed_partition,
-      )
-      is Some(_) {
-      ignore(
-        recover_node_partition(
-          coordinator,
-          job_store,
-          self.config,
-          assignments,
-          failed_partition,
-        ),
-      )
-      let retry_works = build_node_works(job, events, assignments)
-      summary = @runtime.run_durable_job_supervisor(
-        self.server,
-        coordinator,
-        job_store,
-        retry_works,
-        output_manifest?,
-      ) catch {
-        error =>
-          raise ApiError::Cluster(
-            "run recovered Coordinator supervisor: " + @debug.to_string(error),
+  if summary.failed_workers() > 0 {
+    let (failed_workers, failed_partitions) = failed_worker_partitions(
+      summary, assignments,
+    )
+    if failed_workers.length() == 1 {
+      let worker_id = failed_workers[0]
+      guard failed_partitions.get(worker_id) is Some(partitions) else {
+        raise ApiError::Cluster("failed Worker partitions are missing")
+      }
+      match replacement_for_failed_worker(self.config, worker_id) {
+        Some(_) => {
+          ignore(
+            recover_node_worker(
+              coordinator,
+              job_store,
+              self.config,
+              assignments,
+              worker_id,
+              partitions[:],
+            ),
           )
+          let retry_works = build_node_works(job, events, assignments)
+          summary = @runtime.run_durable_job_supervisor(
+            self.server,
+            coordinator,
+            job_store,
+            retry_works,
+            output_manifest?,
+          ) catch {
+            error =>
+              raise ApiError::Cluster(
+                "run recovered Coordinator supervisor: " +
+                @debug.to_string(error),
+              )
+          }
+        }
+        None => ()
       }
     }
   }

@@ -148,6 +148,7 @@ async test "reconciliation compaction retains an unfinished prepare" {
     let plan = ReconciliationPlan::{
       job_id: "job-reconcile-pending",
       partitions: [target],
+      recovery: None,
     }
     let log = ReconciliationLog::open(reconcile)
     log.prepare("pending-prepare", plan)
@@ -285,6 +286,7 @@ async test "a prepared reconciliation transaction is replayed after a simulated 
     let transaction = ReconciliationPlan::{
       job_id: "job-reconcile-crash",
       partitions: [target],
+      recovery: None,
     }
     let log = ReconciliationLog::open(reconcile)
     log.prepare("crash-before-commit", transaction)

@@ -171,6 +171,18 @@ pub(all) enum JobPhase {
   Cancelled
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 
+pub(all) struct JobReassignment {
+  partition : Int
+  worker_id : String
+  epoch : Int
+  start_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn JobReassignment::epoch(Self) -> Int
+pub fn JobReassignment::new(Int, String, Int, Int64) -> Self
+pub fn JobReassignment::partition(Self) -> Int
+pub fn JobReassignment::start_offset(Self) -> Int64
+pub fn JobReassignment::worker_id(Self) -> String
+
 pub(all) struct JobSnapshot {
   version : Int
   job_id : String
@@ -214,6 +226,7 @@ pub fn JobState::partition_count(Self) -> Int
 pub fn JobState::partitions(Self) -> Array[JobPartition]
 pub fn JobState::phase(Self) -> JobPhase
 pub fn JobState::reassign(Self, Int, String, Int, Int64) -> JobPartition raise JobError
+pub fn JobState::reassign_many(Self, ArrayView[JobReassignment]) -> Array[JobPartition] raise JobError
 pub fn JobState::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobError
 pub fn JobState::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobError
 pub fn JobState::snapshot(Self) -> JobSnapshot

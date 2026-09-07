@@ -39,9 +39,21 @@ struct ReconciliationPartition {
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
+/// Durable intent for fencing one failed Worker and moving all of its leases.
+struct WorkerRecoveryIntent {
+  cluster_id : String
+  coordinator_id : String
+  old_worker_id : String
+  old_incarnation : String
+  replacement_worker_id : String
+  replacement_incarnation : String
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
 struct ReconciliationPlan {
   job_id : String
   partitions : Array[ReconciliationPartition]
+  recovery : WorkerRecoveryIntent?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -131,7 +143,42 @@ fn validate_reconciliation_plan(
       )
     }
   }
-  { job_id: plan.job_id, partitions, }
+  let validated = ReconciliationPlan::{ ..plan, partitions, }
+  if plan.recovery is Some(_) {
+    validate_worker_recovery_intent(validated)
+  }
+  validated
+}
+
+///|
+fn validate_worker_recovery_intent(
+  plan : ReconciliationPlan,
+) -> Unit raise ReconciliationError {
+  guard plan.recovery is Some(intent) else { return }
+  if intent.cluster_id.is_empty() ||
+    intent.coordinator_id.is_empty() ||
+    intent.old_worker_id.is_empty() ||
+    intent.old_incarnation.is_empty() ||
+    intent.replacement_worker_id.is_empty() ||
+    intent.replacement_incarnation.is_empty() ||
+    intent.old_worker_id == intent.replacement_worker_id ||
+    plan.partitions.is_empty() {
+    raise ReconciliationError::Malformed
+  }
+  ignore(
+    @protocol.Incarnation::new(intent.old_incarnation) catch {
+      _ => raise ReconciliationError::Malformed
+    },
+  )
+  for item in plan.partitions {
+    if item.worker_id != intent.replacement_worker_id ||
+      item.epoch <= 0 ||
+      item.next_offset != item.start_offset ||
+      item.persisted_offset != item.start_offset - 1L ||
+      item.applied_offset != item.start_offset - 1L {
+      raise ReconciliationError::CursorConflict(item.partition)
+    }
+  }
 }
 
 ///|

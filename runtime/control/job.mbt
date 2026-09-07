@@ -63,6 +63,45 @@ pub(all) struct JobPartition {
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
+/// One durable replacement decision for a failed Job partition.
+pub(all) struct JobReassignment {
+  partition : Int
+  worker_id : String
+  epoch : Int
+  start_offset : Int64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn JobReassignment::new(
+  partition : Int,
+  worker_id : String,
+  epoch : Int,
+  start_offset : Int64,
+) -> JobReassignment {
+  { partition, worker_id, epoch, start_offset, }
+}
+
+///|
+pub fn JobReassignment::partition(self : JobReassignment) -> Int {
+  self.partition
+}
+
+///|
+pub fn JobReassignment::worker_id(self : JobReassignment) -> String {
+  self.worker_id
+}
+
+///|
+pub fn JobReassignment::epoch(self : JobReassignment) -> Int {
+  self.epoch
+}
+
+///|
+pub fn JobReassignment::start_offset(self : JobReassignment) -> Int64 {
+  self.start_offset
+}
+
+///|
 pub fn JobPartition::partition(self : JobPartition) -> Int {
   self.partition
 }
@@ -670,6 +709,36 @@ pub fn JobState::reassign(
   }
   self.partitions[partition] = replacement
   replacement
+}
+
+///|
+/// Replace several failed leases as one state-machine command. Every
+/// replacement is validated against a snapshot before the live state changes,
+/// so duplicate or partially invalid batches cannot leave a mixed epoch set.
+pub fn JobState::reassign_many(
+  self : JobState,
+  reassignments : ArrayView[JobReassignment],
+) -> Array[JobPartition] raise JobError {
+  let preview = JobState::from_snapshot(self.snapshot())
+  let seen : Set[Int] = Set([])
+  let result : Array[JobPartition] = []
+  for item in reassignments {
+    if !seen.add_and_check(item.partition) {
+      raise JobError::AssignmentConflict(item.partition)
+    }
+    result.push(
+      preview.reassign(
+        item.partition,
+        item.worker_id,
+        item.epoch,
+        item.start_offset,
+      ),
+    )
+  }
+  for replacement in result {
+    self.partitions[replacement.partition] = replacement
+  }
+  result
 }
 
 ///|

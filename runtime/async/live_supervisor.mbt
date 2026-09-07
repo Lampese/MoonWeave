@@ -790,14 +790,20 @@ async fn supervise_live_source_connection(
       @async.with_timeout(reconnect_timeout_ms, () => {
         accept_supervisor_connection(server, accept_lock)
       }) catch {
-        error => raise FrameIoError::Handler("Worker reconnect deadline: " + @debug.to_string(error))
+        error =>
+          raise FrameIoError::Handler(
+            "Worker reconnect deadline: " + @debug.to_string(error),
+          )
       }
     }
     defer connection.close()
     let hello_frame = @async.with_timeout(reconnect_timeout_ms, () => {
       read_frame(connection, maximum_frame_bytes~)
     }) catch {
-      error => raise FrameIoError::Handler("Worker handshake failed: " + @debug.to_string(error))
+      error =>
+        raise FrameIoError::Handler(
+          "Worker handshake failed: " + @debug.to_string(error),
+        )
     }
     let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
       error => raise FrameIoError::Message(error)
@@ -810,7 +816,8 @@ async fn supervise_live_source_connection(
     )
     attempt.worker_id = worker.worker_id()
     attempt.partition = Some(assignment.partition())
-    if job_store_partition(live.job_store, assignment.partition()).phase() == @control.JobPartitionPhase::Succeeded {
+    if job_store_partition(live.job_store, assignment.partition()).phase() ==
+      @control.JobPartitionPhase::Succeeded {
       raise FrameIoError::Handler("Worker partition is already complete")
     }
     let claim_key = hello.worker_id() + "#" + assignment.partition().to_string()
@@ -849,8 +856,11 @@ async fn supervise_live_source_connection(
       live.coordinator.state().cluster_id(),
       live.coordinator.state().coordinator_id(),
       hello.worker_id(),
-      live.plan.job_id() + "-live-p" + assignment.partition().to_string() +
-        "-s" + live.session_sequence.to_string(),
+      live.plan.job_id() +
+      "-live-p" +
+      assignment.partition().to_string() +
+      "-s" +
+      live.session_sequence.to_string(),
       assignment=spec,
       maximum_frame_bytes~,
     )
@@ -951,7 +961,8 @@ pub async fn run_live_source_supervisor(
     poll_interval_ms <= 0 ||
     drain_timeout_ms <= 0 ||
     reconnect_attempts < 0 ||
-    reconnect_backoff_ms < 0 || reconnect_timeout_ms <= 0 {
+    reconnect_backoff_ms < 0 ||
+    reconnect_timeout_ms <= 0 {
     raise FrameIoError::Handler("invalid live supervisor configuration")
   }
   if !live.job_store.supervisor_lock.try_acquire() {
@@ -973,7 +984,11 @@ pub async fn run_live_source_supervisor(
         partition.phase() != @control.JobPartitionPhase::Succeeded
       })
     for _ in active {
-      let attempt : LiveConnectionAttempt = { worker_id: "", partition: None, attempts: 1 }
+      let attempt : LiveConnectionAttempt = {
+        worker_id: "",
+        partition: None,
+        attempts: 1,
+      }
       attempts.push(attempt)
       tasks.push(
         group.spawn(allow_failure=true) <| () => {
@@ -981,9 +996,7 @@ pub async fn run_live_source_supervisor(
             supervise_live_source_connection_with_retry(
               server, live, claimed, claim_lock, accept_lock, maximum_frame_bytes,
               poll_interval_ms, drain_timeout_ms, output_manifest, reconnect_attempts,
-              reconnect_backoff_ms,
-              reconnect_timeout_ms,
-              attempt,
+              reconnect_backoff_ms, reconnect_timeout_ms, attempt,
             ),
           ) catch {
             error => Err(error)
