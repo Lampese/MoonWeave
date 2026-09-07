@@ -43,7 +43,7 @@ pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @proto
 
 pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconcile_path? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_durable_liveness_scan(CoordinatorStore, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
+pub async fn run_durable_liveness_scan(CoordinatorStore, Int64, LivenessPolicy, job_store? : JobStore) -> Array[String] raise FrameIoError
 
 pub async fn run_durable_managed_coordinator(@socket.Tcp, CoordinatorStore, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe) -> CoordinatorRunSummary raise FrameIoError
 
@@ -55,9 +55,9 @@ pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, Jo
 
 pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconnect_attempts? : Int, reconnect_backoff_ms? : Int, reconnect_timeout_ms? : Int) -> LiveSupervisorSummary raise FrameIoError
 
-pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy) -> Array[String] raise FrameIoError
+pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy, job_store? : JobStore) -> Array[String] raise FrameIoError
 
-pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?, LivenessPolicy) -> Unit raise FrameIoError
+pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?, LivenessPolicy, job_store? : JobStore) -> Unit raise FrameIoError
 
 pub async fn run_managed_coordinator(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe) -> CoordinatorRunSummary raise FrameIoError
 

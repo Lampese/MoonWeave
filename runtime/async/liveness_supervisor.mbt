@@ -47,6 +47,7 @@ pub async fn run_liveness_scan(
   store : CoordinatorStore?,
   now_tick : Int64,
   policy : LivenessPolicy,
+  job_store? : JobStore,
 ) -> Array[String] raise FrameIoError {
   let stale = control
     .workers()
@@ -89,9 +90,49 @@ pub async fn run_liveness_scan(
     }
     match replacement {
       None => ()
-      Some(replacement_id) => {
-        match store {
-          Some(durable) =>
+      Some(replacement_id) =>
+        match (store, job_store) {
+          (Some(durable), Some(job)) => {
+            let job_snapshot = job.snapshot()
+            let old_partitions = job_snapshot
+              .partitions()
+              .filter(partition => partition.worker_id() == worker_id)
+            if old_partitions.is_empty() {
+              continue
+            }
+            if old_partitions.any(partition => {
+                partition.phase() == @control.JobPartitionPhase::Succeeded ||
+                partition.phase() == @control.JobPartitionPhase::Unassigned
+              }) {
+              continue
+            }
+            for partition in old_partitions {
+              if partition.phase() == @control.JobPartitionPhase::Running ||
+                partition.phase() == @control.JobPartitionPhase::Draining {
+                job.fail_partition(
+                  partition.partition(),
+                  partition.worker_id(),
+                  partition.epoch(),
+                  "Worker liveness timeout",
+                ) catch {
+                  error => raise FrameIoError::JobStore(error)
+                }
+              }
+            }
+            ignore(
+              recover_worker_leases(
+                durable,
+                job,
+                worker_id,
+                worker.incarnation(),
+                replacement_id,
+              ) catch {
+                error => raise FrameIoError::Reconciliation(error)
+              },
+            )
+            actions.push(worker_id)
+          }
+          (Some(durable), None) => {
             ignore(
               durable.fence_and_reassign(
                 worker_id,
@@ -101,7 +142,13 @@ pub async fn run_liveness_scan(
                 error => raise FrameIoError::CoordinatorStore(error)
               },
             )
-          None =>
+            actions.push(worker_id)
+          }
+          (None, Some(_)) =>
+            raise FrameIoError::Handler(
+              "JobStore liveness recovery requires a durable CoordinatorStore",
+            )
+          (None, None) => {
             ignore(
               control.fence_and_reassign(
                 worker_id,
@@ -111,9 +158,9 @@ pub async fn run_liveness_scan(
                 error => raise FrameIoError::Coordinator(error)
               },
             )
+            actions.push(worker_id)
+          }
         }
-        actions.push(worker_id)
-      }
     }
   }
   actions
@@ -126,8 +173,9 @@ pub async fn run_durable_liveness_scan(
   store : CoordinatorStore,
   now_tick : Int64,
   policy : LivenessPolicy,
+  job_store? : JobStore,
 ) -> Array[String] raise FrameIoError {
-  run_liveness_scan(store.state(), Some(store), now_tick, policy)
+  run_liveness_scan(store.state(), Some(store), now_tick, policy, job_store?)
 }
 
 ///|
@@ -136,11 +184,12 @@ pub async fn run_liveness_watchdog(
   control : @control.CoordinatorState,
   store : CoordinatorStore?,
   policy : LivenessPolicy,
+  job_store? : JobStore,
 ) -> Unit raise FrameIoError {
   for ;; {
     @async.sleep(policy.scan_interval_ms()) catch {
       error => raise FrameIoError::Io(@debug.to_string(error))
     }
-    ignore(run_liveness_scan(control, store, @async.now(), policy))
+    ignore(run_liveness_scan(control, store, @async.now(), policy, job_store?))
   }
 }

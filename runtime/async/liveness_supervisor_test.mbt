@@ -109,3 +109,51 @@ async test "durable suspect and delayed reassignment survive restart" {
   assert_eq(moved.start_offset(), 4L)
   final_store.close()
 }
+
+///|
+async test "durable liveness recovery moves Job and Coordinator leases together" {
+  let directory = @fs.tmpdir(prefix="moonweave-liveness-job")
+  defer @fs.rmdir(directory, recursive=true)
+  let coordinator = CoordinatorStore::open(
+    "liveness-job-cluster",
+    "coordinator",
+    directory + "/coordinator.wal",
+  )
+  defer coordinator.close()
+  let spec = @plan.JobSpec::new(
+    "liveness-job",
+    "reachability",
+    2,
+    ["worker-a", "worker-b"],
+    [],
+  )
+  let job = JobStore::open(spec, directory + "/job.wal")
+  defer job.close()
+  let old = @protocol.Incarnation::new("old")
+  let replacement = @protocol.Incarnation::new("replacement")
+  ignore(coordinator.register_worker("worker-a", old, []))
+  ignore(coordinator.register_worker("worker-b", replacement, []))
+  for partition in 0..<2 {
+    let assignment = coordinator.assign(partition, "worker-a")
+    ignore(job.assign(partition, "worker-a", assignment.epoch(), 0L))
+  }
+  job.start()
+  coordinator.record_heartbeat("worker-a", old, 5L)
+  let policy = LivenessPolicy::new(10L, 1, ["worker-b"])
+  assert_eq(
+    run_durable_liveness_scan(coordinator, 15L, policy, job_store=job),
+    ["worker-a"],
+  )
+  assert_eq(
+    coordinator.snapshot().assignments().map(value => value.worker_id()),
+    ["worker-b", "worker-b"],
+  )
+  assert_eq(job.snapshot().partitions().map(value => value.worker_id()), [
+    "worker-b", "worker-b",
+  ])
+  assert_eq(job.snapshot().partitions().map(value => value.epoch()), [1, 1])
+  assert_eq(job.phase(), @control.JobPhase::Running)
+  let replayed = reconcile_job_coordinator(coordinator, job)
+  assert_eq(replayed.recovered_transactions(), 0)
+  assert_eq(replayed.repaired_transactions(), 0)
+}
