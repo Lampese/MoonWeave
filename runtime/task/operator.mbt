@@ -5,6 +5,18 @@ pub(all) enum OperatorKind {
   KeyedSum
   Reachability
   SecurityChain
+  Custom(
+    String,
+    Int,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Bool,
+    Bool
+  )
 } derive(Debug, Eq, Compare, ToJson, FromJson)
 
 ///|
@@ -13,19 +25,26 @@ pub fn OperatorKind::id(self : OperatorKind) -> String {
     KeyedSum => "keyed-sum"
     Reachability => "reachability"
     SecurityChain => "security-chain"
+    Custom(id, _, _, _, _, _, _, _, _, _) => id
   }
 }
 
 ///|
-pub fn OperatorKind::version(_self : OperatorKind) -> Int {
-  1
+pub fn OperatorKind::version(self : OperatorKind) -> Int {
+  match self {
+    KeyedSum | Reachability | SecurityChain => 1
+    Custom(_, version, _, _, _, _, _, _, _, _) => version
+  }
 }
 
 ///|
 /// Explicit implementation revision, not a cryptographic binary hash or a
 /// signature. Bump it whenever replay semantics change.
 pub fn OperatorKind::code_digest(self : OperatorKind) -> String {
-  "builtin:" + self.id() + ":v1"
+  match self {
+    KeyedSum | Reachability | SecurityChain => "builtin:" + self.id() + ":v1"
+    Custom(_, _, code_digest, _, _, _, _, _, _, _) => code_digest
+  }
 }
 
 ///|
@@ -34,6 +53,7 @@ pub fn OperatorKind::state_schema(self : OperatorKind) -> String {
     KeyedSum => "keyed-sum-state:v1"
     Reachability => "reachability-state:v1"
     SecurityChain => "security-chain-state:v1"
+    Custom(_, _, _, state_schema, _, _, _, _, _, _) => state_schema
   }
 }
 
@@ -43,6 +63,7 @@ pub fn OperatorKind::input_schema(self : OperatorKind) -> String {
     KeyedSum => "keyed-sum-contribution:v1"
     Reachability => "reachability-edge:v1"
     SecurityChain => "security-event:v1"
+    Custom(_, _, _, _, input_schema, _, _, _, _, _) => input_schema
   }
 }
 
@@ -52,23 +73,73 @@ pub fn OperatorKind::output_schema(self : OperatorKind) -> String {
     KeyedSum => "keyed-sum-total:v1"
     Reachability => "reachable:v1"
     SecurityChain => "security-alert:v1"
+    Custom(_, _, _, _, _, output_schema, _, _, _, _) => output_schema
   }
 }
 
 ///|
 /// MoonWeave logical data contract, not a MoonBit native function/closure ABI.
-pub fn OperatorKind::runtime_abi(_self : OperatorKind) -> String {
-  "moonweave-task-json-v1"
+pub fn OperatorKind::runtime_abi(self : OperatorKind) -> String {
+  match self {
+    KeyedSum | Reachability | SecurityChain => "moonweave-task-json-v1"
+    Custom(_, _, _, _, _, _, runtime_abi, _, _, _) => runtime_abi
+  }
 }
 
 ///|
-pub fn OperatorKind::dependency_digest(_self : OperatorKind) -> String {
-  "builtin-core-v1"
+pub fn OperatorKind::dependency_digest(self : OperatorKind) -> String {
+  match self {
+    KeyedSum | Reachability | SecurityChain => "builtin-core-v1"
+    Custom(_, _, _, _, _, _, _, dependency_digest, _, _) => dependency_digest
+  }
 }
 
 ///|
-pub fn OperatorKind::supports_proof(_self : OperatorKind) -> Bool {
-  true
+pub fn OperatorKind::supports_proof(self : OperatorKind) -> Bool {
+  match self {
+    KeyedSum | Reachability | SecurityChain => true
+    Custom(_, _, _, _, _, _, _, _, _, supports_proof) => supports_proof
+  }
+}
+
+///|
+pub fn OperatorKind::deterministic(self : OperatorKind) -> Bool {
+  match self {
+    KeyedSum | Reachability | SecurityChain => true
+    Custom(_, _, _, _, _, _, _, _, deterministic, _) => deterministic
+  }
+}
+
+///|
+/// Construct the serializable identity for a compile-time custom operator.
+pub fn OperatorKind::custom(
+  id : String,
+  version : Int,
+  code_digest : String,
+  state_schema : String,
+  input_schema : String,
+  output_schema : String,
+  runtime_abi : String,
+  dependency_digest : String,
+  deterministic : Bool,
+  supports_proof : Bool,
+) -> OperatorKind raise TaskError {
+  if id.is_empty() {
+    raise TaskError::EmptyOperatorId
+  }
+  if version <= 0 ||
+    code_digest.is_empty() ||
+    state_schema.is_empty() ||
+    input_schema.is_empty() ||
+    output_schema.is_empty() ||
+    runtime_abi.is_empty() ||
+    dependency_digest.is_empty() {
+    raise TaskError::Custom("custom operator metadata is incomplete")
+  }
+  Custom(
+    id, version, code_digest, state_schema, input_schema, output_schema, runtime_abi,
+    dependency_digest, deterministic, supports_proof,
+  )
 }
 
 ///|
@@ -76,6 +147,16 @@ pub fn OperatorKind::supports_proof(_self : OperatorKind) -> Bool {
 /// only the operator name. The token checks compatibility in a trusted
 /// cluster; it does not authenticate a Worker or prove that it is honest.
 pub fn OperatorKind::capability(self : OperatorKind) -> String {
+  let determinism = if self.deterministic() {
+    "deterministic"
+  } else {
+    "nondeterministic"
+  }
+  let proof = if self.supports_proof() {
+    "task-replay-proof"
+  } else {
+    "no-task-replay-proof"
+  }
   "moonweave-operator:" +
   @json.to_json([
     self.id(),
@@ -86,9 +167,9 @@ pub fn OperatorKind::capability(self : OperatorKind) -> String {
     self.state_schema(),
     self.runtime_abi(),
     self.dependency_digest(),
-    "deterministic",
+    determinism,
     "exchange",
-    "task-replay-proof",
+    proof,
   ]).stringify()
 }
 
@@ -121,5 +202,6 @@ pub fn OperatorKind::validate_payload(
           error => raise TaskError::Security(error)
         },
       )
+    Custom(_, _, _, _, _, _, _, _, _, _) => ()
   }
 }

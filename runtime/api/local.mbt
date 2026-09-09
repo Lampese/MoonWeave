@@ -13,7 +13,7 @@ pub struct LocalRun {
 pub fn CompiledJob::run_local(self : CompiledJob) -> LocalRun raise ApiError {
   match self.definition.sink {
     SinkSpec::Discard => ()
-    SinkSpec::Durable(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
       raise ApiError::Cluster(
         "LocalRun has no durable sink; use run_local_cluster",
       )
@@ -97,6 +97,7 @@ fn local_output(output : @task.TaskOutput) -> Output {
     @task.TaskOutput::KeyedSum(value) => Output::KeyedSum(value)
     @task.TaskOutput::Reachable(value) => Output::Reachable(value)
     @task.TaskOutput::SecurityAlert(value) => Output::SecurityAlert(value)
+    @task.TaskOutput::Custom(value) => Output::Custom(value)
   }
 }
 

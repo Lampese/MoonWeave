@@ -67,7 +67,8 @@ pub struct OperatorDescriptor {
   deterministic : Bool
   supports_proof : Bool
   operator_kind : @task.OperatorKind
-} derive(Debug, Eq)
+  implementation : @task.CustomOperator?
+}
 
 ///|
 pub fn OperatorDescriptor::reference(self : OperatorDescriptor) -> OperatorRef {
@@ -122,6 +123,14 @@ pub fn OperatorDescriptor::supports_proof(self : OperatorDescriptor) -> Bool {
 }
 
 ///|
+/// Return the process-local implementation for a custom operator.
+pub fn OperatorDescriptor::implementation(
+  self : OperatorDescriptor,
+) -> @task.CustomOperator? {
+  self.implementation
+}
+
+///|
 pub fn OperatorDescriptor::artifact(
   self : OperatorDescriptor,
 ) -> OperatorArtifact {
@@ -169,6 +178,55 @@ fn builtin_descriptor(kind : @task.OperatorKind) -> OperatorDescriptor {
     deterministic: true,
     supports_proof: kind.supports_proof(),
     operator_kind: kind,
+    implementation: None,
+  }
+}
+
+///|
+/// Build a descriptor for a compile-time registered JSON operator. The
+/// callback remains in the Worker binary; metadata is exchanged and persisted.
+pub fn OperatorDescriptor::custom(
+  reference : OperatorRef,
+  code_digest : String,
+  state_schema : String,
+  input_schema : String,
+  output_schema : String,
+  process : (@task.TaskInput) -> Array[Json] raise @task.TaskError,
+  validate : (Json) -> Unit raise @task.TaskError,
+  runtime_abi? : String = "moonweave-task-json-v1",
+  dependency_digest? : String = "custom-v1",
+  deterministic? : Bool = true,
+  supports_proof? : Bool = false,
+) -> OperatorDescriptor raise ApiError {
+  let implementation = @task.CustomOperator::new(
+    reference.id(),
+    reference.version(),
+    code_digest,
+    state_schema,
+    input_schema,
+    output_schema,
+    runtime_abi,
+    dependency_digest,
+    deterministic,
+    supports_proof,
+    validate,
+    process,
+  ) catch {
+    error => raise ApiError::InvalidArtifact(@debug.to_string(error))
+  }
+  {
+    reference,
+    code_digest,
+    state_schema,
+    input_schema,
+    output_schema,
+    runtime_abi,
+    target: "native",
+    dependency_digest,
+    deterministic,
+    supports_proof,
+    operator_kind: implementation.kind(),
+    implementation: Some(implementation),
   }
 }
 
@@ -185,6 +243,29 @@ pub fn OperatorRegistry::register(
     raise ApiError::DuplicateOperator(key)
   }
   self.descriptors[key] = descriptor
+}
+
+///|
+/// Register a process-local custom callback and expose its stable metadata.
+pub fn OperatorRegistry::register_custom(
+  self : OperatorRegistry,
+  implementation : @task.CustomOperator,
+) -> Unit raise ApiError {
+  let descriptor = OperatorDescriptor::{
+    reference: { id: implementation.id(), version: implementation.version(), },
+    code_digest: implementation.code_digest(),
+    state_schema: implementation.state_schema(),
+    input_schema: implementation.input_schema(),
+    output_schema: implementation.output_schema(),
+    runtime_abi: implementation.runtime_abi(),
+    target: "native",
+    dependency_digest: implementation.dependency_digest(),
+    deterministic: implementation.deterministic(),
+    supports_proof: implementation.supports_proof(),
+    operator_kind: implementation.kind(),
+    implementation: Some(implementation),
+  }
+  self.register(descriptor)
 }
 
 ///|
@@ -230,18 +311,45 @@ fn OperatorDescriptor::validate(
   self : OperatorDescriptor,
 ) -> Unit raise ApiError {
   self.reference.validate()
-  let expected = builtin_descriptor(self.operator_kind)
-  if self.reference != expected.reference ||
-    self.code_digest != expected.code_digest ||
-    self.state_schema != expected.state_schema ||
-    self.input_schema != expected.input_schema ||
-    self.output_schema != expected.output_schema ||
-    self.runtime_abi != expected.runtime_abi ||
-    self.target != expected.target ||
-    self.dependency_digest != expected.dependency_digest ||
-    self.deterministic != expected.deterministic ||
-    self.supports_proof != expected.supports_proof {
-    raise ApiError::ArtifactMismatch(self.reference.id)
+  match self.operator_kind {
+    @task.OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) => {
+      if self.reference !=
+        { id: self.operator_kind.id(), version: self.operator_kind.version(), } ||
+        self.code_digest != self.operator_kind.code_digest() ||
+        self.state_schema != self.operator_kind.state_schema() ||
+        self.input_schema != self.operator_kind.input_schema() ||
+        self.output_schema != self.operator_kind.output_schema() ||
+        self.runtime_abi != self.operator_kind.runtime_abi() ||
+        self.target != "native" ||
+        self.dependency_digest != self.operator_kind.dependency_digest() ||
+        self.deterministic != self.operator_kind.deterministic() ||
+        self.supports_proof != self.operator_kind.supports_proof() {
+        raise ApiError::ArtifactMismatch(self.reference.id)
+      }
+      match self.implementation {
+        Some(implementation) if implementation.kind() == self.operator_kind =>
+          ()
+        _ => raise ApiError::ArtifactMismatch(self.reference.id)
+      }
+    }
+    _ => {
+      let expected = builtin_descriptor(self.operator_kind)
+      if self.reference != expected.reference ||
+        self.code_digest != expected.code_digest ||
+        self.state_schema != expected.state_schema ||
+        self.input_schema != expected.input_schema ||
+        self.output_schema != expected.output_schema ||
+        self.runtime_abi != expected.runtime_abi ||
+        self.target != expected.target ||
+        self.dependency_digest != expected.dependency_digest ||
+        self.deterministic != expected.deterministic ||
+        self.supports_proof != expected.supports_proof {
+        raise ApiError::ArtifactMismatch(self.reference.id)
+      }
+      if self.implementation is Some(_) {
+        raise ApiError::ArtifactMismatch(self.reference.id)
+      }
+    }
   }
 }
 
@@ -261,8 +369,15 @@ pub fn OperatorDescriptor::validate_event(
   ignore(
     Event::new(event.id(), event.record.parents(), event.key(), event.payload()),
   )
-  self.operator_kind.validate_payload(event.payload()) catch {
-    error => raise ApiError::InvalidEvent(@debug.to_string(error))
+  match self.implementation {
+    None =>
+      self.operator_kind.validate_payload(event.payload()) catch {
+        error => raise ApiError::InvalidEvent(@debug.to_string(error))
+      }
+    Some(implementation) =>
+      implementation.validate_payload(event.payload()) catch {
+        error => raise ApiError::InvalidEvent(@debug.to_string(error))
+      }
   }
 }
 
@@ -276,16 +391,31 @@ fn OperatorDescriptor::create_task(
   max_state_events : Int,
 ) -> @task.Task raise ApiError {
   self.validate()
-  @task.Task::new(
-    task_id,
-    self.reference.id,
-    self.operator_kind,
-    partition,
-    epoch,
-    start_offset~,
-    max_state_events~,
-  ) catch {
-    error => raise ApiError::TaskFailed(@debug.to_string(error))
+  match self.implementation {
+    None =>
+      @task.Task::new(
+        task_id,
+        self.reference.id,
+        self.operator_kind,
+        partition,
+        epoch,
+        start_offset~,
+        max_state_events~,
+      ) catch {
+        error => raise ApiError::TaskFailed(@debug.to_string(error))
+      }
+    Some(implementation) =>
+      @task.Task::new_custom(
+        task_id,
+        self.reference.id,
+        implementation,
+        partition,
+        epoch,
+        start_offset~,
+        max_state_events~,
+      ) catch {
+        error => raise ApiError::TaskFailed(@debug.to_string(error))
+      }
   }
 }
 

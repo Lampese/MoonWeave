@@ -20,15 +20,42 @@ fn cluster_event_groups(
 }
 
 ///|
-/// Run a finite Job through real local Coordinator/Worker TCP sessions. This
-/// is the first high-level ClusterRunner: it owns durable stores and Worker
-/// sessions but deliberately accepts only registered built-in operators.
+/// Run a finite Job through real local Coordinator/Worker TCP sessions. When
+/// the Job declares a JSONL source, the supplied events are ignored and the
+/// uncommitted source prefix is processed instead.
 pub async fn CompiledJob::run_local_cluster(
   self : CompiledJob,
   config : ClusterConfig,
   events : ArrayView[Event],
 ) -> ClusterRunSummary raise ApiError {
-  for event in events {
+  let external_source : JsonLinesSource? = match self.definition.source {
+    SourceSpec::Events => None
+    SourceSpec::JsonLines(path) => Some(JsonLinesSource::open(path))
+  }
+  defer (match external_source {
+    None => ()
+    Some(source) => source.close()
+  })
+  let input_events : Array[Event] = match external_source {
+    None => events.to_owned()
+    Some(source) => {
+      let result : Array[Event] = []
+      let mut finished = false
+      while !finished {
+        let before = source.polled_offset()
+        let (batch, next_offset) = source.poll_with_offset(maximum_events=128)
+        if next_offset == before {
+          finished = true
+        } else {
+          for event in batch {
+            result.push(event)
+          }
+        }
+      }
+      result
+    }
+  }
+  for event in input_events {
     self.descriptor.validate_event(event)
   }
   let storage_exists = @fs.exists(config.storage_dir) catch {
@@ -101,7 +128,7 @@ pub async fn CompiledJob::run_local_cluster(
     )
     assignments[partition] = assignment
   }
-  let grouped = cluster_event_groups(self, events)
+  let grouped = cluster_event_groups(self, input_events)
   let deltas_by_partition : Map[Int, Array[@protocol.DeltaBatch]] = Map([])
   for source_partition in 0..<self.spec.partition_count() {
     guard grouped.get(source_partition) is Some(source_events) else { continue }
@@ -161,7 +188,7 @@ pub async fn CompiledJob::run_local_cluster(
   }
   let output_manifest = match self.definition.sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
       Some(
         @runtime.JobOutputManifest::open(
           config.storage_dir + "/manifest.wal",
@@ -235,7 +262,7 @@ pub async fn CompiledJob::run_local_cluster(
         ".wal"
       let output_log_path = match self.definition.sink {
         SinkSpec::Discard => None
-        SinkSpec::Durable(_) =>
+        SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
           Some(
             config.storage_dir + "/output-p" + partition.to_string() + ".wal",
           )
@@ -284,6 +311,62 @@ pub async fn CompiledJob::run_local_cluster(
   let summary = match supervisor_result {
     Ok(value) => value
     Err(reason) => raise ApiError::Cluster(reason)
+  }
+  match self.definition.sink {
+    SinkSpec::JsonLines(path) => {
+      let sink = @runtime.JsonLinesSink::open(path) catch {
+        error => raise ApiError::Sink(@debug.to_string(error))
+      }
+      defer sink.close()
+      for partition in 0..<self.spec.partition_count() {
+        guard assignments.get(partition) is Some(assignment) else {
+          raise ApiError::Cluster("missing output assignment")
+        }
+        let task_id = self.definition.job_id +
+          "/p" +
+          partition.to_string() +
+          "/e" +
+          assignment.epoch().to_string()
+        let output_log = @runtime.TaskOutputLog::open(
+          config.storage_dir + "/output-p" + partition.to_string() + ".wal",
+        ) catch {
+          error => raise ApiError::Sink(@debug.to_string(error))
+        }
+        let consumer = @runtime.TaskOutputConsumer::open(
+          output_log,
+          config.storage_dir + "/sink-p" + partition.to_string() + ".wal",
+          self.definition.job_id + "-json-lines",
+          task_id,
+          partition,
+          assignment.epoch(),
+        ) catch {
+          error => {
+            output_log.close()
+            raise ApiError::Sink(@debug.to_string(error))
+          }
+        }
+        let mut done = false
+        while !done {
+          let count = sink.consume(consumer, maximum_records=128) catch {
+            error => {
+              consumer.close()
+              output_log.close()
+              raise ApiError::Sink(@debug.to_string(error))
+            }
+          }
+          if count == 0 {
+            done = true
+          }
+        }
+        consumer.close()
+        output_log.close()
+      }
+    }
+    _ => ()
+  }
+  match external_source {
+    None => ()
+    Some(source) => source.commit(source.polled_offset())
   }
   outputs.sort()
   {

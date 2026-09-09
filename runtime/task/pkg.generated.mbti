@@ -32,6 +32,7 @@ pub(all) suberror TaskError {
   Aggregation(@aggregation.AggregationError)
   Reachability(@reachability.EngineError)
   Security(@security.SecurityError)
+  Custom(String)
   Causal(@causal.CausalError)
   Protocol(@protocol.ProtocolError)
 } derive(Eq, @debug.Debug)
@@ -49,14 +50,37 @@ pub(all) suberror TaskSetError {
 } derive(Eq, @debug.Debug)
 
 // Types and methods
+pub(all) struct CustomOperator {
+  kind : OperatorKind
+  validate : (Json) -> Unit raise TaskError
+  process : (TaskInput) -> Array[Json] raise TaskError
+}
+pub fn CustomOperator::apply(Self, TaskInput) -> Array[Json] raise TaskError
+pub fn CustomOperator::code_digest(Self) -> String
+pub fn CustomOperator::dependency_digest(Self) -> String
+pub fn CustomOperator::deterministic(Self) -> Bool
+pub fn CustomOperator::id(Self) -> String
+pub fn CustomOperator::input_schema(Self) -> String
+pub fn CustomOperator::kind(Self) -> OperatorKind
+pub fn CustomOperator::new(String, Int, String, String, String, String, String, String, Bool, Bool, (Json) -> Unit raise TaskError, (TaskInput) -> Array[Json] raise TaskError) -> Self raise TaskError
+pub fn CustomOperator::output_schema(Self) -> String
+pub fn CustomOperator::runtime_abi(Self) -> String
+pub fn CustomOperator::state_schema(Self) -> String
+pub fn CustomOperator::supports_proof(Self) -> Bool
+pub fn CustomOperator::validate_payload(Self, Json) -> Unit raise TaskError
+pub fn CustomOperator::version(Self) -> Int
+
 pub(all) enum OperatorKind {
   KeyedSum
   Reachability
   SecurityChain
+  Custom(String, Int, String, String, String, String, String, String, Bool, Bool)
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn OperatorKind::capability(Self) -> String
 pub fn OperatorKind::code_digest(Self) -> String
+pub fn OperatorKind::custom(String, Int, String, String, String, String, String, String, Bool, Bool) -> Self raise TaskError
 pub fn OperatorKind::dependency_digest(Self) -> String
+pub fn OperatorKind::deterministic(Self) -> Bool
 pub fn OperatorKind::from_id(String) -> Self raise TaskError
 pub fn OperatorKind::id(Self) -> String
 pub fn OperatorKind::input_schema(Self) -> String
@@ -81,6 +105,9 @@ pub struct Task {
   mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
+  custom_operator : CustomOperator?
+  mut custom_log : @causal.CausalLog[Json]?
+  mut custom_outputs : Array[Json]
   max_state_events : Int
 }
 pub fn Task::adopt_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
@@ -92,6 +119,7 @@ pub fn Task::from_assignment(String, String, OperatorKind, @protocol.AssignmentS
 pub fn Task::from_spec(TaskSpec) -> Self raise TaskError
 pub fn Task::frontier(Self) -> @causal.Frontier
 pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
+pub fn Task::new_custom(String, String, CustomOperator, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
 pub fn Task::offset(Self) -> Int64
 pub fn Task::operator(Self) -> OperatorKind
 pub fn Task::operator_id(Self) -> String
@@ -133,7 +161,9 @@ pub(all) enum TaskOutput {
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
-} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+  Custom(Json)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub impl Compare for TaskOutput
 
 pub(all) enum TaskPhase {
   Created

@@ -7,7 +7,8 @@ fn worker_node_storage_paths(
   let suffix = partition.to_string()
   let output = match sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) => Some(storage_dir + "/output-p" + suffix + ".wal")
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+      Some(storage_dir + "/output-p" + suffix + ".wal")
   }
   @runtime.WorkerStoragePaths::new(
     storage_dir + "/worker-p" + suffix + ".wal",

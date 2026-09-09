@@ -177,7 +177,7 @@ async fn CoordinatorListener::open_source_backed_execution(
   }
   let output_manifest = match job.definition.sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
       Some(
         @runtime.JobOutputManifest::open(
           self.config.storage_dir + "/manifest.wal",

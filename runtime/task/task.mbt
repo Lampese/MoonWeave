@@ -28,6 +28,7 @@ pub(all) suberror TaskError {
   Aggregation(@aggregation.AggregationError)
   Reachability(@reachability.EngineError)
   Security(@security.SecurityError)
+  Custom(String)
   Causal(@causal.CausalError)
   Protocol(@protocol.ProtocolError)
 } derive(Debug, Eq)
@@ -56,7 +57,30 @@ pub(all) enum TaskOutput {
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
-} derive(Debug, Eq, Compare, ToJson, FromJson)
+  Custom(Json)
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// Keep output ordering deterministic even though arbitrary JSON does not
+/// implement the ordering trait required by `Array::sort`.
+pub impl Compare for TaskOutput with fn compare(self, other) {
+  match (self, other) {
+    (TaskOutput::KeyedSum(left), TaskOutput::KeyedSum(right)) =>
+      Compare::compare(left, right)
+    (TaskOutput::Reachable(left), TaskOutput::Reachable(right)) =>
+      Compare::compare(left, right)
+    (TaskOutput::SecurityAlert(left), TaskOutput::SecurityAlert(right)) =>
+      Compare::compare(left, right)
+    (TaskOutput::Custom(left), TaskOutput::Custom(right)) =>
+      @json.to_json(left).stringify().compare(@json.to_json(right).stringify())
+    (TaskOutput::KeyedSum(_), _) => -1
+    (TaskOutput::Reachable(_), TaskOutput::KeyedSum(_)) => 1
+    (TaskOutput::Reachable(_), _) => -1
+    (TaskOutput::SecurityAlert(_), TaskOutput::Custom(_)) => -1
+    (TaskOutput::SecurityAlert(_), _) => 1
+    (TaskOutput::Custom(_), _) => 1
+  }
+}
 
 ///|
 /// Monotone progress exported by a Task after a successful input step.
@@ -122,6 +146,9 @@ pub struct Task {
   mut aggregation : @aggregation.Engine?
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
+  custom_operator : CustomOperator?
+  mut custom_log : @causal.CausalLog[Json]?
+  mut custom_outputs : Array[Json]
   max_state_events : Int
 }
 
@@ -167,6 +194,10 @@ pub fn Task::new(
         },
       )
     OperatorKind::Reachability | OperatorKind::SecurityChain => None
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      raise TaskError::Custom(
+        "custom tasks require a registered implementation",
+      )
   }
   let reachability = match operator {
     OperatorKind::Reachability =>
@@ -176,6 +207,7 @@ pub fn Task::new(
         },
       )
     OperatorKind::KeyedSum | OperatorKind::SecurityChain => None
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) => None
   }
   let security = match operator {
     OperatorKind::KeyedSum | OperatorKind::Reachability => None
@@ -185,6 +217,7 @@ pub fn Task::new(
           error => raise TaskError::Causal(error)
         },
       )
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) => None
   }
   {
     task_id,
@@ -200,6 +233,69 @@ pub fn Task::new(
     aggregation,
     reachability,
     security,
+    custom_operator: None,
+    custom_log: None,
+    custom_outputs: [],
+    max_state_events,
+  }
+}
+
+///|
+/// Construct a Task for a compile-time registered custom implementation.
+/// Checkpoint recovery reuses the same event replay contract as built-ins.
+pub fn Task::new_custom(
+  task_id : String,
+  operator_id : String,
+  custom_operator : CustomOperator,
+  partition : Int,
+  epoch : Int,
+  start_offset? : Int64 = 0L,
+  max_state_events? : Int = 0,
+) -> Task raise TaskError {
+  if task_id.is_empty() {
+    raise TaskError::EmptyTaskId
+  }
+  if operator_id.is_empty() {
+    raise TaskError::EmptyOperatorId
+  }
+  if operator_id != custom_operator.id() {
+    raise TaskError::OperatorMismatch(
+      expected=custom_operator.id(),
+      actual=operator_id,
+    )
+  }
+  if partition < 0 {
+    raise TaskError::InvalidPartition(partition)
+  }
+  if epoch < 0 {
+    raise TaskError::InvalidEpoch(epoch)
+  }
+  if start_offset < 0L {
+    raise TaskError::InvalidOffset(start_offset)
+  }
+  if max_state_events < 0 {
+    raise TaskError::StateLimitExceeded(limit=max_state_events, actual=0)
+  }
+  let custom_log = @causal.CausalLog::new() catch {
+    error => raise TaskError::Causal(error)
+  }
+  {
+    task_id,
+    operator_id,
+    operator: custom_operator.kind(),
+    partition,
+    epoch,
+    start_offset,
+    phase: TaskPhase::Created,
+    offset: start_offset - 1L,
+    frontier: @causal.Frontier::empty(),
+    emitted_outputs: 0,
+    aggregation: None,
+    reachability: None,
+    security: None,
+    custom_operator: Some(custom_operator),
+    custom_log: Some(custom_log),
+    custom_outputs: [],
     max_state_events,
   }
 }
@@ -333,6 +429,8 @@ pub fn Task::event_count(self : Task) -> Int {
     OperatorKind::KeyedSum => self.aggregation.unwrap().event_count()
     OperatorKind::Reachability => self.reachability.unwrap().event_count()
     OperatorKind::SecurityChain => self.security.unwrap().event_count()
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      self.custom_log.unwrap().admitted_count()
   }
 }
 
@@ -342,6 +440,8 @@ pub fn Task::pending_count(self : Task) -> Int {
     OperatorKind::KeyedSum => self.aggregation.unwrap().pending_count()
     OperatorKind::Reachability => self.reachability.unwrap().pending_count()
     OperatorKind::SecurityChain => self.security.unwrap().pending_count()
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      self.custom_log.unwrap().pending_count()
   }
 }
 
@@ -380,6 +480,8 @@ pub fn Task::outputs(self : Task) -> Array[TaskOutput] {
       .unwrap()
       .alerts()
       .map(alert => TaskOutput::SecurityAlert(alert))
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      self.custom_outputs.map(output => TaskOutput::Custom(output))
   }
   outputs.sort()
   outputs
@@ -486,6 +588,32 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
         )
       }
     }
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) => {
+      let log = match self.custom_log {
+        Some(value) => value
+        None => raise TaskError::InvalidTransition
+      }
+      for event in log.events() {
+        events.push(
+          task_snapshot_event(
+            event.id(),
+            event.parents(),
+            event.key(),
+            event.payload(),
+          ),
+        )
+      }
+      for event in log.pending_events() {
+        events.push(
+          task_snapshot_event(
+            event.id(),
+            event.parents(),
+            event.key(),
+            event.payload(),
+          ),
+        )
+      }
+    }
   }
   events.sort_by((left, right) => Compare::compare(left.id(), right.id()))
   {
@@ -523,15 +651,28 @@ pub fn Task::restore(
     snapshot.emitted_outputs() < 0 {
     raise TaskError::InvalidTransition
   }
-  let candidate = Task::new(
-    self.task_id,
-    self.operator_id,
-    self.operator,
-    self.partition,
-    self.epoch,
-    start_offset=self.start_offset,
-    max_state_events=self.max_state_events,
-  )
+  let candidate = match self.custom_operator {
+    None =>
+      Task::new(
+        self.task_id,
+        self.operator_id,
+        self.operator,
+        self.partition,
+        self.epoch,
+        start_offset=self.start_offset,
+        max_state_events=self.max_state_events,
+      )
+    Some(operator) =>
+      Task::new_custom(
+        self.task_id,
+        self.operator_id,
+        operator,
+        self.partition,
+        self.epoch,
+        start_offset=self.start_offset,
+        max_state_events=self.max_state_events,
+      )
+  }
   for event in snapshot.events() {
     let restored_outputs = candidate.apply_input(TaskInput::new(event))
     ignore(restored_outputs)
@@ -545,6 +686,8 @@ pub fn Task::restore(
   self.aggregation = candidate.aggregation
   self.reachability = candidate.reachability
   self.security = candidate.security
+  self.custom_log = candidate.custom_log
+  self.custom_outputs = candidate.custom_outputs
   self.offset = candidate.offset
   self.frontier = candidate.frontier
   self.emitted_outputs = candidate.emitted_outputs
@@ -652,6 +795,46 @@ fn Task::apply_input(
       }
       alerts.map(alert => TaskOutput::SecurityAlert(alert))
     }
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) => {
+      let operator = match self.custom_operator {
+        Some(value) => value
+        None => raise TaskError::InvalidTransition
+      }
+      let log = match self.custom_log {
+        Some(value) => value
+        None => raise TaskError::InvalidTransition
+      }
+      let record = input.event()
+      operator.validate_payload(record.payload())
+      let event = @causal.Event::new(
+        record.id(),
+        record.parents(),
+        record.key(),
+        record.payload(),
+      ) catch {
+        error => raise TaskError::Causal(error)
+      }
+      let admission = log.submit(event) catch {
+        error => raise TaskError::Causal(error)
+      }
+      let outputs : Array[TaskOutput] = []
+      for admitted in admission.admitted() {
+        let admitted_record = @protocol.EventRecord::new(
+          admitted.id(),
+          admitted.parents(),
+          admitted.key(),
+          admitted.payload(),
+        ) catch {
+          error => raise TaskError::Protocol(error)
+        }
+        let emitted = operator.apply(TaskInput::new(admitted_record))
+        for output in emitted {
+          self.custom_outputs.push(output)
+          outputs.push(TaskOutput::Custom(output))
+        }
+      }
+      outputs
+    }
   }
 }
 
@@ -661,6 +844,8 @@ fn Task::refresh_frontier(self : Task) -> Unit {
     OperatorKind::KeyedSum => self.aggregation.unwrap().frontier()
     OperatorKind::Reachability => self.reachability.unwrap().frontier()
     OperatorKind::SecurityChain => self.security.unwrap().frontier()
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      self.custom_log.unwrap().frontier()
   }
 }
 
@@ -680,6 +865,9 @@ fn Task::copy(self : Task) -> Task {
     aggregation: self.aggregation.map(engine => engine.copy()),
     reachability: self.reachability.map(engine => engine.copy()),
     security: self.security.map(engine => engine.copy()),
+    custom_operator: self.custom_operator,
+    custom_log: self.custom_log.map(log => log.copy()),
+    custom_outputs: self.custom_outputs.copy(),
     max_state_events: self.max_state_events,
   }
 }
@@ -689,6 +877,8 @@ fn Task::commit(self : Task, candidate : Task) -> Unit {
   self.aggregation = candidate.aggregation
   self.reachability = candidate.reachability
   self.security = candidate.security
+  self.custom_log = candidate.custom_log
+  self.custom_outputs = candidate.custom_outputs
   self.offset = candidate.offset
   self.frontier = candidate.frontier
   self.emitted_outputs = candidate.emitted_outputs

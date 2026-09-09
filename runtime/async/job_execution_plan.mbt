@@ -22,11 +22,15 @@ fn validate_job_work_plan(
   if plan.required_capability is Some(capability) && capability.is_empty() {
     raise JobStoreError::PlanMismatch(plan.partition)
   }
-  let expected_capability = @task.OperatorKind::from_id(state.operator_id()) catch {
-    _ => raise JobStoreError::PlanMismatch(plan.partition)
+  // Built-in capabilities can be reconstructed from the operator id. Custom
+  // capabilities are opaque and are checked at Worker admission instead.
+  let builtin_capability : String? = Some(
+    @task.OperatorKind::from_id(state.operator_id()).capability(),
+  ) catch {
+    _ => None
   }
-  match plan.required_capability {
-    Some(value) if value != expected_capability.capability() =>
+  match (plan.required_capability, builtin_capability) {
+    (Some(value), Some(expected)) if value != expected =>
       raise JobStoreError::PlanMismatch(plan.partition)
     _ => ()
   }

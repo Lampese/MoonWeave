@@ -2,6 +2,7 @@
 package "moonweave/moonweave/runtime/api"
 
 import {
+  "moonbitlang/async/fs",
   "moonbitlang/async/socket",
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
@@ -48,6 +49,8 @@ pub(all) suberror ApiError {
   InvalidDriverCommand(String)
   DriverClosed
   TaskFailed(String)
+  Source(String)
+  Sink(String)
   Closed
   Cluster(String)
   Plan(@plan.PlanError)
@@ -404,6 +407,29 @@ pub fn JobSubmission::run_local(Self) -> LocalJobHandle raise ApiError
 pub async fn JobSubmission::run_remote(Self, DriverConfig) -> RemoteJobHandle raise ApiError
 pub fn JobSubmission::submission_id(Self) -> String
 
+pub struct JsonLinesSource {
+  path : String
+  cursor_path : String
+  owner : @fs.File
+  operation_lock : @moonbitlang/async.Mutex
+  mut offset : Int64
+  mut polled_offset : Int64
+  mut prefix_digest : String
+  mut closed : Bool
+}
+pub fn JsonLinesSource::close(Self) -> Unit
+pub async fn JsonLinesSource::commit(Self, Int64) -> Unit raise ApiError
+pub fn JsonLinesSource::cursor_path(Self) -> String
+pub fn JsonLinesSource::offset(Self) -> Int64
+pub async fn JsonLinesSource::open(String) -> Self raise ApiError
+pub fn JsonLinesSource::path(Self) -> String
+pub async fn JsonLinesSource::poll(Self, maximum_events? : Int) -> Array[Event] raise ApiError
+pub async fn JsonLinesSource::poll_with_offset(Self, maximum_events? : Int) -> (Array[Event], Int64) raise ApiError
+pub fn JsonLinesSource::polled_offset(Self) -> Int64
+pub async fn JsonLinesSource::rewind(Self, next_offset? : Int64) -> Unit raise ApiError
+
+type JsonLinesSourceCursor derive(ToJson, @json.FromJson)
+
 pub struct KeyBy[T] {
   selector : (T) -> String
 }
@@ -590,12 +616,15 @@ pub struct OperatorDescriptor {
   deterministic : Bool
   supports_proof : Bool
   operator_kind : @task.OperatorKind
-} derive(Eq, @debug.Debug)
+  implementation : @task.CustomOperator?
+}
 pub fn OperatorDescriptor::artifact(Self) -> OperatorArtifact
 pub fn OperatorDescriptor::capability(Self) -> String
 pub fn OperatorDescriptor::code_digest(Self) -> String
+pub fn OperatorDescriptor::custom(OperatorRef, String, String, String, String, (@task.TaskInput) -> Array[Json] raise @task.TaskError, (Json) -> Unit raise @task.TaskError, runtime_abi? : String, dependency_digest? : String, deterministic? : Bool, supports_proof? : Bool) -> Self raise ApiError
 pub fn OperatorDescriptor::dependency_digest(Self) -> String
 pub fn OperatorDescriptor::deterministic(Self) -> Bool
+pub fn OperatorDescriptor::implementation(Self) -> @task.CustomOperator?
 pub fn OperatorDescriptor::input_schema(Self) -> String
 pub fn OperatorDescriptor::output_schema(Self) -> String
 pub fn OperatorDescriptor::reference(Self) -> OperatorRef
@@ -624,6 +653,7 @@ pub fn OperatorRegistry::capabilities(Self) -> Array[String]
 pub fn OperatorRegistry::entries(Self) -> Array[OperatorDescriptor]
 pub fn OperatorRegistry::new() -> Self
 pub fn OperatorRegistry::register(Self, OperatorDescriptor) -> Unit raise ApiError
+pub fn OperatorRegistry::register_custom(Self, @task.CustomOperator) -> Unit raise ApiError
 pub fn OperatorRegistry::resolve(Self, OperatorRef) -> OperatorDescriptor raise ApiError
 pub fn OperatorRegistry::resolve_artifact(Self, OperatorArtifact) -> OperatorDescriptor raise ApiError
 
@@ -631,13 +661,15 @@ pub(all) enum Output {
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
-} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+  Custom(Json)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Output::as_keyed_sum(Self) -> @aggregation.KeyedSum?
 pub fn Output::as_reachable(Self) -> @reachability.Reachable?
 pub fn Output::as_security_alert(Self) -> @security.SecurityAlert?
 pub fn Output::keyed_sum(@aggregation.KeyedSum) -> Self
 pub fn Output::reachable(@reachability.Reachable) -> Self
 pub fn Output::security_alert(@security.SecurityAlert) -> Self
+pub impl Compare for Output
 
 pub(all) enum Partitioning {
   ByKey
@@ -694,10 +726,13 @@ pub(all) enum SinkMode {
 pub(all) enum SinkSpec {
   Discard
   Durable(String)
+  JsonLines(String)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SinkSpec::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn SinkSpec::discard() -> Self
 pub fn SinkSpec::durable(String) -> Self raise ApiError
+pub fn SinkSpec::json_lines(String) -> Self raise ApiError
+pub fn SinkSpec::path(Self) -> String?
 pub fn SinkSpec::requires_idempotent_consumer(Self) -> Bool
 
 pub struct Source[T] {
@@ -720,8 +755,11 @@ pub struct SourceBackedExecution {
 
 pub(all) enum SourceSpec {
   Events
+  JsonLines(String)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SourceSpec::events() -> Self
+pub fn SourceSpec::json_lines(String) -> Self raise ApiError
+pub fn SourceSpec::path(Self) -> String?
 pub fn SourceSpec::recovery_capability(Self) -> RecoveryCapability
 
 pub struct Stream[T] {

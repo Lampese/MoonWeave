@@ -1669,7 +1669,7 @@ pub async fn CoordinatorListener::run(
   let works = build_node_works(job, events, assignments)
   let output_manifest = match job.definition.sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
       Some(
         @runtime.JobOutputManifest::open(
           self.config.storage_dir + "/manifest.wal",

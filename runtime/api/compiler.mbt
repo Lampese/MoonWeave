@@ -15,6 +15,19 @@ fn validate_sink(sink : SinkSpec) -> Unit raise ApiError {
     SinkSpec::Discard => ()
     SinkSpec::Durable(name) if name.is_empty() => raise ApiError::EmptySinkId
     SinkSpec::Durable(_) => ()
+    SinkSpec::JsonLines(path) if path.is_empty() =>
+      raise ApiError::Sink("sink path is required")
+    SinkSpec::JsonLines(_) => ()
+  }
+}
+
+///|
+fn validate_source(source : SourceSpec) -> Unit raise ApiError {
+  match source {
+    SourceSpec::Events => ()
+    SourceSpec::JsonLines(path) if path.is_empty() =>
+      raise ApiError::Source("source path is required")
+    SourceSpec::JsonLines(_) => ()
   }
 }
 
@@ -46,6 +59,7 @@ pub fn JobDefinition::compile(
     }
   }
   descriptor.validate()
+  validate_source(self.source)
   validate_sink(self.sink)
   let routes = self.routes.copy()
   routes.sort()

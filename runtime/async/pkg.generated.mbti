@@ -201,6 +201,15 @@ pub(all) suberror JobStoreError {
   AlreadyRunning
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror JsonLinesSinkError {
+  EmptyPath
+  Malformed
+  IdentityConflict(String)
+  Io(String)
+  OutputLog(String)
+  Consumer(String)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror OutboxError {
   InvalidCapacity(Int)
   Closed(String)
@@ -681,6 +690,19 @@ pub async fn JobStore::start(Self) -> Unit raise JobStoreError
 pub async fn JobStore::stop_partition(Self, Int, String, Int, Int) -> Unit raise JobStoreError
 
 type JobStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct JsonLinesSink {
+  path : String
+  known : Map[String, TaskOutputRecord]
+  write_lock : @moonbitlang/async.Mutex
+}
+pub fn JsonLinesSink::close(Self) -> Unit
+pub async fn JsonLinesSink::consume(Self, TaskOutputConsumer, maximum_records? : Int) -> Int raise JsonLinesSinkError
+pub fn JsonLinesSink::contains(Self, String) -> Bool
+pub async fn JsonLinesSink::open(String) -> Self raise JsonLinesSinkError
+pub fn JsonLinesSink::path(Self) -> String
+pub async fn JsonLinesSink::write(Self, TaskOutputRecord) -> Unit raise JsonLinesSinkError
+pub fn JsonLinesSink::written_count(Self) -> Int
 
 type LiveJobControl
 

@@ -31,6 +31,8 @@ pub(all) suberror ApiError {
   InvalidDriverCommand(String)
   DriverClosed
   TaskFailed(String)
+  Source(String)
+  Sink(String)
   Closed
   Cluster(String)
   Plan(@plan.PlanError)
@@ -41,11 +43,29 @@ pub(all) suberror ApiError {
 /// connectors are deliberately separate from the distributed transport.
 pub(all) enum SourceSpec {
   Events
+  JsonLines(String)
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 pub fn SourceSpec::events() -> SourceSpec {
   SourceSpec::Events
+}
+
+///|
+/// Read one JSON-encoded `Event` per physical line from an external file.
+pub fn SourceSpec::json_lines(path : String) -> SourceSpec raise ApiError {
+  if path.is_empty() {
+    raise ApiError::Source("source path is required")
+  }
+  SourceSpec::JsonLines(path)
+}
+
+///|
+pub fn SourceSpec::path(self : SourceSpec) -> String? {
+  match self {
+    SourceSpec::Events => None
+    SourceSpec::JsonLines(path) => Some(path)
+  }
 }
 
 ///|
@@ -63,6 +83,7 @@ pub fn RecoveryCapability::replayable() -> RecoveryCapability {
 pub fn SourceSpec::recovery_capability(self : SourceSpec) -> RecoveryCapability {
   match self {
     SourceSpec::Events => RecoveryCapability::Replayable
+    SourceSpec::JsonLines(_) => RecoveryCapability::Replayable
   }
 }
 
@@ -83,6 +104,7 @@ pub fn Partitioning::by_key() -> Partitioning {
 pub(all) enum SinkSpec {
   Discard
   Durable(String)
+  JsonLines(String)
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -112,9 +134,28 @@ pub fn SinkSpec::durable(name : String) -> SinkSpec raise ApiError {
 }
 
 ///|
+/// Append one JSON-encoded `TaskOutputRecord` per line to an external sink.
+pub fn SinkSpec::json_lines(path : String) -> SinkSpec raise ApiError {
+  if path.is_empty() {
+    raise ApiError::Sink("sink path is required")
+  }
+  SinkSpec::JsonLines(path)
+}
+
+///|
+pub fn SinkSpec::path(self : SinkSpec) -> String? {
+  match self {
+    SinkSpec::Discard => None
+    SinkSpec::Durable(name) => Some(name)
+    SinkSpec::JsonLines(path) => Some(path)
+  }
+}
+
+///|
 pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
   match self {
-    SinkSpec::Discard | SinkSpec::Durable(_) => DeliveryGuarantee::AtLeastOnce
+    SinkSpec::Discard | SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+      DeliveryGuarantee::AtLeastOnce
   }
 }
 
@@ -124,7 +165,7 @@ pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
 pub fn SinkSpec::requires_idempotent_consumer(self : SinkSpec) -> Bool {
   match self {
     SinkSpec::Discard => false
-    SinkSpec::Durable(_) => true
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) => true
   }
 }
 
@@ -546,7 +587,28 @@ pub(all) enum Output {
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
-} derive(Debug, Eq, Compare, ToJson, FromJson)
+  Custom(Json)
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub impl Compare for Output with fn compare(self, other) {
+  match (self, other) {
+    (Output::KeyedSum(left), Output::KeyedSum(right)) =>
+      Compare::compare(left, right)
+    (Output::Reachable(left), Output::Reachable(right)) =>
+      Compare::compare(left, right)
+    (Output::SecurityAlert(left), Output::SecurityAlert(right)) =>
+      Compare::compare(left, right)
+    (Output::Custom(left), Output::Custom(right)) =>
+      @json.to_json(left).stringify().compare(@json.to_json(right).stringify())
+    (Output::KeyedSum(_), _) => -1
+    (Output::Reachable(_), Output::KeyedSum(_)) => 1
+    (Output::Reachable(_), _) => -1
+    (Output::SecurityAlert(_), Output::Custom(_)) => -1
+    (Output::SecurityAlert(_), _) => 1
+    (Output::Custom(_), _) => 1
+  }
+}
 
 ///|
 pub fn Output::reachable(value : @reachability.Reachable) -> Output {
@@ -566,7 +628,7 @@ pub fn Output::security_alert(value : @security.SecurityAlert) -> Output {
 ///|
 pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
   match self {
-    Output::KeyedSum(_) => None
+    Output::KeyedSum(_) | Output::Custom(_) => None
     Output::Reachable(value) => Some(value)
     Output::SecurityAlert(_) => None
   }
@@ -575,7 +637,7 @@ pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
 ///|
 pub fn Output::as_security_alert(self : Output) -> @security.SecurityAlert? {
   match self {
-    Output::KeyedSum(_) => None
+    Output::KeyedSum(_) | Output::Custom(_) => None
     Output::Reachable(_) => None
     Output::SecurityAlert(value) => Some(value)
   }
@@ -585,7 +647,7 @@ pub fn Output::as_security_alert(self : Output) -> @security.SecurityAlert? {
 pub fn Output::as_keyed_sum(self : Output) -> @aggregation.KeyedSum? {
   match self {
     Output::KeyedSum(value) => Some(value)
-    Output::Reachable(_) | Output::SecurityAlert(_) => None
+    Output::Reachable(_) | Output::SecurityAlert(_) | Output::Custom(_) => None
   }
 }
 
