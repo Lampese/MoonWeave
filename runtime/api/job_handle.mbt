@@ -13,15 +13,17 @@ pub struct LocalJobHandle {
 ///|
 pub fn JobSubmission::compile(
   self : JobSubmission,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> CompiledJob raise ApiError {
-  self.job.compile()
+  self.job.compile(registry~)
 }
 
 ///|
 pub fn JobSubmission::run_local(
   self : JobSubmission,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> LocalJobHandle raise ApiError {
-  let compiled = self.compile()
+  let compiled = self.compile(registry~)
   let run = compiled.run_local()
   {
     submission: self,

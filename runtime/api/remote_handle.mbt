@@ -12,8 +12,9 @@ pub struct RemoteJobHandle {
 pub async fn JobSubmission::run_remote(
   self : JobSubmission,
   config : DriverConfig,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> RemoteJobHandle raise ApiError {
-  let client = DriverClient::connect(config)
+  let client = DriverClient::connect(config, registry~)
   let status = client.submit(self)
   { submission: self, client, last_status: status, }
 }

@@ -29,6 +29,41 @@ fn driver_submission() -> JobSubmission raise ApiError {
 }
 
 ///|
+fn static_driver_registry() -> OperatorRegistry raise ApiError {
+  let custom = @task.CustomOperator::new(
+    "driver-static-custom",
+    1,
+    "custom:driver-static:v1",
+    "driver-static-state:v1",
+    "json-event:v1",
+    "json-output:v1",
+    "moonweave-task-json-v1",
+    "driver-static-deps:v1",
+    true,
+    false,
+    _ => (),
+    input => [Json::object({ "value": input.event().payload() })],
+  ) catch {
+    error => raise ApiError::InvalidArtifact(@debug.to_string(error))
+  }
+  let registry = OperatorRegistry::new()
+  registry.register_custom(custom)
+  registry
+}
+
+///|
+fn static_driver_submission(
+  registry : OperatorRegistry,
+) -> JobSubmission raise ApiError {
+  JobDefinition::new(
+    "driver-static-custom-job",
+    OperatorRef::new("driver-static-custom", 1),
+  )
+  .compile(registry~)
+  .submission_with_id("driver-static-submission")
+}
+
+///|
 fn driver_event(sequence : Int) -> Event raise ApiError {
   Event::new(
     @causal.EventId::new("driver-source", sequence) catch {
@@ -66,6 +101,41 @@ async test "driver store persists submission input lifecycle and idempotent retr
     assert_eq(restored.status().accepted_events(), 2L)
     assert_eq(restored.inputs(), [first, second])
   })
+}
+
+///|
+async test "driver store reopens static custom submissions with their registry" {
+  let directory = @fs.tmpdir(prefix="moonweave-driver-static-custom")
+  let path = directory + "/driver.wal"
+  defer {
+    @fs.remove(path) catch {
+      _ => ()
+    }
+    @fs.remove(path + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let registry = static_driver_registry()
+  let submission = static_driver_submission(registry)
+  let store = DriverStore::open(path, registry~)
+  ignore(store.submit(submission))
+  store.close()
+  let restored = DriverStore::open(path, registry~)
+  guard restored.submission() is Some(value) else {
+    fail("custom submission was not restored")
+  }
+  assert_eq(value, submission)
+  assert_eq(restored.status().phase(), JobRunPhase::Running)
+  restored.close()
+  try DriverStore::open(path) catch {
+    ApiError::UnsupportedOperator(id) => assert_eq(id, "driver-static-custom")
+    _ => fail("expected default registry to reject custom submission")
+  } noraise {
+    _ => fail("expected default registry to reject custom submission")
+  }
 }
 
 ///|

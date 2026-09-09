@@ -102,6 +102,49 @@ test "matching artifact metadata is accepted and mismatches are rejected" {
 }
 
 ///|
+fn static_custom_registry() -> OperatorRegistry raise ApiError {
+  let custom = @task.CustomOperator::new(
+    "static-custom",
+    1,
+    "custom:static:v1",
+    "static-custom-state:v1",
+    "json-event:v1",
+    "json-output:v1",
+    "moonweave-task-json-v1",
+    "static-custom-deps:v1",
+    true,
+    false,
+    _ => (),
+    input => [Json::object({ "echo": input.event().payload() })],
+  ) catch {
+    error => raise ApiError::InvalidArtifact(@debug.to_string(error))
+  }
+  let registry = OperatorRegistry::new()
+  registry.register_custom(custom)
+  registry
+}
+
+///|
+test "static custom submissions require the Worker registry" {
+  let registry = static_custom_registry()
+  let compiled = JobDefinition::new(
+    "static-custom-job",
+    OperatorRef::new("static-custom", 1),
+  ).compile(registry~)
+  let submission = compiled.submission()
+  try submission.compile() catch {
+    ApiError::UnsupportedOperator(id) => assert_eq(id, "static-custom")
+    _ => fail("expected missing static custom implementation")
+  } noraise {
+    _ => fail("expected missing static custom implementation")
+  }
+  let decoded : ClusterSubmission = @json.from_json(@json.to_json(submission))
+  let restored = decoded.compile(registry~)
+  assert_eq(restored.plan_digest(), compiled.plan_digest())
+  assert_eq(restored.operator_descriptor().code_digest(), "custom:static:v1")
+}
+
+///|
 test "operator descriptors validate payloads before transport" {
   let descriptor = OperatorRegistry::builtins().resolve(
     OperatorRef::reachability(),

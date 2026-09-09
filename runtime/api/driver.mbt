@@ -77,6 +77,7 @@ pub fn DriverConfig::incarnation(self : DriverConfig) -> String {
 /// crossed the async socket boundary.
 pub struct DriverClient {
   config : DriverConfig
+  registry : OperatorRegistry
   connection : @socket.Tcp
   outbound : @protocol.FrameBuilder
   session : @protocol.DriverClientSession
@@ -88,6 +89,7 @@ pub struct DriverClient {
 ///|
 pub async fn DriverClient::connect(
   config : DriverConfig,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> DriverClient raise ApiError {
   let connection = @socket.Tcp::connect_to_host(
     config.endpoint.host,
@@ -122,6 +124,7 @@ pub async fn DriverClient::connect(
   }
   {
     config,
+    registry,
     connection,
     outbound,
     session,
@@ -273,7 +276,7 @@ pub async fn DriverClient::submit(
   }
   defer self.operation_lock.release()
   self.ensure_open()
-  ignore(submission.compile())
+  ignore(submission.compile(registry=self.registry))
   if self.submitted is Some(previous) {
     if previous != submission {
       raise ApiError::RequestConflict(submission.submission_id)

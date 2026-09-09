@@ -100,8 +100,9 @@ pub fn JobDefinition::compile(
 /// development path; ClusterRunner remains a separate explicit mode.
 pub fn JobDefinition::run_local(
   self : JobDefinition,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> LocalRun raise ApiError {
-  self.compile().run_local()
+  self.compile(registry~).run_local()
 }
 
 ///|
@@ -110,8 +111,9 @@ pub async fn JobDefinition::run_local_cluster(
   self : JobDefinition,
   config : ClusterConfig,
   events : ArrayView[Event],
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> ClusterRunSummary raise ApiError {
-  self.compile().run_local_cluster(config, events)
+  self.compile(registry~).run_local_cluster(config, events)
 }
 
 ///|
@@ -159,13 +161,15 @@ pub fn CompiledJob::submission_with_id(
 }
 
 ///|
-/// Recompile and verify a submission before accepting it into a runtime. This
-/// catches plan drift and operator artifact mismatch without loading code.
+/// Recompile and verify a submission before accepting it into a runtime. The
+/// registry is the static Worker build's implementation catalog; it must carry
+/// the same custom callback that was compiled into the submitting Worker.
 pub fn ClusterSubmission::compile(
   self : ClusterSubmission,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> CompiledJob raise ApiError {
   self.operator.validate()
-  let compiled = self.definition.compile()
+  let compiled = self.definition.compile(registry~)
   if compiled.plan_digest() != self.plan_digest {
     raise ApiError::SubmissionMismatch("plan digest")
   }

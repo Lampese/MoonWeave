@@ -1,7 +1,7 @@
 ///|
-/// A stable identity for code that can run on a Worker. v1 ships the built-in
-/// operators with the Worker binary; later artifact execution can add a code
-/// digest without changing JobDefinition.
+/// A stable identity for code that can run on a Worker. Static custom
+/// operators are compiled into the Worker binary and selected through this
+/// identity; the artifact envelope does not load code dynamically.
 pub struct OperatorRef {
   id : String
   version : Int
@@ -53,8 +53,7 @@ fn OperatorRef::validate(self : OperatorRef) -> Unit raise ApiError {
 
 ///|
 /// Metadata advertised by a Worker for one registered operator. `code_digest`
-/// is an identity for the compiled implementation in v1; artifact loading can
-/// replace it with a signed package digest later.
+/// identifies the statically compiled implementation in this Worker build.
 pub struct OperatorDescriptor {
   reference : OperatorRef
   code_digest : String
@@ -184,7 +183,8 @@ fn builtin_descriptor(kind : @task.OperatorKind) -> OperatorDescriptor {
 
 ///|
 /// Build a descriptor for a compile-time registered JSON operator. The
-/// callback remains in the Worker binary; metadata is exchanged and persisted.
+/// callback remains in the Worker binary; only the descriptor metadata is
+/// exchanged and persisted.
 pub fn OperatorDescriptor::custom(
   reference : OperatorRef,
   code_digest : String,
@@ -439,9 +439,9 @@ pub fn OperatorRegistry::resolve(
 }
 
 ///|
-/// Validate an artifact envelope against a registered implementation. This
-/// does not execute or dynamically load code; it establishes the identity and
-/// compatibility contract needed by a future sandboxed loader.
+/// Validate a static artifact envelope against an implementation registered in
+/// this process. This does not execute or dynamically load code; it verifies
+/// that the Worker build contains the expected implementation identity.
 pub fn OperatorRegistry::resolve_artifact(
   self : OperatorRegistry,
   artifact : OperatorArtifact,

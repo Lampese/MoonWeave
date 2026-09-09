@@ -113,7 +113,7 @@ async fn DriverCoordinator::ensure_live_execution(
     raise ApiError::UnknownSubmission("live execution without submission")
   }
   let execution = self.data_listener.open_source_backed_execution(
-    submission.compile(),
+    self.store.compile_submission(submission),
     self.store.inputs(),
   )
   errdefer execution.close()
@@ -164,7 +164,7 @@ async fn DriverCoordinator::apply_command(
   }
   match command {
     JobCommand::Submit(submission) => {
-      let compiled = submission.compile()
+      let compiled = self.store.compile_submission(submission)
       validate_coordinator_workers(compiled, self.data_listener.config)
       ignore(self.store.submit(submission))
       if self.store.phase() == JobRunPhase::Running ||

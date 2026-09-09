@@ -17,6 +17,9 @@ struct DriverJournalEntry {
 pub struct DriverStore {
   path : String
   journal : @runtime.Wal
+  // The registry is part of the static Coordinator build. It is deliberately
+  // not persisted: a restart must be given the same compiled implementations.
+  registry : OperatorRegistry
   mut submission : JobSubmission?
   mut compiled : CompiledJob?
   mut phase : JobRunPhase
@@ -70,7 +73,7 @@ fn DriverStore::install_submission(
   self : DriverStore,
   submission : JobSubmission,
 ) -> Unit raise ApiError {
-  let compiled = submission.job().compile()
+  let compiled = submission.job().compile(registry=self.registry)
   match self.submission {
     None => {
       self.submission = Some(submission)
@@ -89,7 +92,7 @@ fn DriverStore::compile_submission(
   if submission.submission_id.is_empty() {
     raise ApiError::EmptySubmissionId
   }
-  let compiled = submission.job().compile()
+  let compiled = submission.job().compile(registry=self.registry)
   match self.submission {
     None => ()
     Some(previous) if driver_submission_equal(previous, submission) => ()
@@ -209,7 +212,10 @@ fn DriverStore::install_entry(
 }
 
 ///|
-pub async fn DriverStore::open(path : String) -> DriverStore raise ApiError {
+pub async fn DriverStore::open(
+  path : String,
+  registry? : OperatorRegistry = OperatorRegistry::builtins(),
+) -> DriverStore raise ApiError {
   if path.is_empty() {
     raise ApiError::Cluster("Driver store path is empty")
   }
@@ -220,6 +226,7 @@ pub async fn DriverStore::open(path : String) -> DriverStore raise ApiError {
   let store = DriverStore::{
     path,
     journal,
+    registry,
     submission: None,
     compiled: None,
     phase: JobRunPhase::Created,

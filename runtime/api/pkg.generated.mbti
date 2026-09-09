@@ -94,7 +94,7 @@ pub(all) struct ClusterSubmission {
   plan_digest : String
   operator : OperatorArtifact
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
-pub fn ClusterSubmission::compile(Self) -> CompiledJob raise ApiError
+pub fn ClusterSubmission::compile(Self, registry? : OperatorRegistry) -> CompiledJob raise ApiError
 pub fn ClusterSubmission::definition(Self) -> JobDefinition
 pub fn ClusterSubmission::operator(Self) -> OperatorArtifact
 pub fn ClusterSubmission::plan_digest(Self) -> String
@@ -199,6 +199,7 @@ pub fn DeliveryGuarantee::at_least_once() -> Self
 
 pub struct DriverClient {
   config : DriverConfig
+  registry : OperatorRegistry
   connection : @socket.Tcp
   outbound : @protocol.FrameBuilder
   session : @protocol.DriverClientSession
@@ -210,7 +211,7 @@ pub async fn DriverClient::await_completion(Self, poll_interval_ms? : Int, timeo
 pub async fn DriverClient::cancel(Self) -> JobRunStatus raise ApiError
 pub fn DriverClient::close(Self) -> Unit
 pub async fn DriverClient::command(Self, JobCommand) -> JobRunStatus raise ApiError
-pub async fn DriverClient::connect(DriverConfig) -> Self raise ApiError
+pub async fn DriverClient::connect(DriverConfig, registry? : OperatorRegistry) -> Self raise ApiError
 pub async fn DriverClient::drain(Self) -> JobRunStatus raise ApiError
 pub async fn DriverClient::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
 pub async fn DriverClient::status(Self) -> JobRunStatus raise ApiError
@@ -285,6 +286,7 @@ type DriverJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub struct DriverStore {
   path : String
   journal : @moonweave/moonweave/runtime/async.Wal
+  registry : OperatorRegistry
   mut submission : JobSubmission?
   mut compiled : CompiledJob?
   mut phase : JobRunPhase
@@ -302,7 +304,7 @@ pub async fn DriverStore::drain(Self) -> JobRunStatus raise ApiError
 pub async fn DriverStore::handle(Self, JobCommand) -> Result[JobRunStatus, String]
 pub async fn DriverStore::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
 pub fn DriverStore::inputs(Self) -> Array[Event] raise ApiError
-pub async fn DriverStore::open(String) -> Self raise ApiError
+pub async fn DriverStore::open(String, registry? : OperatorRegistry) -> Self raise ApiError
 pub fn DriverStore::path(Self) -> String
 pub fn DriverStore::phase(Self) -> JobRunPhase
 pub fn DriverStore::stats(Self) -> @moonweave/moonweave/runtime/async.WalStats
@@ -353,8 +355,8 @@ pub fn JobDefinition::operator(Self) -> OperatorRef
 pub fn JobDefinition::partition_count(Self) -> Int
 pub fn JobDefinition::partitioning(Self) -> Partitioning
 pub fn JobDefinition::routes(Self) -> ArrayView[@plan.ExchangeRoute]
-pub fn JobDefinition::run_local(Self) -> LocalRun raise ApiError
-pub async fn JobDefinition::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
+pub fn JobDefinition::run_local(Self, registry? : OperatorRegistry) -> LocalRun raise ApiError
+pub async fn JobDefinition::run_local_cluster(Self, ClusterConfig, ArrayView[Event], registry? : OperatorRegistry) -> ClusterRunSummary raise ApiError
 pub fn JobDefinition::sink(Self) -> SinkSpec
 pub fn JobDefinition::source(Self) -> SourceSpec
 pub fn JobDefinition::with_artifact(Self, OperatorArtifact) -> Self
@@ -400,11 +402,11 @@ pub(all) struct JobSubmission {
   submission_id : String
   job : ClusterSubmission
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
-pub fn JobSubmission::compile(Self) -> CompiledJob raise ApiError
+pub fn JobSubmission::compile(Self, registry? : OperatorRegistry) -> CompiledJob raise ApiError
 pub fn JobSubmission::job(Self) -> ClusterSubmission
 pub fn JobSubmission::new(String, ClusterSubmission) -> Self raise ApiError
-pub fn JobSubmission::run_local(Self) -> LocalJobHandle raise ApiError
-pub async fn JobSubmission::run_remote(Self, DriverConfig) -> RemoteJobHandle raise ApiError
+pub fn JobSubmission::run_local(Self, registry? : OperatorRegistry) -> LocalJobHandle raise ApiError
+pub async fn JobSubmission::run_remote(Self, DriverConfig, registry? : OperatorRegistry) -> RemoteJobHandle raise ApiError
 pub fn JobSubmission::submission_id(Self) -> String
 
 pub struct JsonLinesSource {

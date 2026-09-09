@@ -1,7 +1,8 @@
 ///|
-/// Portable identity for a compiled operator artifact. This metadata is
-/// checked for compatibility; it contains no executable bytes. The signature
-/// field is opaque, unverified metadata, NOT proof of authenticity.
+/// Portable identity for a statically compiled operator artifact. This
+/// metadata is checked for compatibility; it contains no executable bytes and
+/// does not dynamically load an operator. The signature field is opaque,
+/// unverified metadata, NOT proof of authenticity.
 pub struct OperatorArtifact {
   reference : OperatorRef
   code_digest : String
