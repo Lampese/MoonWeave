@@ -239,6 +239,16 @@ async test "supervisor retries a transient connection failure" {
       run_supervisor_with_retry(server, control, [work], policy)
     }
     let failed = @socket.Tcp::connect(addr)
+    ignore(
+      worker_handshake(
+        failed,
+        "cluster-a",
+        "coordinator",
+        "worker-a",
+        boot.value(),
+        ["graph"],
+      ),
+    )
     failed.close()
     @async_runtime.sleep(5)
     let connection = @socket.Tcp::connect(addr)
@@ -331,7 +341,7 @@ async test "supervisor rejects a worker without the registered operator capabili
 }
 
 ///|
-async test "supervisor checks the capability advertised in the Hello frame" {
+async test "supervisor checks Hello authentication and capabilities without consuming work" {
   let directory = @fs.tmpdir(prefix="moonweave-supervisor-hello-capability")
   let wal = directory + "/worker.wal"
   defer {
@@ -367,9 +377,33 @@ async test "supervisor checks the capability advertised in the Hello frame" {
   @async_runtime.with_timeout(10000, () => {
     @async_runtime.with_task_group <| group => {
       let supervisor = group.spawn() <| () => {
-        run_supervisor(server, control, [work])
+        run_supervisor(server, control, [work], auth_token="secret")
       }
-      let worker = group.spawn(allow_failure=true) <| () => {
+      for
+        (token, capabilities) in [
+          ("wrong", [required]),
+          ("secret", ["reachability"]),
+        ] {
+        let connection = @socket.Tcp::connect(server.addr)
+        try
+          run_worker(
+            connection,
+            "cluster-hello-capability",
+            "coordinator",
+            "worker",
+            boot.value(),
+            capabilities,
+            wal,
+            _ => (),
+            auth_token=token,
+          )
+        catch {
+          _ => ()
+        } noraise {
+          _ => fail("invalid Hello was admitted")
+        }
+      }
+      let worker = group.spawn() <| () => {
         let connection = @socket.Tcp::connect(server.addr)
         run_worker(
           connection,
@@ -377,18 +411,16 @@ async test "supervisor checks the capability advertised in the Hello frame" {
           "coordinator",
           "worker",
           boot.value(),
-          ["reachability"],
+          [required],
           wal,
           _ => (),
+          auth_token="secret",
         )
       }
       let summary = supervisor.wait()
-      assert_eq(summary.failed_workers(), 1)
-      try worker.wait() catch {
-        _ => ()
-      } noraise {
-        summary => ignore(summary)
-      }
+      ignore(worker.wait())
+      assert_eq(summary.failed_workers(), 0)
+      assert_eq(summary.completed_workers(), 1)
       ignore(assignment)
     }
   })

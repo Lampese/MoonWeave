@@ -210,8 +210,8 @@ async test "coordinator store adopts a staged generation after checkpoint commit
 }
 
 ///|
-async test "coordinator store accepts a legacy checkpoint without a generation" {
-  let directory = @fs.tmpdir(prefix="moonweave-coordinator-legacy")
+async test "coordinator store requires a checkpoint journal generation" {
+  let directory = @fs.tmpdir(prefix="moonweave-coordinator-checkpoint")
   let journal_path = directory + "/coordinator.journal"
   let checkpoint_path = directory + "/coordinator.json"
   defer {
@@ -233,18 +233,18 @@ async test "coordinator store accepts a legacy checkpoint without a generation" 
     }
   }
   let store = CoordinatorStore::open(
-    "cluster-legacy",
+    "cluster-checkpoint",
     "coordinator",
     journal_path,
     checkpoint_path~,
   )
-  let boot = @protocol.Incarnation::new("boot-legacy")
+  let boot = @protocol.Incarnation::new("boot-checkpoint")
   ignore(store.register_worker("worker", boot, []))
   store.checkpoint()
   store.close()
   let json = @json.parse(@fs.read_file(checkpoint_path).text())
   guard json is Object(fields) else { fail("checkpoint was not an object") }
-  fields["version"] = Json::number(1.0)
+  assert_eq(fields.get("version"), None)
   fields.remove("journal_generation")
   @fs.write_file(
     checkpoint_path,
@@ -252,13 +252,70 @@ async test "coordinator store accepts a legacy checkpoint without a generation" 
     create_mode=@fs.CreateOrTruncate,
     sync=@fs.Full,
   )
-  let restored = CoordinatorStore::open(
-    "cluster-legacy",
+  try
+    CoordinatorStore::open(
+      "cluster-checkpoint",
+      "coordinator",
+      journal_path,
+      checkpoint_path~,
+    )
+  catch {
+    CoordinatorStoreError::Malformed => ()
+    _ => fail("expected missing generation to be rejected")
+  } noraise {
+    _ => fail("expected missing generation to be rejected")
+  }
+}
+
+///|
+async test "coordinator store rejects removed checkpoint versions" {
+  let directory = @fs.tmpdir(prefix="moonweave-coordinator-version")
+  let journal_path = directory + "/coordinator.journal"
+  let checkpoint_path = directory + "/coordinator.json"
+  defer {
+    for
+      path in [
+        journal_path,
+        journal_path + ".lock",
+        checkpoint_path,
+        checkpoint_path + ".tmp",
+      ] {
+      @fs.remove(path) catch {
+        _ => ()
+      }
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let store = CoordinatorStore::open(
+    "cluster-version",
     "coordinator",
     journal_path,
     checkpoint_path~,
   )
-  defer restored.close()
-  assert_eq(restored.journal_generation(), 0L)
-  assert_eq(restored.snapshot().workers().length(), 1)
+  store.checkpoint()
+  store.close()
+  let json = @json.parse(@fs.read_file(checkpoint_path).text())
+  guard json is Object(fields) else { fail("checkpoint was not an object") }
+  fields["version"] = Json::number(2.0)
+  @fs.write_file(
+    checkpoint_path,
+    @utf8.encode(json.stringify()),
+    create_mode=@fs.CreateOrTruncate,
+    sync=@fs.Full,
+  )
+  try
+    CoordinatorStore::open(
+      "cluster-version",
+      "coordinator",
+      journal_path,
+      checkpoint_path~,
+    )
+  catch {
+    CoordinatorStoreError::Malformed => ()
+    _ => fail("expected removed checkpoint version to be rejected")
+  } noraise {
+    _ => fail("expected removed checkpoint version to be rejected")
+  }
 }

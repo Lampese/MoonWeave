@@ -366,12 +366,8 @@ test "task snapshot preserves pending causal state and resumes deterministically
   assert_eq(snapshot.offset(), 0L)
   assert_eq(snapshot.events().length(), 1)
   assert_eq(snapshot.state_schema(), "reachability-state:v1")
-  assert_true(snapshot.operator_capability() is Some(_))
+  assert_eq(snapshot.operator_capability(), snapshot.operator().capability())
 
-  let forged = TaskSnapshot::{
-    ..snapshot,
-    operator_capability: Some("forged-operator-capability"),
-  }
   let forged_restore = Task::new(
     "snapshot-task",
     "reachability",
@@ -380,11 +376,17 @@ test "task snapshot preserves pending causal state and resumes deterministically
     0,
   )
   forged_restore.start()
-  try forged_restore.restore(forged) catch {
-    TaskError::OperatorContractMismatch => ()
-    _ => fail("expected operator contract mismatch")
-  } noraise {
-    _ => fail("expected operator contract mismatch")
+  let before_restore = forged_restore.snapshot()
+  for capability in ["", "forged-operator-capability"] {
+    let forged = TaskSnapshot::{ ..snapshot, operator_capability: capability, }
+    try forged_restore.restore(forged) catch {
+      TaskError::OperatorContractMismatch => ()
+      _ => fail("expected operator contract mismatch")
+    } noraise {
+      _ => fail("expected operator contract mismatch")
+    }
+    assert_eq(forged_restore.snapshot(), before_restore)
+    assert_eq(forged_restore.phase(), TaskPhase::Running)
   }
 
   let restored = Task::new(
@@ -430,4 +432,35 @@ test "task snapshot JSON round-trip preserves operator schema identity" {
   assert_eq(decoded, snapshot)
   assert_eq(decoded.state_schema(), "reachability-state:v1")
   assert_eq(decoded.operator_capability(), snapshot.operator_capability())
+}
+
+///|
+test "task snapshot JSON requires operator capability" {
+  let task = Task::new(
+    "snapshot-required-capability",
+    "reachability",
+    OperatorKind::Reachability,
+    0,
+    0,
+  )
+  task.start()
+  let snapshot = task.snapshot()
+  let invalid_capabilities : Array[Json?] = [
+    None,
+    Some(Json::null()),
+    Some(Json::number(1)),
+  ]
+  for capability in invalid_capabilities {
+    let json = @json.to_json(snapshot)
+    guard json is Object(fields) else { fail("snapshot was not an object") }
+    match capability {
+      None => fields.remove("operator_capability")
+      Some(value) => fields["operator_capability"] = value
+    }
+    try (@json.from_json(json) : TaskSnapshot) catch {
+      @json.JsonDecodeError(_) => ()
+    } noraise {
+      _ => fail("expected invalid operator capability to be rejected")
+    }
+  }
 }

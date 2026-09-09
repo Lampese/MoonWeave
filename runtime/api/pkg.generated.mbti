@@ -156,14 +156,20 @@ pub struct CoordinatorNodeConfig {
   advertised : NodeEndpoint?
   storage_dir : String
   workers : Array[WorkerSlot]
+  migration_required : Bool
+  auth_token : String?
 } derive(Eq, @debug.Debug)
 pub fn CoordinatorNodeConfig::advertised_endpoint(Self) -> NodeEndpoint?
+pub fn CoordinatorNodeConfig::auth_token(Self) -> String?
 pub fn CoordinatorNodeConfig::bind(Self) -> NodeEndpoint
 pub fn CoordinatorNodeConfig::cluster_id(Self) -> String
 pub fn CoordinatorNodeConfig::coordinator_id(Self) -> String
+pub fn CoordinatorNodeConfig::migration_required(Self) -> Bool
 pub fn CoordinatorNodeConfig::new(String, String, NodeEndpoint, String, ArrayView[WorkerSlot]) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::storage_dir(Self) -> String
 pub fn CoordinatorNodeConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
+pub fn CoordinatorNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn CoordinatorNodeConfig::with_migration_required(Self, required? : Bool) -> Self
 pub fn CoordinatorNodeConfig::workers(Self) -> ArrayView[WorkerSlot]
 
 pub(all) struct CoordinatorNodeSummary {
@@ -754,7 +760,9 @@ pub struct WorkerNodeConfig {
   epoch : Int
   start_offset : Int64
   assignment_known : Bool
+  auth_token : String?
 } derive(Eq, @debug.Debug)
+pub fn WorkerNodeConfig::auth_token(Self) -> String?
 pub fn WorkerNodeConfig::cluster_id(Self) -> String
 pub fn WorkerNodeConfig::coordinator(Self) -> NodeEndpoint
 pub fn WorkerNodeConfig::coordinator_id(Self) -> String
@@ -767,6 +775,7 @@ pub fn WorkerNodeConfig::partition(Self) -> Int
 pub fn WorkerNodeConfig::start_offset(Self) -> Int64
 pub fn WorkerNodeConfig::storage_dir(Self) -> String
 pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
+pub fn WorkerNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn WorkerNodeConfig::worker_id(Self) -> String
 
 pub struct WorkerNodeSetConfig {
@@ -777,7 +786,9 @@ pub struct WorkerNodeSetConfig {
   incarnation : String
   storage_dir : String
   partitions : Array[Int]?
+  auth_token : String?
 } derive(Eq, @debug.Debug)
+pub fn WorkerNodeSetConfig::auth_token(Self) -> String?
 pub fn WorkerNodeSetConfig::cluster_id(Self) -> String
 pub fn WorkerNodeSetConfig::coordinator(Self) -> NodeEndpoint
 pub fn WorkerNodeSetConfig::coordinator_id(Self) -> String
@@ -785,6 +796,7 @@ pub fn WorkerNodeSetConfig::incarnation(Self) -> String
 pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::partitions(Self) -> ArrayView[Int]
 pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
+pub fn WorkerNodeSetConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::with_partitions(Self, ArrayView[Int]) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::worker_id(Self) -> String
 
@@ -827,9 +839,12 @@ pub fn WorkerNodeSummary::worker_id(Self) -> String
 pub(all) struct WorkerSlot {
   worker_id : String
   incarnation : String
+  storage_dir : String?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn WorkerSlot::incarnation(Self) -> String
 pub fn WorkerSlot::new(String, String) -> Self raise ApiError
+pub fn WorkerSlot::storage_dir(Self) -> String?
+pub fn WorkerSlot::with_storage_dir(Self, String) -> Self raise ApiError
 pub fn WorkerSlot::worker_id(Self) -> String
 
 // Type aliases

@@ -75,6 +75,7 @@ pub async fn run_managed_durable_exchange_outbox(
   outbox : DurableExchangeOutbox,
   poll_interval_ms? : Int = 10,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> ExchangeRunSummary raise FrameIoError {
   if poll_interval_ms <= 0 {
     raise FrameIoError::Handler(
@@ -124,6 +125,7 @@ pub async fn run_managed_durable_exchange_outbox(
     session_id,
     assignment=spec,
     maximum_frame_bytes~,
+    auth_token?,
   )
   session.restore_send_cursor(
     assignment.partition(),

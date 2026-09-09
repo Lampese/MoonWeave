@@ -84,7 +84,7 @@ async test "remote inputs compute before drain and retries do not add totals twi
       )
       assert_eq(handle.input([first]).accepted_events(), 1L)
       let checkpoint = wait_live_checkpoint(root + "/worker/worker-p0.json", 0L)
-      assert_eq(checkpoint.state_schema(), Some("keyed-sum-state:v1"))
+      assert_eq(checkpoint.state_schema(), "keyed-sum-state:v1")
       assert_eq(handle.refresh().phase(), JobRunPhase::Running)
       assert_eq(handle.input([first, second, second]).accepted_events(), 2L)
       let checkpoint = wait_live_checkpoint(root + "/worker/worker-p0.json", 1L)

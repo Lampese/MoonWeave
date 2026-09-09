@@ -257,6 +257,7 @@ pub(all) struct Hello {
   capabilities : Array[String]
   last_session_id : String?
   requested_partition : Int?
+  auth_token : String?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -266,6 +267,7 @@ pub fn Hello::new(
   capabilities : Array[String],
   last_session_id? : String,
   requested_partition? : Int,
+  auth_token? : String,
 ) -> Hello raise ProtocolError {
   if worker_id.is_empty() {
     raise ProtocolError::EmptyWorkerId
@@ -277,12 +279,17 @@ pub fn Hello::new(
     Some(partition) if partition < 0 => raise ProtocolError::UnknownAssignment
     _ => ()
   }
+  match auth_token {
+    Some(token) if token.is_empty() => raise ProtocolError::InvalidFrameField
+    _ => ()
+  }
   {
     worker_id,
     incarnation,
     capabilities,
     last_session_id,
     requested_partition,
+    auth_token,
   }
 }
 
@@ -311,6 +318,13 @@ pub fn Hello::last_session_id(self : Hello) -> String? {
 /// independent transport sessions. A missing hint preserves legacy routing.
 pub fn Hello::requested_partition(self : Hello) -> Int? {
   self.requested_partition
+}
+
+///|
+/// Optional shared-secret credential for deployments that enable connection
+/// authentication. TLS should still be used when the network is untrusted.
+pub fn Hello::auth_token(self : Hello) -> String? {
+  self.auth_token
 }
 
 ///|
@@ -977,6 +991,7 @@ pub fn Hello::from_payload(text : String) -> Hello raise MessageError {
     value.capabilities,
     last_session_id?=value.last_session_id,
     requested_partition?=value.requested_partition,
+    auth_token?=value.auth_token,
   ) catch {
     error => raise protocol_error(error)
   }

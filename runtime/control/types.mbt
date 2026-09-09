@@ -90,6 +90,25 @@ pub struct PartitionAssignment {
 } derive(Debug, Eq)
 
 ///|
+/// Rehydrate one lease from a durable Coordinator snapshot. The async store
+/// uses this when a Coordinator restarts with assignments already installed.
+pub fn PartitionAssignment::from_snapshot(
+  snapshot : AssignmentSnapshot,
+) -> PartitionAssignment raise @protocol.ProtocolError {
+  let incarnation = @protocol.Incarnation::new(snapshot.incarnation)
+  {
+    partition: snapshot.partition,
+    epoch: snapshot.epoch,
+    worker_id: snapshot.worker_id,
+    incarnation,
+    start_offset: snapshot.start_offset,
+    next_offset: snapshot.next_offset,
+    persisted_offset: snapshot.persisted_offset,
+    applied_offset: snapshot.applied_offset,
+  }
+}
+
+///|
 pub fn PartitionAssignment::partition(self : PartitionAssignment) -> Int {
   self.partition
 }

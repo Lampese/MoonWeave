@@ -19,6 +19,7 @@ pub struct WorkerTaskWork {
   initial_credit_events : Int64
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
+  auth_token : String?
 }
 
 ///|
@@ -39,6 +40,7 @@ pub fn WorkerTaskWork::new(
   initial_credit_events? : Int64 = 128L,
   initial_credit_bytes? : Int64 = 4L * 1024L * 1024L,
   heartbeat_interval_ms? : Int = 0,
+  auth_token? : String,
 ) -> WorkerTaskWork {
   {
     connection,
@@ -57,6 +59,7 @@ pub fn WorkerTaskWork::new(
     initial_credit_events,
     initial_credit_bytes,
     heartbeat_interval_ms,
+    auth_token,
   }
 }
 
@@ -224,6 +227,7 @@ pub async fn run_worker_task_set(
             delta_wal_path?=work.delta_wal_path,
             output_log_path?=work.output_log_path,
             dynamic_assignment=work.dynamic_assignment,
+            auth_token?=work.auth_token,
           ),
         ) catch {
           error => Err(error)

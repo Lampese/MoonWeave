@@ -12,9 +12,7 @@ pub(all) struct TaskSnapshot {
   frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
-  // Legacy checkpoints omit this field; new checkpoints record implementation
-  // and schema identity.
-  operator_capability : String?
+  operator_capability : String
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -38,7 +36,7 @@ pub fn TaskSnapshot::state_schema(self : TaskSnapshot) -> String {
 }
 
 ///|
-pub fn TaskSnapshot::operator_capability(self : TaskSnapshot) -> String? {
+pub fn TaskSnapshot::operator_capability(self : TaskSnapshot) -> String {
   self.operator_capability
 }
 

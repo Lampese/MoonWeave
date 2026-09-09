@@ -418,18 +418,13 @@ fn live_assignment_for_hello(
   @control.WorkerInfo,
   @control.PartitionAssignment,
   @protocol.AssignmentSpec,
-) raise FrameIoError {
+)? raise FrameIoError {
   let worker = match control.worker(worker_id) {
     Some(value) => value
-    None =>
-      raise FrameIoError::Coordinator(
-        @control.CoordinatorError::UnknownWorker(worker_id),
-      )
+    None => return None
   }
   if worker.lifecycle() != @control.WorkerLifecycle::Active {
-    raise FrameIoError::Coordinator(
-      @control.CoordinatorError::WorkerNotActive(worker_id),
-    )
+    return None
   }
   let matches : Array[@control.PartitionAssignment] = []
   for partition in 0..<plan.partition_count() {
@@ -442,16 +437,10 @@ fn live_assignment_for_hello(
       _ => ()
     }
   }
-  guard matches.length() == 1 else {
-    raise FrameIoError::Handler(
-      "live Worker must identify exactly one assigned partition",
-    )
-  }
+  guard matches.length() == 1 else { return None }
   let assignment = matches[0]
   if assignment.incarnation() != worker.incarnation() {
-    raise FrameIoError::Coordinator(
-      @control.CoordinatorError::AssignmentConflict(assignment.partition()),
-    )
+    return None
   }
   let spec = @protocol.AssignmentSpec::new(
     assignment.partition(),
@@ -461,7 +450,7 @@ fn live_assignment_for_hello(
   ) catch {
     error => raise FrameIoError::Protocol(error)
   }
-  (worker, assignment, spec)
+  Some((worker, assignment, spec))
 }
 
 ///|
@@ -789,104 +778,102 @@ async fn supervise_live_source_connection(
   output_manifest : JobOutputManifest?,
   attempt : LiveConnectionAttempt,
   reconnect_timeout_ms : Int,
+  auth_token : String?,
 ) -> CoordinatorRunSummary raise FrameIoError {
-  let mut claimed_id = ""
-  let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
-    let (connection, _) = if attempt.attempts == 1 {
-      accept_supervisor_connection(server, accept_lock)
-    } else {
-      @async.with_timeout(reconnect_timeout_ms, () => {
+  for ;; {
+    let mut claimed_id = ""
+    let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
+      let (connection, _) = if attempt.attempts == 1 {
         accept_supervisor_connection(server, accept_lock)
-      }) catch {
-        error =>
-          raise FrameIoError::Handler(
-            "Worker reconnect deadline: " + @debug.to_string(error),
-          )
+      } else {
+        @async.with_timeout(reconnect_timeout_ms, () => {
+          accept_supervisor_connection(server, accept_lock)
+        }) catch {
+          error =>
+            raise FrameIoError::Handler(
+              "Worker reconnect deadline: " + @debug.to_string(error),
+            )
+        }
       }
-    }
-    defer connection.close()
-    let hello_frame = @async.with_timeout(reconnect_timeout_ms, () => {
-      read_frame(connection, maximum_frame_bytes~)
-    }) catch {
-      error =>
-        raise FrameIoError::Handler(
-          "Worker handshake failed: " + @debug.to_string(error),
+      defer connection.close()
+      guard read_supervisor_hello(
+          connection,
+          live.coordinator.state(),
+          maximum_frame_bytes,
+          reconnect_timeout_ms,
+          auth_token,
         )
-    }
-    let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
-      error => raise FrameIoError::Message(error)
-    }
-    let (worker, assignment, spec) = live_assignment_for_hello(
-      live.coordinator.state(),
-      live.plan,
-      hello.worker_id(),
-      hello.requested_partition(),
-    )
-    attempt.worker_id = worker.worker_id()
-    attempt.partition = Some(assignment.partition())
-    if job_store_partition(live.job_store, assignment.partition()).phase() ==
-      @control.JobPartitionPhase::Succeeded {
-      raise FrameIoError::Handler("Worker partition is already complete")
-    }
-    let claim_key = hello.worker_id() + "#" + assignment.partition().to_string()
-    claim_lock.acquire() catch {
-      error => raise FrameIoError::Io(@debug.to_string(error))
-    }
-    let unique = claimed.add_and_check(claim_key)
-    claim_lock.release()
-    if !unique {
-      raise FrameIoError::Coordinator(
-        @control.CoordinatorError::IncarnationConflict,
-      )
-    }
-    claimed_id = claim_key
-    if hello.incarnation() != worker.incarnation().value() {
-      raise FrameIoError::Coordinator(
-        @control.CoordinatorError::StaleIncarnation,
-      )
-    }
-    match live.required_capability {
-      Some(capability) if !hello
-        .capabilities()
-        .any(value => value == capability) =>
-        raise FrameIoError::SupervisorPlan(
-          SupervisorPlanError::MissingCapability(
-            worker=hello.worker_id(),
-            capability~,
-          ),
+        is Some((hello_frame, hello)) else {
+        continue
+      }
+      guard live_assignment_for_hello(
+          live.coordinator.state(),
+          live.plan,
+          hello.worker_id(),
+          hello.requested_partition(),
         )
-      _ => ()
+        is Some((worker, assignment, spec)) else {
+        continue
+      }
+      if job_store_partition(live.job_store, assignment.partition()).phase() ==
+        @control.JobPartitionPhase::Succeeded {
+        continue
+      }
+      if hello.incarnation() != worker.incarnation().value() {
+        continue
+      }
+      match live.required_capability {
+        Some(capability) if !hello
+          .capabilities()
+          .any(value => value == capability) => continue
+        _ => ()
+      }
+      let claim_key = hello.worker_id() +
+        "#" +
+        assignment.partition().to_string()
+      claim_lock.acquire() catch {
+        error => raise FrameIoError::Io(@debug.to_string(error))
+      }
+      let unique = claimed.add_and_check(claim_key)
+      claim_lock.release()
+      if !unique {
+        continue
+      }
+      claimed_id = claim_key
+      attempt.worker_id = worker.worker_id()
+      attempt.partition = Some(assignment.partition())
+      live.session_sequence += 1L
+      let (session, outbound) = coordinator_handshake_after_hello(
+        connection,
+        hello_frame,
+        live.coordinator.state().cluster_id(),
+        live.coordinator.state().coordinator_id(),
+        hello.worker_id(),
+        live.plan.job_id() +
+        "-live-p" +
+        assignment.partition().to_string() +
+        "-s" +
+        live.session_sequence.to_string(),
+        assignment=spec,
+        maximum_frame_bytes~,
+        auth_token?,
+      )
+      Ok(
+        run_live_source_session(
+          connection, live, lifecycle, worker, assignment, session, outbound, maximum_frame_bytes,
+          poll_interval_ms, drain_timeout_ms, output_manifest,
+        ),
+      )
+    } catch {
+      error => Err(error)
     }
-    live.session_sequence += 1L
-    let (session, outbound) = coordinator_handshake_after_hello(
-      connection,
-      hello_frame,
-      live.coordinator.state().cluster_id(),
-      live.coordinator.state().coordinator_id(),
-      hello.worker_id(),
-      live.plan.job_id() +
-      "-live-p" +
-      assignment.partition().to_string() +
-      "-s" +
-      live.session_sequence.to_string(),
-      assignment=spec,
-      maximum_frame_bytes~,
-    )
-    Ok(
-      run_live_source_session(
-        connection, live, lifecycle, worker, assignment, session, outbound, maximum_frame_bytes,
-        poll_interval_ms, drain_timeout_ms, output_manifest,
-      ),
-    )
-  } catch {
-    error => Err(error)
-  }
-  if outcome is Err(_) && !claimed_id.is_empty() {
-    release_supervisor_claim(claimed, claim_lock, claimed_id)
-  }
-  match outcome {
-    Ok(value) => value
-    Err(error) => raise error
+    if outcome is Err(_) && !claimed_id.is_empty() {
+      release_supervisor_claim(claimed, claim_lock, claimed_id)
+    }
+    match outcome {
+      Ok(value) => return value
+      Err(error) => raise error
+    }
   }
 }
 
@@ -914,6 +901,7 @@ async fn supervise_live_source_connection_with_retry(
   reconnect_backoff_ms : Int,
   reconnect_timeout_ms : Int,
   attempt : LiveConnectionAttempt,
+  auth_token : String?,
 ) -> CoordinatorRunSummary raise FrameIoError {
   for ;; {
     let result : Result[CoordinatorRunSummary, FrameIoError] = Ok(
@@ -930,6 +918,7 @@ async fn supervise_live_source_connection_with_retry(
         output_manifest,
         attempt,
         reconnect_timeout_ms,
+        auth_token,
       ),
     ) catch {
       error => Err(error)
@@ -964,6 +953,7 @@ pub async fn run_live_source_supervisor(
   reconnect_attempts? : Int = 3,
   reconnect_backoff_ms? : Int = 10,
   reconnect_timeout_ms? : Int = 5000,
+  auth_token? : String,
 ) -> LiveSupervisorSummary raise FrameIoError {
   if maximum_frame_bytes <= 0 ||
     poll_interval_ms <= 0 ||
@@ -1004,7 +994,7 @@ pub async fn run_live_source_supervisor(
             supervise_live_source_connection_with_retry(
               server, live, claimed, claim_lock, accept_lock, maximum_frame_bytes,
               poll_interval_ms, drain_timeout_ms, output_manifest, reconnect_attempts,
-              reconnect_backoff_ms, reconnect_timeout_ms, attempt,
+              reconnect_backoff_ms, reconnect_timeout_ms, attempt, auth_token,
             ),
           ) catch {
             error => Err(error)

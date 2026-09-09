@@ -14,6 +14,7 @@ pub(all) suberror SessionError {
   SessionMismatch
   SenderMismatch
   IncarnationMismatch
+  AuthenticationFailed
   MessageRegression(expected_at_least~ : Int64, actual~ : Int64)
   MessageGap(expected~ : Int64, actual~ : Int64)
   MessageIdConflict(String)
@@ -552,6 +553,7 @@ fn CoordinatorSession::validate_frame(
 pub fn CoordinatorSession::accept_hello(
   self : CoordinatorSession,
   frame : Frame,
+  auth_token? : String,
 ) -> Hello raise SessionError {
   match self.seen_messages.get(frame.message_id()) {
     Some(previous) => {
@@ -571,6 +573,16 @@ pub fn CoordinatorSession::accept_hello(
   if hello.worker_id() != self.worker_id ||
     hello.incarnation() != frame.worker_incarnation() {
     raise SessionError::IncarnationMismatch
+  }
+  match auth_token {
+    None =>
+      if hello.auth_token() is Some(_) {
+        raise SessionError::AuthenticationFailed
+      }
+    Some(expected) =>
+      if hello.auth_token() != Some(expected) {
+        raise SessionError::AuthenticationFailed
+      }
   }
   let incarnation = Incarnation::new(hello.incarnation()) catch {
     error => raise SessionError::Frame(error)

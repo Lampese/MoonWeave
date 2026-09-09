@@ -11,7 +11,6 @@ pub(all) suberror CheckpointError {
 /// Durable worker progress manifest. It describes a verified WAL prefix and
 /// logical input/application offsets; it is not a replacement for the WAL.
 pub(all) struct Checkpoint {
-  version : Int
   partition : Int
   epoch : Int
   wal_offset : Int64
@@ -19,7 +18,7 @@ pub(all) struct Checkpoint {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
-  state_schema : String?
+  state_schema : String
   operator_state : Json?
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -32,7 +31,7 @@ pub fn Checkpoint::new(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset? : Int64 = 0L,
-  state_schema? : String,
+  state_schema~ : String,
   operator_state? : Json,
 ) -> Checkpoint raise CheckpointError {
   if partition < 0 ||
@@ -43,11 +42,10 @@ pub fn Checkpoint::new(
     applied_offset < -1L ||
     applied_offset > persisted_offset ||
     frontier_digest.is_empty() ||
-    (state_schema is Some(value) && value.is_empty()) {
+    state_schema.is_empty() {
     raise CheckpointError::InvalidField
   }
   {
-    version: 1,
     partition,
     epoch,
     wal_offset,
@@ -58,11 +56,6 @@ pub fn Checkpoint::new(
     state_schema,
     operator_state,
   }
-}
-
-///|
-pub fn Checkpoint::version(self : Checkpoint) -> Int {
-  self.version
 }
 
 ///|
@@ -101,7 +94,7 @@ pub fn Checkpoint::frontier_digest(self : Checkpoint) -> String {
 }
 
 ///|
-pub fn Checkpoint::state_schema(self : Checkpoint) -> String? {
+pub fn Checkpoint::state_schema(self : Checkpoint) -> String {
   self.state_schema
 }
 
@@ -112,9 +105,6 @@ pub fn Checkpoint::operator_state(self : Checkpoint) -> Json? {
 
 ///|
 fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
-  if self.version != 1 {
-    raise CheckpointError::Malformed
-  }
   Checkpoint::new(
     self.partition,
     self.epoch,
@@ -123,7 +113,7 @@ fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
     self.applied_offset,
     self.frontier_digest,
     delta_wal_offset=self.delta_wal_offset,
-    state_schema?=self.state_schema,
+    state_schema=self.state_schema,
     operator_state?=self.operator_state,
   )
 }
@@ -145,6 +135,10 @@ pub async fn Checkpoint::load(
     error => raise CheckpointError::Io(@debug.to_string(error))
   }
   let json = @json.parse(text) catch { _ => raise CheckpointError::Malformed }
+  guard json is Object(fields) else { raise CheckpointError::Malformed }
+  if fields.get("version") is Some(_) {
+    raise CheckpointError::Malformed
+  }
   let checkpoint : Checkpoint = @json.from_json(json) catch {
     _ => raise CheckpointError::Malformed
   }

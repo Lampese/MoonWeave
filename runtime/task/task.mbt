@@ -498,7 +498,7 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
     frontier_digest: self.frontier.digest(),
     emitted_outputs: self.emitted_outputs,
     events,
-    operator_capability: Some(self.operator.capability()),
+    operator_capability: self.operator.capability(),
   }
 }
 
@@ -510,10 +510,8 @@ pub fn Task::restore(
   self : Task,
   snapshot : TaskSnapshot,
 ) -> Unit raise TaskError {
-  match snapshot.operator_capability {
-    Some(capability) if capability != self.operator.capability() =>
-      raise TaskError::OperatorContractMismatch
-    _ => ()
+  if snapshot.operator_capability != self.operator.capability() {
+    raise TaskError::OperatorContractMismatch
   }
   if snapshot.task_id() != self.task_id ||
     snapshot.operator_id() != self.operator_id ||

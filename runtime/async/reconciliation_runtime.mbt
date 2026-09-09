@@ -455,10 +455,13 @@ async fn apply_reconciliation_partition(
 /// startup barrier: callers must run it before accepting new driver writes.
 /// A sidecar WAL records prepare/commit intent; a crash between the two store
 /// writes leaves a replayable plan instead of an ambiguous silent divergence.
+/// Use replay_only before resuming a higher-level recovery transaction; it
+/// finishes recorded intents without creating new cursor-repair intents.
 pub async fn reconcile_job_coordinator(
   coordinator : CoordinatorStore,
   job : JobStore,
   reconcile_path? : String,
+  replay_only? : Bool = false,
 ) -> ReconciliationSummary raise ReconciliationError {
   let path = reconciliation_sidecar_path(coordinator, job, reconcile_path)
   let log = ReconciliationLog::open(path)
@@ -481,6 +484,14 @@ pub async fn reconcile_job_coordinator(
     log, coordinator, job,
   )
   let mut repaired_partitions = recovered_partitions
+  if replay_only {
+    log.compact()
+    return {
+      repaired_transactions: 0,
+      recovered_transactions,
+      repaired_partitions,
+    }
+  }
   let plan = build_reconciliation_plan(coordinator, job)
   if plan.partitions.is_empty() {
     log.compact()

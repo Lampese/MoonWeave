@@ -35,9 +35,12 @@ async test "checkpoint saves atomically and loads validated progress" {
       fail("checkpoint should load")
     }
     assert_eq(loaded, checkpoint)
-    assert_eq(loaded.version(), 1)
+    guard @json.parse(@fs.read_file(path).text()) is Object(fields) else {
+      fail("checkpoint was not an object")
+    }
+    assert_eq(fields.get("version"), None)
     assert_eq(loaded.delta_wal_offset(), 64L)
-    assert_eq(loaded.state_schema(), Some("reachability-state:v1"))
+    assert_eq(loaded.state_schema(), "reachability-state:v1")
     assert_eq(
       loaded.operator_state(),
       Some(Json::object({ "pending": Json::number(1) })),
@@ -48,9 +51,17 @@ async test "checkpoint saves atomically and loads validated progress" {
 }
 
 ///|
-async test "checkpoint accepts legacy manifests without a state schema" {
+async test "checkpoint rejects manifests without a state schema" {
   with_checkpoint_path <| path => {
-    let current = Checkpoint::new(0, 2, 0L, -1L, -1L, "frontier-empty")
+    let current = Checkpoint::new(
+      0,
+      2,
+      0L,
+      -1L,
+      -1L,
+      "frontier-empty",
+      state_schema="moonweave:transport:v1",
+    )
     current.save(path)
     let json = @json.parse(@fs.read_file(path).text())
     guard json is Object(fields) else { fail("checkpoint was not an object") }
@@ -61,11 +72,43 @@ async test "checkpoint accepts legacy manifests without a state schema" {
       create_mode=@fs.CreateOrTruncate,
       sync=@fs.Full,
     )
-    guard Checkpoint::load(path) is Some(loaded) else {
-      fail("legacy checkpoint should load")
+    try Checkpoint::load(path) catch {
+      CheckpointError::Malformed => ()
+      _ => fail("expected missing schema to be rejected")
+    } noraise {
+      _ => fail("expected missing schema to be rejected")
     }
-    assert_eq(loaded.state_schema(), None)
-    assert_eq(loaded.operator_state(), None)
+  }
+}
+
+///|
+async test "checkpoint rejects removed version fields" {
+  with_checkpoint_path <| path => {
+    let checkpoint = Checkpoint::new(
+      0,
+      0,
+      0L,
+      -1L,
+      -1L,
+      "frontier-empty",
+      state_schema="moonweave:transport:v1",
+    )
+    checkpoint.save(path)
+    let json = @json.parse(@fs.read_file(path).text())
+    guard json is Object(fields) else { fail("checkpoint was not an object") }
+    fields["version"] = Json::number(1.0)
+    @fs.write_file(
+      path,
+      @utf8.encode(json.stringify()),
+      create_mode=@fs.CreateOrTruncate,
+      sync=@fs.Full,
+    )
+    try Checkpoint::load(path) catch {
+      CheckpointError::Malformed => ()
+      _ => fail("expected removed version field to be rejected")
+    } noraise {
+      _ => fail("expected removed version field to be rejected")
+    }
   }
 }
 
@@ -76,7 +119,17 @@ async test "missing checkpoint is not an error" {
 
 ///|
 async test "checkpoint rejects invalid progress ordering" {
-  try Checkpoint::new(0, 0, 10L, 4L, 5L, "frontier") catch {
+  try
+    Checkpoint::new(
+      0,
+      0,
+      10L,
+      4L,
+      5L,
+      "frontier",
+      state_schema="moonweave:transport:v1",
+    )
+  catch {
     CheckpointError::InvalidField => ()
     _ => fail("expected invalid checkpoint")
   } noraise {
@@ -97,14 +150,9 @@ async test "checkpoint rejects an empty state schema" {
 }
 
 ///|
-async test "checkpoint rejects malformed or unsupported version" {
+async test "checkpoint rejects an incomplete manifest" {
   with_checkpoint_path <| path => {
-    @fs.write_file(
-      path,
-      "{\"version\":2}",
-      create_mode=@fs.CreateOrTruncate,
-      sync=@fs.Full,
-    )
+    @fs.write_file(path, "{}", create_mode=@fs.CreateOrTruncate, sync=@fs.Full)
     try Checkpoint::load(path) catch {
       CheckpointError::Malformed => ()
       _ => fail("expected malformed checkpoint")

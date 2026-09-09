@@ -132,6 +132,7 @@ pub async fn run_coordinator(
   assignment : @protocol.AssignmentSpec,
   batches : Array[@protocol.EventBatch],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> CoordinatorRunSummary raise FrameIoError {
   defer connection.close()
   validate_batch_plan(assignment, batches[:])
@@ -143,6 +144,7 @@ pub async fn run_coordinator(
     session_id,
     assignment~,
     maximum_frame_bytes~,
+    auth_token?,
   )
   let mut next_batch = 0
   let mut sent_batches = 0

@@ -261,7 +261,7 @@ fn validate_checkpoint(
   wal_batches : ArrayView[@protocol.EventBatch],
   delta_records : ArrayView[DeltaWalRecord],
   restored_offset : Int64,
-  state_schema : String?,
+  state_schema : String,
 ) -> Unit raise FrameIoError {
   if checkpoint.partition() != assignment.partition() ||
     checkpoint.epoch() != assignment.epoch() {
@@ -269,12 +269,8 @@ fn validate_checkpoint(
       "checkpoint does not match the active assignment",
     )
   }
-  match (checkpoint.state_schema(), state_schema) {
-    (Some(saved), Some(expected)) if saved != expected =>
-      raise FrameIoError::Handler("checkpoint state schema mismatch")
-    (Some(saved), None) if saved.is_empty() =>
-      raise FrameIoError::Handler("checkpoint state schema is empty")
-    _ => ()
+  if checkpoint.state_schema() != state_schema {
+    raise FrameIoError::Handler("checkpoint state schema mismatch")
   }
   if checkpoint.wal_offset() > wal.write_offset() ||
     checkpoint.delta_wal_offset() > delta_wal_offset ||
@@ -334,7 +330,7 @@ async fn save_checkpoint(
   applied_offset : Int64,
   frontier_digest : String,
   delta_wal_offset : Int64,
-  state_schema : String?,
+  state_schema : String,
   operator_state? : Json,
 ) -> Unit raise FrameIoError {
   match checkpoint_path {
@@ -348,7 +344,7 @@ async fn save_checkpoint(
         applied_offset,
         frontier_digest,
         delta_wal_offset~,
-        state_schema?,
+        state_schema~,
         operator_state?,
       ) catch {
         error => raise FrameIoError::Checkpoint(error)
@@ -520,15 +516,43 @@ async fn run_worker_impl(
   state_snapshot? : () -> Json raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
-  state_schema? : String,
+  state_schema? : String = "moonweave:transport:v1",
   assignment_setup? : () -> Unit raise FrameIoError,
   drain_handler? : () -> Unit raise FrameIoError,
   output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
+  auth_token? : String,
+  storage_prepare? : async (@protocol.Assignment) -> (String, String?, String?) raise FrameIoError,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
   }
   defer connection.close()
+  let (session, outbound) = worker_handshake(
+    connection,
+    cluster_id,
+    coordinator_id,
+    worker_id,
+    incarnation,
+    capabilities,
+    maximum_frame_bytes~,
+    requested_partition?,
+    auth_token?,
+  )
+  guard session.state().assignment() is Some(assignment) else {
+    raise FrameIoError::MissingAssignment
+  }
+  match assignment_validator {
+    None => ()
+    Some(validator) => validator(assignment)
+  }
+  match assignment_setup {
+    None => ()
+    Some(setup) => setup()
+  }
+  let (wal_path, checkpoint_path, delta_wal_path) = match storage_prepare {
+    None => (wal_path, checkpoint_path, delta_wal_path)
+    Some(prepare) => prepare(assignment)
+  }
   let (wal, replay) = Wal::open(wal_path) catch {
     error => raise FrameIoError::Wal(error)
   }
@@ -556,27 +580,6 @@ async fn run_worker_impl(
       Checkpoint::load(path) catch {
         error => raise FrameIoError::Checkpoint(error)
       }
-  }
-  let (session, outbound) = worker_handshake(
-    connection,
-    cluster_id,
-    coordinator_id,
-    worker_id,
-    incarnation,
-    capabilities,
-    maximum_frame_bytes~,
-    requested_partition?,
-  )
-  guard session.state().assignment() is Some(assignment) else {
-    raise FrameIoError::MissingAssignment
-  }
-  match assignment_validator {
-    None => ()
-    Some(validator) => validator(assignment)
-  }
-  match assignment_setup {
-    None => ()
-    Some(setup) => setup()
   }
   let causal_log : @causal.CausalLog[Json] = @causal.CausalLog::new() catch {
     error => raise FrameIoError::Handler(@debug.to_string(error))
@@ -1092,6 +1095,7 @@ pub async fn run_worker(
   delta_handler? : (@protocol.DeltaBatch) -> Unit raise,
   delta_wal_path? : String,
   requested_partition? : Int,
+  auth_token? : String,
 ) -> WorkerRunSummary raise FrameIoError {
   run_worker_impl(
     connection,
@@ -1110,5 +1114,6 @@ pub async fn run_worker(
     delta_handler?,
     delta_wal_path?,
     requested_partition?,
+    auth_token?,
   )
 }

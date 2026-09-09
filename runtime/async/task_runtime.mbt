@@ -20,53 +20,20 @@ pub async fn run_worker_task(
   delta_wal_path? : String,
   output_log_path? : String,
   dynamic_assignment? : Bool = false,
+  auth_token? : String,
 ) -> WorkerRunSummary raise FrameIoError {
-  validate_migration_target(
-    wal_path,
-    cluster_id,
-    coordinator_id,
-    worker_id,
-    incarnation,
-    task.partition(),
-    task.task_id(),
-  ) catch {
-    error => {
-      task.fail()
-      raise FrameIoError::Migration(error)
-    }
-  }
-  let resolved = resolve_worker_storage_paths(
-    wal_path, checkpoint_path, delta_wal_path, output_log_path,
-  ) catch {
-    error => {
-      task.fail()
-      raise FrameIoError::Migration(error)
-    }
-  }
-  let wal_path = resolved.wal_path
-  let checkpoint_path = match checkpoint_path {
-    None => None
-    Some(_) => Some(resolved.checkpoint_path)
-  }
-  let delta_wal_path = resolved.delta_wal_path
-  let output_log_path = resolved.output_log_path
+  let canonical_wal_path = wal_path
   if !dynamic_assignment {
     task.start() catch {
       error => raise FrameIoError::Task(error)
     }
   }
-  let output_log = match output_log_path {
-    None => None
-    Some(path) =>
-      Some(
-        TaskOutputLog::open(path) catch {
-          error => {
-            task.fail()
-            raise FrameIoError::OutputLog(error)
-          }
-        },
-      )
-  }
+  let mut storage_owner : @fs.File? = None
+  defer (match storage_owner {
+    None => ()
+    Some(owner) => owner.close()
+  })
+  let mut output_log : TaskOutputLog? = None
   defer (match output_log {
     None => ()
     Some(log) => log.close()
@@ -210,6 +177,64 @@ pub async fn run_worker_task(
       state_snapshot~,
       output_barrier~,
       requested_partition=task.partition(),
+      auth_token?,
+      storage_prepare=assignment => {
+        storage_owner = Some(
+          migration_lock(canonical_wal_path + ".migration") catch {
+            error => raise FrameIoError::Migration(error)
+          },
+        )
+        let installed = load_worker_installation(canonical_wal_path) catch {
+          error => raise FrameIoError::Migration(error)
+        }
+        match installed {
+          None => ()
+          Some(installed) => {
+            let identity = installed.identity
+            if identity.cluster_id != cluster_id ||
+              identity.coordinator_id != coordinator_id ||
+              identity.target_worker_id != worker_id ||
+              identity.target_incarnation != incarnation ||
+              identity.partition != assignment.partition() ||
+              identity.target_epoch != assignment.epoch() ||
+              identity.start_offset != assignment.next_offset() ||
+              installed.task_id != task.task_id() {
+              raise FrameIoError::Migration(
+                WorkerMigrationError::InvalidIdentity,
+              )
+            }
+          }
+        }
+        let resolved = resolve_worker_storage_paths(
+          canonical_wal_path, checkpoint_path, delta_wal_path, output_log_path,
+        ) catch {
+          error => {
+            task.fail()
+            raise FrameIoError::Migration(error)
+          }
+        }
+        match resolved.output_log_path {
+          None => ()
+          Some(path) =>
+            output_log = Some(
+              TaskOutputLog::open(path) catch {
+                error => {
+                  task.fail()
+                  raise FrameIoError::OutputLog(error)
+                }
+              },
+            )
+        }
+        (
+          resolved.wal_path,
+          if checkpoint_path is Some(_) {
+            Some(resolved.checkpoint_path)
+          } else {
+            None
+          },
+          resolved.delta_wal_path,
+        )
+      },
       state_schema=task.operator().state_schema(),
       drain_handler=() => {
         task.drain() catch {
@@ -219,7 +244,7 @@ pub async fn run_worker_task(
           error => raise FrameIoError::Task(error)
         }
       },
-      output_summary?=match output_log {
+      output_summary?=match output_log_path {
         None => None
         Some(_) => Some(output_summary)
       },

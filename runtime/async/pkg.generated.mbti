@@ -19,9 +19,9 @@ import {
 // Values
 pub async fn commit_worker_migration(CoordinatorStore, JobStore, WorkerMigration, reconcile_path? : String) -> Unit raise WorkerMigrationError
 
-pub async fn coordinator_handshake(@socket.Tcp, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
+pub async fn coordinator_handshake(@socket.Tcp, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int, auth_token? : String) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
 
-pub async fn coordinator_handshake_after_hello(@socket.Tcp, @protocol.Frame, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
+pub async fn coordinator_handshake_after_hello(@socket.Tcp, @protocol.Frame, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int, auth_token? : String) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn coordinator_send_batch(@socket.Tcp, @protocol.CoordinatorSession, @protocol.FrameBuilder, @protocol.EventBatch, Int64, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
@@ -37,7 +37,7 @@ pub async fn[R : @io.Reader] read_frame(R, maximum_frame_bytes? : Int) -> @proto
 
 pub async fn[R : @io.Reader] read_optional_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame?
 
-pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String) -> ReconciliationSummary raise ReconciliationError
+pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String, replay_only? : Bool) -> ReconciliationSummary raise ReconciliationError
 
 pub async fn recover_worker_leases(CoordinatorStore, JobStore, String, @protocol.Incarnation, String, reconcile_path? : String) -> Array[@control.PartitionAssignment] raise ReconciliationError
 
@@ -45,41 +45,41 @@ pub async fn resolve_worker_storage_paths(String, String?, String?, String?) -> 
 
 pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoError, RetryPolicy) -> Y raise FrameIoError
 
-pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @protocol.AssignmentSpec, Array[@protocol.EventBatch], maximum_frame_bytes? : Int) -> CoordinatorRunSummary raise FrameIoError
+pub async fn run_coordinator(@socket.Tcp, String, String, String, String, @protocol.AssignmentSpec, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, auth_token? : String) -> CoordinatorRunSummary raise FrameIoError
 
-pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconcile_path? : String) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_durable_job_supervisor(@socket.TcpServer, CoordinatorStore, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconcile_path? : String, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
 pub async fn run_durable_liveness_scan(CoordinatorStore, Int64, LivenessPolicy, job_store? : JobStore) -> Array[String] raise FrameIoError
 
-pub async fn run_durable_managed_coordinator(@socket.Tcp, CoordinatorStore, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe) -> CoordinatorRunSummary raise FrameIoError
+pub async fn run_durable_managed_coordinator(@socket.Tcp, CoordinatorStore, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe, auth_token? : String) -> CoordinatorRunSummary raise FrameIoError
 
-pub async fn run_durable_supervisor(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_durable_supervisor(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], maximum_frame_bytes? : Int, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_durable_supervisor_with_retry(@socket.TcpServer, CoordinatorStore, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_job_supervisor(@socket.TcpServer, @control.CoordinatorState, JobStore, Array[SupervisorWork], maximum_frame_bytes? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconnect_attempts? : Int, reconnect_backoff_ms? : Int, reconnect_timeout_ms? : Int) -> LiveSupervisorSummary raise FrameIoError
+pub async fn run_live_source_supervisor(@socket.TcpServer, SourceBackedJob, maximum_frame_bytes? : Int, poll_interval_ms? : Int, drain_timeout_ms? : Int, output_manifest? : JobOutputManifest, reconnect_attempts? : Int, reconnect_backoff_ms? : Int, reconnect_timeout_ms? : Int, auth_token? : String) -> LiveSupervisorSummary raise FrameIoError
 
 pub async fn run_liveness_scan(@control.CoordinatorState, CoordinatorStore?, Int64, LivenessPolicy, job_store? : JobStore) -> Array[String] raise FrameIoError
 
 pub async fn run_liveness_watchdog(@control.CoordinatorState, CoordinatorStore?, LivenessPolicy, job_store? : JobStore) -> Unit raise FrameIoError
 
-pub async fn run_managed_coordinator(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe) -> CoordinatorRunSummary raise FrameIoError
+pub async fn run_managed_coordinator(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.EventBatch], maximum_frame_bytes? : Int, probe? : @protocol.Probe, auth_token? : String) -> CoordinatorRunSummary raise FrameIoError
 
-pub async fn run_managed_durable_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, DurableExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
+pub async fn run_managed_durable_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, DurableExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int, auth_token? : String) -> ExchangeRunSummary raise FrameIoError
 
-pub async fn run_managed_exchange(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.DeltaBatch], maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
+pub async fn run_managed_exchange(@socket.Tcp, @control.CoordinatorState, String, String, Int, Array[@protocol.DeltaBatch], maximum_frame_bytes? : Int, auth_token? : String) -> ExchangeRunSummary raise FrameIoError
 
-pub async fn run_managed_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, ExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int) -> ExchangeRunSummary raise FrameIoError
+pub async fn run_managed_exchange_outbox(@socket.Tcp, @control.CoordinatorState, String, String, Int, ExchangeOutbox, poll_interval_ms? : Int, maximum_frame_bytes? : Int, auth_token? : String) -> ExchangeRunSummary raise FrameIoError
 
-pub async fn run_supervisor(@socket.TcpServer, @control.CoordinatorState, Array[SupervisorWork], maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_supervisor(@socket.TcpServer, @control.CoordinatorState, Array[SupervisorWork], maximum_frame_bytes? : Int, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorState, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int) -> SupervisorRunSummary raise FrameIoError
+pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorState, Array[SupervisorWork], RetryPolicy, maximum_frame_bytes? : Int, auth_token? : String) -> SupervisorRunSummary raise FrameIoError
 
-pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int, auth_token? : String) -> WorkerRunSummary raise FrameIoError
 
-pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, auth_token? : String) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
 
@@ -89,7 +89,7 @@ pub fn task_snapshot_digest(@task.TaskSnapshot) -> String
 
 pub async fn validate_migration_target(String, String, String, String, String, Int, String) -> Unit raise WorkerMigrationError
 
-pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
+pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int, auth_token? : String) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn[W : @io.Writer] write_frame(W, @protocol.Frame, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
@@ -339,7 +339,6 @@ pub(all) suberror WorkerMigrationError {
 
 // Types and methods
 pub(all) struct Checkpoint {
-  version : Int
   partition : Int
   epoch : Int
   wal_offset : Int64
@@ -347,7 +346,7 @@ pub(all) struct Checkpoint {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
-  state_schema : String?
+  state_schema : String
   operator_state : Json?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Checkpoint::applied_offset(Self) -> Int64
@@ -355,13 +354,12 @@ pub fn Checkpoint::delta_wal_offset(Self) -> Int64
 pub fn Checkpoint::epoch(Self) -> Int
 pub fn Checkpoint::frontier_digest(Self) -> String
 pub async fn Checkpoint::load(String) -> Self? raise CheckpointError
-pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, state_schema? : String, operator_state? : Json) -> Self raise CheckpointError
+pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, state_schema~ : String, operator_state? : Json) -> Self raise CheckpointError
 pub fn Checkpoint::operator_state(Self) -> Json?
 pub fn Checkpoint::partition(Self) -> Int
 pub fn Checkpoint::persisted_offset(Self) -> Int64
 pub async fn Checkpoint::save(Self, String) -> Unit raise CheckpointError
-pub fn Checkpoint::state_schema(Self) -> String?
-pub fn Checkpoint::version(Self) -> Int
+pub fn Checkpoint::state_schema(Self) -> String
 pub fn Checkpoint::wal_offset(Self) -> Int64
 
 type CoordinatorJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
@@ -1102,8 +1100,9 @@ pub struct WorkerTaskWork {
   initial_credit_events : Int64
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
+  auth_token : String?
 }
-pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int) -> Self
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, auth_token? : String) -> Self
 pub fn WorkerTaskWork::partition(Self) -> Int
 pub fn WorkerTaskWork::task(Self) -> @task.Task
 pub fn WorkerTaskWork::task_id(Self) -> String

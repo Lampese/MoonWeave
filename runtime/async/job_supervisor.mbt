@@ -335,6 +335,7 @@ pub async fn run_job_supervisor(
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   drain_timeout_ms? : Int = 5000,
   output_manifest? : JobOutputManifest,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   run_job_supervisor_impl(
     server,
@@ -345,6 +346,7 @@ pub async fn run_job_supervisor(
     drain_timeout_ms,
     None,
     output_manifest,
+    auth_token,
   )
 }
 
@@ -362,6 +364,7 @@ pub async fn run_durable_job_supervisor(
   drain_timeout_ms? : Int = 5000,
   output_manifest? : JobOutputManifest,
   reconcile_path? : String,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   if coordinator_store.journal_path() == job_store.journal_path() ||
     coordinator_store.checkpoint_path() == job_store.checkpoint_path() {
@@ -378,6 +381,7 @@ pub async fn run_durable_job_supervisor(
     drain_timeout_ms,
     Some((coordinator_store, reconcile_path)),
     output_manifest,
+    auth_token,
   )
 }
 
@@ -391,6 +395,7 @@ async fn run_job_supervisor_impl(
   drain_timeout_ms : Int,
   coordinator : (CoordinatorStore, String?)?,
   output_manifest : JobOutputManifest?,
+  auth_token : String?,
 ) -> SupervisorRunSummary raise FrameIoError {
   if !job_store.supervisor_lock.try_acquire() {
     raise FrameIoError::JobStore(JobStoreError::AlreadyRunning)
@@ -520,6 +525,7 @@ async fn run_job_supervisor_impl(
     job_store~,
     output_manifest?,
     drain_timeout_ms~,
+    auth_token?,
   )
   match coordinator {
     None => ()

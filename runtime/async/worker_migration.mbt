@@ -302,7 +302,7 @@ fn WorkerMigration::validate(
   let snapshot = self.snapshot
   if snapshot.partition() != identity.partition ||
     snapshot.epoch() != identity.source_epoch ||
-    snapshot.operator_capability() != Some(snapshot.operator().capability()) ||
+    snapshot.operator_capability() != snapshot.operator().capability() ||
     self.primary_records < 0 ||
     self.primary_records > self.batches.length() ||
     self.delta_records < 0 ||
@@ -497,7 +497,7 @@ pub async fn WorkerMigration::capture(
   }
   if saved.partition() != identity.partition ||
     saved.epoch() != identity.source_epoch ||
-    saved.state_schema() != Some(snapshot.state_schema()) ||
+    saved.state_schema() != snapshot.state_schema() ||
     saved.persisted_offset() != snapshot.offset() ||
     saved.applied_offset() != snapshot.offset() ||
     saved.frontier_digest() != snapshot.frontier_digest() {

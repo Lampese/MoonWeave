@@ -195,7 +195,7 @@ async test "job store adopts a staged generation after checkpoint commit" {
 }
 
 ///|
-async test "job store accepts a legacy checkpoint without a generation" {
+async test "job store requires a checkpoint journal generation" {
   with_job_store_paths <| ((journal_path, checkpoint_path) => {
     let store = JobStore::open(
       durable_job_spec(),
@@ -209,7 +209,7 @@ async test "job store accepts a legacy checkpoint without a generation" {
     store.close()
     let json = @json.parse(@fs.read_file(checkpoint_path).text())
     guard json is Object(fields) else { fail("checkpoint was not an object") }
-    fields["version"] = Json::number(1.0)
+    assert_eq(fields.get("version"), None)
     fields.remove("journal_generation")
     @fs.write_file(
       checkpoint_path,
@@ -217,14 +217,44 @@ async test "job store accepts a legacy checkpoint without a generation" {
       create_mode=@fs.CreateOrTruncate,
       sync=@fs.Full,
     )
-    let restored = JobStore::open(
+    try
+      JobStore::open(durable_job_spec(), journal_path, checkpoint_path~)
+    catch {
+      JobStoreError::Malformed => ()
+      _ => fail("expected missing generation to be rejected")
+    } noraise {
+      _ => fail("expected missing generation to be rejected")
+    }
+  })
+}
+
+///|
+async test "job store rejects removed checkpoint versions" {
+  with_job_store_paths <| ((journal_path, checkpoint_path) => {
+    let store = JobStore::open(
       durable_job_spec(),
       journal_path,
       checkpoint_path~,
     )
-    defer restored.close()
-    assert_eq(restored.journal_generation(), 0L)
-    assert_eq(restored.phase(), @control.JobPhase::Running)
+    store.checkpoint()
+    store.close()
+    let json = @json.parse(@fs.read_file(checkpoint_path).text())
+    guard json is Object(fields) else { fail("checkpoint was not an object") }
+    fields["version"] = Json::number(2.0)
+    @fs.write_file(
+      checkpoint_path,
+      @utf8.encode(json.stringify()),
+      create_mode=@fs.CreateOrTruncate,
+      sync=@fs.Full,
+    )
+    try
+      JobStore::open(durable_job_spec(), journal_path, checkpoint_path~)
+    catch {
+      JobStoreError::Malformed => ()
+      _ => fail("expected removed checkpoint version to be rejected")
+    } noraise {
+      _ => fail("expected removed checkpoint version to be rejected")
+    }
   })
 }
 

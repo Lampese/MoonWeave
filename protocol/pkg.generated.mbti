@@ -46,6 +46,7 @@ pub(all) suberror SessionError {
   SessionMismatch
   SenderMismatch
   IncarnationMismatch
+  AuthenticationFailed
   MessageRegression(expected_at_least~ : Int64, actual~ : Int64)
   MessageGap(expected~ : Int64, actual~ : Int64)
   MessageIdConflict(String)
@@ -115,7 +116,7 @@ pub struct CoordinatorSession {
   mut drain_ack : DrainAck?
 }
 pub fn CoordinatorSession::accept_frame(Self, Frame) -> Unit raise SessionError
-pub fn CoordinatorSession::accept_hello(Self, Frame) -> Hello raise SessionError
+pub fn CoordinatorSession::accept_hello(Self, Frame, auth_token? : String) -> Hello raise SessionError
 pub fn CoordinatorSession::activate(Self, String, assignment? : AssignmentSpec) -> Welcome raise SessionError
 pub fn CoordinatorSession::begin_drain(Self, String, DrainRequest) -> Unit raise SessionError
 pub fn CoordinatorSession::credit_bytes(Self) -> Int64
@@ -416,12 +417,14 @@ pub(all) struct Hello {
   capabilities : Array[String]
   last_session_id : String?
   requested_partition : Int?
+  auth_token : String?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Hello::auth_token(Self) -> String?
 pub fn Hello::capabilities(Self) -> ArrayView[String]
 pub fn Hello::from_payload(String) -> Self raise MessageError
 pub fn Hello::incarnation(Self) -> String
 pub fn Hello::last_session_id(Self) -> String?
-pub fn Hello::new(String, String, Array[String], last_session_id? : String, requested_partition? : Int) -> Self raise ProtocolError
+pub fn Hello::new(String, String, Array[String], last_session_id? : String, requested_partition? : Int, auth_token? : String) -> Self raise ProtocolError
 pub fn Hello::requested_partition(Self) -> Int?
 pub fn Hello::to_payload(Self) -> String
 pub fn Hello::worker_id(Self) -> String

@@ -72,23 +72,48 @@ async fn CoordinatorListener::open_source_backed_execution(
     }
     ignore(
       coordinator.register_worker(worker.worker_id(), incarnation, capabilities) catch {
+        @runtime.CoordinatorStoreError::Coordinator(
+          @control.CoordinatorError::StaleIncarnation
+        ) => {
+          let fenced = coordinator
+            .snapshot()
+            .workers()
+            .any(value => {
+              value.worker_id() == worker.worker_id() &&
+              value.lifecycle() == @control.WorkerLifecycle::Fenced
+            })
+          if fenced {
+            @control.RegisterStatus::Duplicate
+          } else {
+            raise live_execution_error(
+              "register Worker",
+              @control.CoordinatorError::StaleIncarnation,
+            )
+          }
+        }
         error => raise live_execution_error("register Worker", error)
       },
     )
   }
+  ignore(restore_node_assignments(coordinator, job_store, job, self.config))
   for partition in 0..<job.spec.partition_count() {
     let worker_id = job.spec.owner(partition) catch {
       error => raise ApiError::Plan(error)
     }
-    let assignment = coordinator.assign(partition, worker_id) catch {
-      error => raise live_execution_error("assign partition", error)
+    let assignment = match
+      snapshot_assignment(coordinator.snapshot(), partition) {
+      Some(existing) => existing
+      None =>
+        coordinator.assign(partition, worker_id) catch {
+          error => raise live_execution_error("assign partition", error)
+        }
     }
     let saved = job_store.snapshot().partitions()[partition]
     if saved.phase() == @control.JobPartitionPhase::Unassigned {
       ignore(
         job_store.assign(
           partition,
-          worker_id,
+          assignment.worker_id(),
           assignment.epoch(),
           assignment.start_offset(),
         ),
@@ -126,7 +151,7 @@ async fn CoordinatorListener::open_source_backed_execution(
     @runtime.reconcile_job_coordinator(
       coordinator,
       job_store,
-      reconcile_path=self.config.storage_dir + "/live-reconcile.wal",
+      reconcile_path=node_reconciliation_path(self.config),
     ),
   ) catch {
     error => raise live_execution_error("reconcile live execution", error)
@@ -274,22 +299,6 @@ fn live_replacement_worker(
 }
 
 ///|
-fn live_worker_incarnation(
-  config : CoordinatorNodeConfig,
-  worker_id : String,
-) -> @protocol.Incarnation raise ApiError {
-  for slot in config.workers {
-    if slot.worker_id() == worker_id {
-      return @protocol.Incarnation::new(slot.incarnation()) catch {
-        error =>
-          raise live_execution_error("parse live Worker incarnation", error)
-      }
-    }
-  }
-  raise ApiError::InvalidWorkerAssignment(worker_id)
-}
-
-///|
 async fn SourceBackedExecution::recover_live_failures(
   self : SourceBackedExecution,
   summary : @runtime.LiveSupervisorSummary,
@@ -317,9 +326,8 @@ async fn SourceBackedExecution::recover_live_failures(
     return false
   }
   let failed_worker = failed_workers[0]
-  let replacement = match
-    live_replacement_worker(self.listener.config, failed_worker) {
-    Some(value) => value
+  match live_replacement_worker(self.listener.config, failed_worker) {
+    Some(_) => ()
     None => return false
   }
   let owned = self.coordinator
@@ -348,14 +356,23 @@ async fn SourceBackedExecution::recover_live_failures(
       return false
     }
   }
+  let assignments : Map[Int, @control.PartitionAssignment] = Map([])
+  for item in self.coordinator.snapshot().assignments() {
+    let assignment = @control.PartitionAssignment::from_snapshot(item) catch {
+      error =>
+        raise live_execution_error("decode live Worker assignment", error)
+    }
+    assignments[assignment.partition()] = assignment
+  }
   ignore(
-    @runtime.recover_worker_leases(
+    recover_node_worker(
       self.coordinator,
       self.job_store,
+      self.job,
+      self.listener.config,
+      assignments,
       failed_worker,
-      live_worker_incarnation(self.listener.config, failed_worker),
-      replacement,
-      reconcile_path=self.listener.config.storage_dir + "/live-reconcile.wal",
+      failed[:],
     ) catch {
       error => raise live_execution_error("recover live Worker leases", error)
     },
@@ -386,6 +403,7 @@ async fn SourceBackedExecution::run(
     self.listener.server,
     self.source,
     output_manifest?=self.output_manifest,
+    auth_token?=self.listener.config.auth_token,
   ) catch {
     error => {
       if !@async_runtime.is_being_cancelled() &&
@@ -412,6 +430,7 @@ async fn SourceBackedExecution::run(
         self.listener.server,
         self.source,
         output_manifest?=self.output_manifest,
+        auth_token?=self.listener.config.auth_token,
       ) catch {
         error =>
           raise live_execution_error("resume live source supervisor", error)
@@ -438,7 +457,7 @@ async fn SourceBackedExecution::run(
       @runtime.reconcile_job_coordinator(
         self.coordinator,
         self.job_store,
-        reconcile_path=self.listener.config.storage_dir + "/live-reconcile.wal",
+        reconcile_path=node_reconciliation_path(self.listener.config),
       ),
     ) catch {
       error => raise live_execution_error("reconcile completed live Job", error)

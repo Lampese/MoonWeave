@@ -35,10 +35,9 @@ struct CoordinatorJournalEntry {
 
 ///|
 struct CoordinatorStoreCheckpoint {
-  version : Int
   journal_offset : Int64
   snapshot : @control.CoordinatorSnapshot
-  journal_generation : Int64?
+  journal_generation : Int64
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -279,28 +278,22 @@ async fn load_store_checkpoint(
   let json = @json.parse(text) catch {
     _ => raise CoordinatorStoreError::Malformed
   }
+  guard json is Object(fields) else { raise CoordinatorStoreError::Malformed }
+  if fields.get("version") is Some(_) {
+    raise CoordinatorStoreError::Malformed
+  }
   let checkpoint : CoordinatorStoreCheckpoint = @json.from_json(json) catch {
     _ => raise CoordinatorStoreError::Malformed
-  }
-  if checkpoint.version != 1 && checkpoint.version != 2 {
-    raise CoordinatorStoreError::UnsupportedVersion(checkpoint.version)
   }
   if checkpoint.journal_offset < 0L {
     raise CoordinatorStoreError::InvalidJournalOffset(checkpoint.journal_offset)
   }
-  match checkpoint.journal_generation {
-    Some(value) if value < 0L =>
-      raise CoordinatorStoreError::InvalidJournalGeneration(value)
-    _ => ()
+  if checkpoint.journal_generation < 0L {
+    raise CoordinatorStoreError::InvalidJournalGeneration(
+      checkpoint.journal_generation,
+    )
   }
   Some(checkpoint)
-}
-
-///|
-fn coordinator_checkpoint_generation(
-  checkpoint : CoordinatorStoreCheckpoint,
-) -> Int64 {
-  checkpoint.journal_generation.unwrap_or(0L)
 }
 
 ///|
@@ -437,7 +430,7 @@ pub async fn CoordinatorStore::open(
   }
   let checkpoint = load_store_checkpoint(checkpoint_path)
   let expected_generation = match checkpoint {
-    Some(value) => coordinator_checkpoint_generation(value)
+    Some(value) => value.journal_generation
     None => 0L
   }
   let (journal, initial_replay) = Wal::open(journal_path) catch {
@@ -617,10 +610,9 @@ pub async fn CoordinatorStore::checkpoint(
   }
   defer self.write_lock.release()
   let checkpoint = CoordinatorStoreCheckpoint::{
-    version: 2,
     journal_offset: self.journal_offset,
     snapshot: self.state.snapshot(),
-    journal_generation: Some(self.journal_generation),
+    journal_generation: self.journal_generation,
   }
   let encoded = @utf8.encode(@json.to_json(checkpoint).stringify())
   let temporary = self.checkpoint_path + ".tmp"
@@ -670,10 +662,9 @@ pub async fn CoordinatorStore::checkpoint_and_compact(
   let candidate_offset = candidate.write_offset()
   candidate.close()
   let checkpoint = CoordinatorStoreCheckpoint::{
-    version: 2,
     journal_offset: candidate_offset,
     snapshot: self.state.snapshot(),
-    journal_generation: Some(generation),
+    journal_generation: generation,
   }
   let temporary = self.checkpoint_path + ".tmp"
   @fs.write_file(

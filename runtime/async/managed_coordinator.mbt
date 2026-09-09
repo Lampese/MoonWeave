@@ -235,6 +235,7 @@ pub async fn run_managed_coordinator(
   batches : Array[@protocol.EventBatch],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   probe? : @protocol.Probe,
+  auth_token? : String,
 ) -> CoordinatorRunSummary raise FrameIoError {
   run_managed_coordinator_impl(
     connection,
@@ -246,6 +247,7 @@ pub async fn run_managed_coordinator(
     maximum_frame_bytes,
     probe,
     None,
+    auth_token,
   )
 }
 
@@ -261,6 +263,7 @@ pub async fn run_durable_managed_coordinator(
   batches : Array[@protocol.EventBatch],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   probe? : @protocol.Probe,
+  auth_token? : String,
 ) -> CoordinatorRunSummary raise FrameIoError {
   let summary = run_managed_coordinator_impl(
     connection,
@@ -272,6 +275,7 @@ pub async fn run_durable_managed_coordinator(
     maximum_frame_bytes,
     probe,
     Some(store),
+    auth_token,
   )
   store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
@@ -290,6 +294,7 @@ async fn run_managed_coordinator_impl(
   maximum_frame_bytes : Int,
   probe : @protocol.Probe?,
   store : CoordinatorStore?,
+  auth_token : String?,
 ) -> CoordinatorRunSummary raise FrameIoError {
   defer connection.close()
   let worker = match control.worker(worker_id) {
@@ -334,6 +339,7 @@ async fn run_managed_coordinator_impl(
     session_id,
     assignment=spec,
     maximum_frame_bytes~,
+    auth_token?,
   )
   session.restore_send_cursor(
     assignment.partition(),

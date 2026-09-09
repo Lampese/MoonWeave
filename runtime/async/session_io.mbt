@@ -11,6 +11,7 @@ pub async fn coordinator_handshake(
   session_id : String,
   assignment? : @protocol.AssignmentSpec,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError {
   let session = @protocol.CoordinatorSession::new(
     cluster_id, coordinator_id, worker_id,
@@ -18,7 +19,7 @@ pub async fn coordinator_handshake(
     error => raise FrameIoError::Session(error)
   }
   let hello_frame = read_frame(connection, maximum_frame_bytes~)
-  let hello = session.accept_hello(hello_frame) catch {
+  let hello = session.accept_hello(hello_frame, auth_token?) catch {
     error => raise FrameIoError::Session(error)
   }
   let welcome = session.activate(session_id, assignment?) catch {
@@ -57,13 +58,14 @@ pub async fn coordinator_handshake_after_hello(
   session_id : String,
   assignment? : @protocol.AssignmentSpec,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError {
   let session = @protocol.CoordinatorSession::new(
     cluster_id, coordinator_id, worker_id,
   ) catch {
     error => raise FrameIoError::Session(error)
   }
-  let hello = session.accept_hello(hello_frame) catch {
+  let hello = session.accept_hello(hello_frame, auth_token?) catch {
     error => raise FrameIoError::Session(error)
   }
   let welcome = session.activate(session_id, assignment?) catch {
@@ -100,6 +102,7 @@ pub async fn worker_handshake(
   capabilities : Array[String],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   requested_partition? : Int,
+  auth_token? : String,
 ) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError {
   let session = @protocol.WorkerSession::new(
     cluster_id,
@@ -117,6 +120,7 @@ pub async fn worker_handshake(
     incarnation,
     capabilities,
     requested_partition?,
+    auth_token?,
   ) catch {
     error => raise FrameIoError::Protocol(error)
   }

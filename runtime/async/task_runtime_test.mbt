@@ -131,7 +131,7 @@ async test "worker task rejects a checkpoint state schema before restoring state
       -1L,
       -1L,
       snapshot.frontier_digest(),
-      state_schema="reachability-state:v2",
+      state_schema="unexpected-state-schema",
       operator_state=@json.to_json(snapshot),
     )
     checkpoint.save(checkpoint_path)

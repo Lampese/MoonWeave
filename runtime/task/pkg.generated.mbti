@@ -204,7 +204,7 @@ pub(all) struct TaskSnapshot {
   frontier_digest : String
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
-  operator_capability : String?
+  operator_capability : String
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn TaskSnapshot::emitted_outputs(Self) -> Int
 pub fn TaskSnapshot::epoch(Self) -> Int
@@ -212,7 +212,7 @@ pub fn TaskSnapshot::events(Self) -> ArrayView[@protocol.EventRecord]
 pub fn TaskSnapshot::frontier_digest(Self) -> String
 pub fn TaskSnapshot::offset(Self) -> Int64
 pub fn TaskSnapshot::operator(Self) -> OperatorKind
-pub fn TaskSnapshot::operator_capability(Self) -> String?
+pub fn TaskSnapshot::operator_capability(Self) -> String
 pub fn TaskSnapshot::operator_id(Self) -> String
 pub fn TaskSnapshot::partition(Self) -> Int
 pub fn TaskSnapshot::rebind(Self, String, Int) -> Self raise TaskError

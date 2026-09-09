@@ -35,11 +35,10 @@ struct JobJournalEntry {
 
 ///|
 struct JobStoreCheckpoint {
-  version : Int
   journal_offset : Int64
   snapshot : @control.JobSnapshot
   work_plans : Array[JobExecutionPlan]
-  journal_generation : Int64?
+  journal_generation : Int64
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -259,26 +258,20 @@ async fn load_job_checkpoint(
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
   let json = @json.parse(text) catch { _ => raise JobStoreError::Malformed }
+  guard json is Object(fields) else { raise JobStoreError::Malformed }
+  if fields.get("version") is Some(_) {
+    raise JobStoreError::Malformed
+  }
   let checkpoint : JobStoreCheckpoint = @json.from_json(json) catch {
     _ => raise JobStoreError::Malformed
-  }
-  if checkpoint.version != 1 && checkpoint.version != 2 {
-    raise JobStoreError::UnsupportedVersion(checkpoint.version)
   }
   if checkpoint.journal_offset < 0L {
     raise JobStoreError::InvalidJournalOffset(checkpoint.journal_offset)
   }
-  match checkpoint.journal_generation {
-    Some(value) if value < 0L =>
-      raise JobStoreError::InvalidJournalGeneration(value)
-    _ => ()
+  if checkpoint.journal_generation < 0L {
+    raise JobStoreError::InvalidJournalGeneration(checkpoint.journal_generation)
   }
   Some(checkpoint)
-}
-
-///|
-fn job_checkpoint_generation(checkpoint : JobStoreCheckpoint) -> Int64 {
-  checkpoint.journal_generation.unwrap_or(0L)
 }
 
 ///|
@@ -417,7 +410,7 @@ pub async fn JobStore::open(
   }
   let checkpoint = load_job_checkpoint(checkpoint_path)
   let expected_generation = match checkpoint {
-    Some(value) => job_checkpoint_generation(value)
+    Some(value) => value.journal_generation
     None => 0L
   }
   let (journal, initial_replay) = Wal::open(journal_path) catch {
@@ -605,11 +598,10 @@ pub async fn JobStore::checkpoint(self : JobStore) -> Unit raise JobStoreError {
   let work_plans = self.work_plans.values().to_array()
   work_plans.sort_by((left, right) => left.partition.compare(right.partition))
   let checkpoint = JobStoreCheckpoint::{
-    version: 2,
     journal_offset: self.journal_offset,
     snapshot: self.state.snapshot(),
     work_plans,
-    journal_generation: Some(self.journal_generation),
+    journal_generation: self.journal_generation,
   }
   let temporary = self.checkpoint_path + ".tmp"
   @fs.write_file(
@@ -659,11 +651,10 @@ pub async fn JobStore::checkpoint_and_compact(
   let work_plans = self.work_plans.values().to_array()
   work_plans.sort_by((left, right) => left.partition.compare(right.partition))
   let checkpoint = JobStoreCheckpoint::{
-    version: 2,
     journal_offset: candidate_offset,
     snapshot: self.state.snapshot(),
     work_plans,
-    journal_generation: Some(generation),
+    journal_generation: generation,
   }
   let temporary = self.checkpoint_path + ".tmp"
   @fs.write_file(

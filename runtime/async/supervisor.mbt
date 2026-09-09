@@ -651,7 +651,7 @@ priv struct SupervisedAttemptResult {
 }
 
 ///|
-/// Identity learned from the Hello frame. It lets the outer task collector
+/// Identity learned from an admitted Hello. It lets the outer task collector
 /// report an accept/read failure without inventing a Worker or partition.
 priv struct SupervisedAttemptIdentity {
   mut worker_id : String
@@ -704,6 +704,7 @@ async fn supervise_one_connection(
   output_manifest : JobOutputManifest?,
   drain_timeout_ms : Int,
   identity : SupervisedAttemptIdentity,
+  auth_token : String?,
 ) -> SupervisedAttemptResult raise FrameIoError {
   let mut attempt = 1
   for ;; {
@@ -714,22 +715,27 @@ async fn supervise_one_connection(
     let outcome : Result[CoordinatorRunSummary, FrameIoError] = try {
       let (connection, _) = accept_supervisor_connection(server, accept_lock)
       defer connection.close()
-      let hello_frame = read_frame(connection, maximum_frame_bytes~)
-      let hello = @protocol.Hello::from_payload(hello_frame.payload()) catch {
-        error => raise FrameIoError::Message(error)
+      guard read_supervisor_hello(
+          connection, control, maximum_frame_bytes, 5000, auth_token,
+        )
+        is Some((hello_frame, hello)) else {
+        continue
       }
-      claimed_worker_id = hello.worker_id()
-      identity.worker_id = claimed_worker_id
       let work = match
         supervisor_work(works, hello.worker_id(), hello.requested_partition()) {
         Some(value) => value
-        None =>
-          raise FrameIoError::Coordinator(
-            @control.CoordinatorError::UnknownWorker(hello.worker_id()),
-          )
+        None => continue
       }
-      claimed_partition = Some(work.partition())
-      identity.partition = claimed_partition
+      let (worker, assignment, spec) = validate_supervisor_work(control, work)
+      if hello.incarnation() != worker.incarnation().value() {
+        continue
+      }
+      match work.required_capability() {
+        Some(capability) if !hello
+          .capabilities()
+          .any(value => value == capability) => continue
+        _ => ()
+      }
       let claim_key = hello.worker_id() + "#" + work.partition().to_string()
       claim_lock.acquire() catch {
         error => raise FrameIoError::Io(@debug.to_string(error))
@@ -737,41 +743,13 @@ async fn supervise_one_connection(
       let unique = claimed.add_and_check(claim_key)
       claim_lock.release()
       if !unique {
-        raise FrameIoError::Coordinator(
-          @control.CoordinatorError::IncarnationConflict,
-        )
+        continue
       }
       claimed_id = claim_key
-      let (worker, assignment, spec) = validate_supervisor_work(control, work)
-      if hello.incarnation() != worker.incarnation().value() {
-        raise FrameIoError::Coordinator(
-          @control.CoordinatorError::StaleIncarnation,
-        )
-      }
-      match work.required_capability() {
-        Some(capability) if !hello
-          .capabilities()
-          .any(value => value == capability) =>
-          raise FrameIoError::SupervisorPlan(
-            SupervisorPlanError::MissingCapability(
-              worker=hello.worker_id(),
-              capability~,
-            ),
-          )
-        _ => ()
-      }
-      let validator = @protocol.CoordinatorSession::new(
-        control.cluster_id(),
-        control.coordinator_id(),
-        worker.worker_id(),
-      ) catch {
-        error => raise FrameIoError::Session(error)
-      }
-      ignore(
-        validator.accept_hello(hello_frame) catch {
-          error => raise FrameIoError::Session(error)
-        },
-      )
+      claimed_worker_id = hello.worker_id()
+      claimed_partition = Some(work.partition())
+      identity.worker_id = claimed_worker_id
+      identity.partition = claimed_partition
       active_assignment = Some(assignment)
       let (session, outbound) = coordinator_handshake_after_hello(
         connection,
@@ -782,6 +760,7 @@ async fn supervise_one_connection(
         work.session_id(),
         assignment=spec,
         maximum_frame_bytes~,
+        auth_token?,
       )
       let summary = run_supervised_session(
         connection,
@@ -870,6 +849,7 @@ pub async fn run_supervisor(
   control : @control.CoordinatorState,
   works : Array[SupervisorWork],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   let retry_policy = RetryPolicy::new(1, 0, 0) catch {
     _ => raise FrameIoError::Handler("invalid default retry policy")
@@ -881,6 +861,7 @@ pub async fn run_supervisor(
     maximum_frame_bytes,
     None,
     retry_policy,
+    auth_token?,
   )
 }
 
@@ -892,6 +873,7 @@ pub async fn run_supervisor_with_retry(
   works : Array[SupervisorWork],
   retry_policy : RetryPolicy,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   run_supervisor_impl(
     server,
@@ -900,6 +882,7 @@ pub async fn run_supervisor_with_retry(
     maximum_frame_bytes,
     None,
     retry_policy,
+    auth_token?,
   )
 }
 
@@ -911,6 +894,7 @@ pub async fn run_durable_supervisor(
   store : CoordinatorStore,
   works : Array[SupervisorWork],
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   let retry_policy = RetryPolicy::new(1, 0, 0) catch {
     _ => raise FrameIoError::Handler("invalid default retry policy")
@@ -922,6 +906,7 @@ pub async fn run_durable_supervisor(
     maximum_frame_bytes,
     Some(store),
     retry_policy,
+    auth_token?,
   )
   store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
@@ -937,6 +922,7 @@ pub async fn run_durable_supervisor_with_retry(
   works : Array[SupervisorWork],
   retry_policy : RetryPolicy,
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   let summary = run_supervisor_impl(
     server,
@@ -945,6 +931,7 @@ pub async fn run_durable_supervisor_with_retry(
     maximum_frame_bytes,
     Some(store),
     retry_policy,
+    auth_token?,
   )
   store.checkpoint_and_compact() catch {
     error => raise FrameIoError::CoordinatorStore(error)
@@ -963,6 +950,7 @@ async fn run_supervisor_impl(
   job_store? : JobStore,
   output_manifest? : JobOutputManifest,
   drain_timeout_ms? : Int = 5000,
+  auth_token? : String,
 ) -> SupervisorRunSummary raise FrameIoError {
   validate_supervisor_plan(control, works[:], maximum_frame_bytes)
   (@async.with_task_group <| group => {
@@ -993,6 +981,7 @@ async fn run_supervisor_impl(
           output_manifest,
           drain_timeout_ms,
           identity,
+          auth_token,
         )
       }
       tasks.push(task)
