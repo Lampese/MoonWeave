@@ -18,6 +18,7 @@ pub(all) suberror FrameIoError {
   Message(@protocol.MessageError)
   Wal(WalError)
   Checkpoint(CheckpointError)
+  Migration(WorkerMigrationError)
   MissingAssignment
   ProbeMismatch
   ProbeNotReached(target~ : Int64, actual~ : Int64)

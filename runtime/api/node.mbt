@@ -1135,8 +1135,21 @@ pub async fn CompiledJob::run_worker_node(
     error =>
       raise ApiError::Cluster("connect Coordinator: " + @debug.to_string(error))
   }
-  let task = self.descriptor.create_task(
+  let wal_path = config.storage_dir +
+    "/worker-p" +
+    partition.to_string() +
+    ".wal"
+  let task_id = @runtime.migrated_task_id(wal_path) catch {
+    error =>
+      raise ApiError::Cluster(
+        "read Worker migration pointer: " + @debug.to_string(error),
+      )
+  }
+  let task_id = task_id.unwrap_or(
     self.definition.job_id + "/dynamic/" + config.worker_id,
+  )
+  let task = self.descriptor.create_task(
+    task_id,
     partition,
     config.epoch,
     config.start_offset,
@@ -1160,7 +1173,7 @@ pub async fn CompiledJob::run_worker_node(
     config.worker_id,
     config.incarnation,
     capabilities,
-    config.storage_dir + "/worker-p" + partition.to_string() + ".wal",
+    wal_path,
     task,
     _ => (),
     checkpoint_path=config.storage_dir +
@@ -1188,6 +1201,207 @@ pub async fn CompiledJob::run_worker_node(
     state_events: task.event_count(),
     pending_events: task.pending_count(),
     state_schema: self.descriptor.state_schema(),
+  }
+}
+
+///|
+/// Capture one stopped Worker Task into a portable transfer bundle. The source
+/// WAL/checkpoint/output files are locked for the duration of the capture.
+pub async fn CompiledJob::capture_worker_migration(
+  self : CompiledJob,
+  config : WorkerNodeConfig,
+  target_worker_id : String,
+  target_incarnation : String,
+  target_epoch : Int,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  if config.partition < 0 {
+    raise ApiError::InvalidWorkerAssignment(
+      "migration capture requires an explicit partition",
+    )
+  }
+  let partition = config.partition
+  let output_path = match self.definition.sink {
+    SinkSpec::Discard => None
+    SinkSpec::Durable(_) =>
+      Some(config.storage_dir + "/output-p" + partition.to_string() + ".wal")
+  }
+  let paths = @runtime.WorkerStoragePaths::new(
+    config.storage_dir + "/worker-p" + partition.to_string() + ".wal",
+    config.storage_dir + "/worker-p" + partition.to_string() + ".json",
+    Some(config.storage_dir + "/delta-p" + partition.to_string() + ".wal"),
+    output_path,
+  ) catch {
+    error =>
+      raise ApiError::Cluster(
+        "build Worker migration paths: " + @debug.to_string(error),
+      )
+  }
+  let identity = @runtime.WorkerMigrationIdentity::new(
+    config.cluster_id,
+    config.coordinator_id,
+    self.definition.job_id,
+    partition,
+    config.start_offset,
+    config.worker_id,
+    config.incarnation,
+    config.epoch,
+    target_worker_id,
+    target_incarnation,
+    target_epoch,
+  ) catch {
+    error =>
+      raise ApiError::Cluster(
+        "build Worker migration identity: " + @debug.to_string(error),
+      )
+  }
+  let bundle = @runtime.WorkerMigration::capture(identity, paths) catch {
+    error =>
+      raise ApiError::Cluster(
+        "capture Worker migration: " + @debug.to_string(error),
+      )
+  }
+  bundle.save(bundle_path) catch {
+    error =>
+      raise ApiError::Cluster(
+        "save Worker migration: " + @debug.to_string(error),
+      )
+  }
+}
+
+///|
+/// Install a previously captured bundle. Call this after fencing/reassigning
+/// the lease and before starting the replacement Worker.
+pub async fn CompiledJob::install_worker_migration(
+  self : CompiledJob,
+  config : WorkerNodeConfig,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  if config.partition < 0 {
+    raise ApiError::InvalidWorkerAssignment(
+      "migration install requires an explicit partition",
+    )
+  }
+  let bundle = @runtime.WorkerMigration::load(bundle_path) catch {
+    error =>
+      raise ApiError::Cluster(
+        "load Worker migration: " + @debug.to_string(error),
+      )
+  }
+  let identity = bundle.identity()
+  if identity.job_id() != self.definition.job_id ||
+    identity.cluster_id() != config.cluster_id ||
+    identity.coordinator_id() != config.coordinator_id ||
+    identity.target_worker_id() != config.worker_id ||
+    identity.target_incarnation() != config.incarnation ||
+    identity.partition() != config.partition {
+    raise ApiError::InvalidWorkerAssignment(
+      "Worker migration target does not match Worker config",
+    )
+  }
+  let output_path = match self.definition.sink {
+    SinkSpec::Discard => None
+    SinkSpec::Durable(_) =>
+      Some(
+        config.storage_dir + "/output-p" + config.partition.to_string() + ".wal",
+      )
+  }
+  let storage_exists = @fs.exists(config.storage_dir) catch {
+    error =>
+      raise ApiError::Cluster(
+        "check Worker migration storage: " + @debug.to_string(error),
+      )
+  }
+  if !storage_exists {
+    @fs.mkdir(config.storage_dir, recursive=true) catch {
+      error =>
+        raise ApiError::Cluster(
+          "mkdir Worker migration storage: " + @debug.to_string(error),
+        )
+    }
+  }
+  let paths = @runtime.WorkerStoragePaths::new(
+    config.storage_dir + "/worker-p" + config.partition.to_string() + ".wal",
+    config.storage_dir + "/worker-p" + config.partition.to_string() + ".json",
+    Some(
+      config.storage_dir + "/delta-p" + config.partition.to_string() + ".wal",
+    ),
+    output_path,
+  ) catch {
+    error =>
+      raise ApiError::Cluster(
+        "build Worker migration paths: " + @debug.to_string(error),
+      )
+  }
+  bundle.install(identity, paths) catch {
+    error =>
+      raise ApiError::Cluster(
+        "install Worker migration: " + @debug.to_string(error),
+      )
+  }
+}
+
+///|
+/// Complete replacement-side recovery: install the verified bundle, fence the
+/// old lease in both durable control stores, and commit the transferred
+/// cursors. Start the replacement Worker only after this returns.
+pub async fn CompiledJob::recover_worker_migration(
+  self : CompiledJob,
+  config : WorkerNodeConfig,
+  coordinator : @runtime.CoordinatorStore,
+  job : @runtime.JobStore,
+  bundle_path : String,
+  reconcile_path? : String,
+) -> Unit raise ApiError {
+  if config.partition < 0 {
+    raise ApiError::InvalidWorkerAssignment(
+      "migration recovery requires an explicit partition",
+    )
+  }
+  let bundle = @runtime.WorkerMigration::load(bundle_path) catch {
+    error =>
+      raise ApiError::Cluster(
+        "load Worker migration: " + @debug.to_string(error),
+      )
+  }
+  let identity = bundle.identity()
+  if identity.job_id() != self.definition.job_id ||
+    identity.cluster_id() != config.cluster_id ||
+    identity.coordinator_id() != config.coordinator_id ||
+    identity.target_worker_id() != config.worker_id ||
+    identity.target_incarnation() != config.incarnation ||
+    identity.partition() != config.partition {
+    raise ApiError::InvalidWorkerAssignment(
+      "Worker migration target does not match Worker config",
+    )
+  }
+  self.install_worker_migration(config, bundle_path)
+  ignore(
+    @runtime.recover_worker_leases(
+      coordinator,
+      job,
+      identity.source_worker_id(),
+      @protocol.Incarnation::new(identity.source_incarnation()),
+      config.worker_id,
+      reconcile_path?,
+    ) catch {
+      error =>
+        raise ApiError::Cluster(
+          "recover Worker lease: " + @debug.to_string(error),
+        )
+    },
+  )
+  let cursor_path = reconcile_path.map(path => path + ".migration-cursors")
+  @runtime.commit_worker_migration(
+    coordinator,
+    job,
+    bundle,
+    reconcile_path?=cursor_path,
+  ) catch {
+    error =>
+      raise ApiError::Cluster(
+        "commit Worker migration: " + @debug.to_string(error),
+      )
   }
 }
 
@@ -1248,14 +1462,23 @@ pub async fn CompiledJob::run_worker_node_set(
           "connect Coordinator: " + @debug.to_string(error),
         )
     }
-    let task = self.descriptor.create_task(
+    let prefix = config.storage_dir + "/p" + partition.to_string()
+    let migrated_id = @runtime.migrated_task_id(prefix + ".wal") catch {
+      error =>
+        raise ApiError::Cluster(
+          "read Worker migration pointer: " + @debug.to_string(error),
+        )
+    }
+    let task_id = migrated_id.unwrap_or(
       self.definition.job_id + "/p" + partition.to_string() + "/e0",
+    )
+    let task = self.descriptor.create_task(
+      task_id,
       partition,
       0,
       0L,
       self.definition.max_state_events.unwrap_or(0),
     )
-    let prefix = config.storage_dir + "/p" + partition.to_string()
     let output_log_path = match self.definition.sink {
       SinkSpec::Discard => None
       SinkSpec::Durable(_) => Some(prefix + ".output.wal")

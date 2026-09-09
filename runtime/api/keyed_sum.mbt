@@ -193,6 +193,55 @@ pub async fn KeyedSumJob::run_worker_node(
 }
 
 ///|
+/// Capture the durable state of a stopped keyed-sum Worker for an explicit
+/// cross-epoch takeover.
+pub async fn KeyedSumJob::capture_worker_migration(
+  self : KeyedSumJob,
+  config : WorkerNodeConfig,
+  target_worker_id : String,
+  target_incarnation : String,
+  target_epoch : Int,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  self
+  .compile()
+  .capture_worker_migration(
+    config, target_worker_id, target_incarnation, target_epoch, bundle_path,
+  )
+}
+
+///|
+/// Install a keyed-sum migration bundle before starting the replacement Worker.
+pub async fn KeyedSumJob::install_worker_migration(
+  self : KeyedSumJob,
+  config : WorkerNodeConfig,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  self.compile().install_worker_migration(config, bundle_path)
+}
+
+///|
+/// Perform keyed-sum replacement recovery and commit the transferred cursors.
+pub async fn KeyedSumJob::recover_worker_migration(
+  self : KeyedSumJob,
+  config : WorkerNodeConfig,
+  coordinator : @runtime.CoordinatorStore,
+  job : @runtime.JobStore,
+  bundle_path : String,
+  reconcile_path? : String,
+) -> Unit raise ApiError {
+  self
+  .compile()
+  .recover_worker_migration(
+    config,
+    coordinator,
+    job,
+    bundle_path,
+    reconcile_path?,
+  )
+}
+
+///|
 /// A compiled keyed-sum plan. It exposes only deterministic placement and
 /// execution entry points, not the underlying JobSpec or TaskSpec.
 pub struct KeyedSumPlan {
@@ -258,6 +307,47 @@ pub async fn KeyedSumPlan::run_worker_node(
   config : WorkerNodeConfig,
 ) -> WorkerNodeSummary raise ApiError {
   self.compiled.run_worker_node(config)
+}
+
+///|
+pub async fn KeyedSumPlan::capture_worker_migration(
+  self : KeyedSumPlan,
+  config : WorkerNodeConfig,
+  target_worker_id : String,
+  target_incarnation : String,
+  target_epoch : Int,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  self.compiled.capture_worker_migration(
+    config, target_worker_id, target_incarnation, target_epoch, bundle_path,
+  )
+}
+
+///|
+pub async fn KeyedSumPlan::install_worker_migration(
+  self : KeyedSumPlan,
+  config : WorkerNodeConfig,
+  bundle_path : String,
+) -> Unit raise ApiError {
+  self.compiled.install_worker_migration(config, bundle_path)
+}
+
+///|
+pub async fn KeyedSumPlan::recover_worker_migration(
+  self : KeyedSumPlan,
+  config : WorkerNodeConfig,
+  coordinator : @runtime.CoordinatorStore,
+  job : @runtime.JobStore,
+  bundle_path : String,
+  reconcile_path? : String,
+) -> Unit raise ApiError {
+  self.compiled.recover_worker_migration(
+    config,
+    coordinator,
+    job,
+    bundle_path,
+    reconcile_path?,
+  )
 }
 
 ///|

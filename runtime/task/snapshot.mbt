@@ -73,3 +73,21 @@ pub fn TaskSnapshot::events(
 ) -> ArrayView[@protocol.EventRecord] {
   self.events[:]
 }
+
+///|
+/// Rebind a verified snapshot to a new Task attempt. The event set and its
+/// causal frontier remain unchanged; only the durable execution identity is
+/// replaced. Worker migration is the only caller that should use this method.
+pub fn TaskSnapshot::rebind(
+  self : TaskSnapshot,
+  task_id : String,
+  epoch : Int,
+) -> TaskSnapshot raise TaskError {
+  if task_id.is_empty() {
+    raise TaskError::EmptyTaskId
+  }
+  if epoch < 0 {
+    raise TaskError::InvalidEpoch(epoch)
+  }
+  { ..self, task_id, epoch, }
+}

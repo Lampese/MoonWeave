@@ -14,7 +14,7 @@ fn option(args : Array[String], name : String, fallback : String) -> String {
 async fn main {
   let args = @env.args()
   let host = option(args, "--host", "127.0.0.1")
-  let port : Int = @strconv.from_str(option(args, "--port", "7801")) catch {
+  let port : Int = @string.parse_int(option(args, "--port", "7801")) catch {
     _ => {
       println("--port must be an integer")
       panic()
@@ -24,7 +24,7 @@ async fn main {
   let incarnation = option(args, "--incarnation", "boot-cli")
   let storage = option(args, "--storage", "moonweave-worker")
   let job_id = option(args, "--job", "cli-job")
-  let partition : Int = @strconv.from_str(option(args, "--partition", "0")) catch {
+  let partition : Int = @string.parse_int(option(args, "--partition", "0")) catch {
     _ => {
       println("--partition must be an integer")
       panic()

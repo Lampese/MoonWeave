@@ -21,6 +21,35 @@ pub async fn run_worker_task(
   output_log_path? : String,
   dynamic_assignment? : Bool = false,
 ) -> WorkerRunSummary raise FrameIoError {
+  validate_migration_target(
+    wal_path,
+    cluster_id,
+    coordinator_id,
+    worker_id,
+    incarnation,
+    task.partition(),
+    task.task_id(),
+  ) catch {
+    error => {
+      task.fail()
+      raise FrameIoError::Migration(error)
+    }
+  }
+  let resolved = resolve_worker_storage_paths(
+    wal_path, checkpoint_path, delta_wal_path, output_log_path,
+  ) catch {
+    error => {
+      task.fail()
+      raise FrameIoError::Migration(error)
+    }
+  }
+  let wal_path = resolved.wal_path
+  let checkpoint_path = match checkpoint_path {
+    None => None
+    Some(_) => Some(resolved.checkpoint_path)
+  }
+  let delta_wal_path = resolved.delta_wal_path
+  let output_log_path = resolved.output_log_path
   if !dynamic_assignment {
     task.start() catch {
       error => raise FrameIoError::Task(error)

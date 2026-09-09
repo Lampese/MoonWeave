@@ -215,6 +215,7 @@ pub fn TaskSnapshot::operator(Self) -> OperatorKind
 pub fn TaskSnapshot::operator_capability(Self) -> String?
 pub fn TaskSnapshot::operator_id(Self) -> String
 pub fn TaskSnapshot::partition(Self) -> Int
+pub fn TaskSnapshot::rebind(Self, String, Int) -> Self raise TaskError
 pub fn TaskSnapshot::state_schema(Self) -> String
 pub fn TaskSnapshot::task_id(Self) -> String
 

@@ -3,7 +3,7 @@ fn event_count(args : Array[String]) -> Int {
   let mut index = 0
   while index + 1 < args.length() {
     if args[index] == "--events" {
-      return @strconv.from_str(args[index + 1]) catch { _ => 100 }
+      return @string.parse_int(args[index + 1]) catch { _ => 100 }
     }
     index += 1
   }

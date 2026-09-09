@@ -159,6 +159,17 @@ pub async fn Checkpoint::save(
   if path.is_empty() {
     raise CheckpointError::EmptyPath
   }
+  let lock = @fs.open(
+    path + ".lock",
+    mode=@fs.ReadWrite,
+    create_mode=@fs.OpenOrCreate,
+  ) catch {
+    error => raise CheckpointError::Io(@debug.to_string(error))
+  }
+  errdefer lock.close()
+  lock.lock(@fs.Exclusive) catch {
+    error => raise CheckpointError::Io(@debug.to_string(error))
+  }
   let encoded = @utf8.encode(@json.to_json(self.validate()).stringify())
   let temporary = path + ".tmp"
   @fs.write_file(
@@ -172,4 +183,5 @@ pub async fn Checkpoint::save(
   @fs.rename(temporary, path, replace=true) catch {
     error => raise CheckpointError::Io(@debug.to_string(error))
   }
+  lock.close()
 }

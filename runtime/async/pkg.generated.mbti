@@ -17,6 +17,8 @@ import {
 }
 
 // Values
+pub async fn commit_worker_migration(CoordinatorStore, JobStore, WorkerMigration, reconcile_path? : String) -> Unit raise WorkerMigrationError
+
 pub async fn coordinator_handshake(@socket.Tcp, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn coordinator_handshake_after_hello(@socket.Tcp, @protocol.Frame, String, String, String, String, assignment? : @protocol.AssignmentSpec, maximum_frame_bytes? : Int) -> (@protocol.CoordinatorSession, @protocol.FrameBuilder) raise FrameIoError
@@ -29,6 +31,8 @@ pub async fn coordinator_send_probe(@socket.Tcp, @protocol.CoordinatorSession, @
 
 pub async fn coordinator_send_seal(@socket.Tcp, @protocol.CoordinatorSession, @protocol.FrameBuilder, @protocol.Seal, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
+pub async fn migrated_task_id(String) -> String? raise WorkerMigrationError
+
 pub async fn[R : @io.Reader] read_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame raise FrameIoError
 
 pub async fn[R : @io.Reader] read_optional_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame?
@@ -36,6 +40,8 @@ pub async fn[R : @io.Reader] read_optional_frame(R, maximum_frame_bytes? : Int) 
 pub async fn reconcile_job_coordinator(CoordinatorStore, JobStore, reconcile_path? : String) -> ReconciliationSummary raise ReconciliationError
 
 pub async fn recover_worker_leases(CoordinatorStore, JobStore, String, @protocol.Incarnation, String, reconcile_path? : String) -> Array[@control.PartitionAssignment] raise ReconciliationError
+
+pub async fn resolve_worker_storage_paths(String, String?, String?, String?) -> WorkerStoragePaths raise WorkerMigrationError
 
 pub async fn[X, Y] retry_transport(async () -> X, async (X) -> Y raise FrameIoError, RetryPolicy) -> Y raise FrameIoError
 
@@ -80,6 +86,8 @@ pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.Task
 pub async fn serve_echo(@socket.Tcp, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
 pub fn task_snapshot_digest(@task.TaskSnapshot) -> String
+
+pub async fn validate_migration_target(String, String, String, String, String, Int, String) -> Unit raise WorkerMigrationError
 
 pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
 
@@ -135,6 +143,7 @@ pub(all) suberror FrameIoError {
   Message(@protocol.MessageError)
   Wal(WalError)
   Checkpoint(CheckpointError)
+  Migration(WorkerMigrationError)
   MissingAssignment
   ProbeMismatch
   ProbeNotReached(target~ : Int64, actual~ : Int64)
@@ -306,6 +315,26 @@ pub(all) suberror WalError {
   Closed
   Failed
   Io(String)
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror WorkerMigrationError {
+  InvalidIdentity
+  PathConflict
+  Busy(String)
+  Malformed
+  DigestMismatch
+  CheckpointMismatch
+  OutputConflict
+  TargetConflict
+  MissingCheckpoint
+  InvalidMaximumBundleBytes(Int)
+  BundleTooLarge(actual~ : Int64, limit~ : Int)
+  Io(String)
+  Wal(WalError)
+  Task(@task.TaskError)
+  CoordinatorStore(CoordinatorStoreError)
+  JobStore(JobStoreError)
+  Reconciliation(ReconciliationError)
 } derive(Eq, @debug.Debug)
 
 // Types and methods
@@ -948,6 +977,60 @@ pub fn WalStats::physical_bytes(Self) -> Int64
 pub fn WalStats::record_count(Self) -> Int
 pub fn WalStats::repaired_tail_bytes(Self) -> Int64
 
+pub struct WorkerMigration {
+  version : Int
+  identity : WorkerMigrationIdentity
+  snapshot : @task.TaskSnapshot
+  primary_records : Int
+  delta_records : Int
+  batches : Array[@protocol.EventBatch]
+  deltas : Array[@protocol.DeltaBatch]
+  outputs : Array[TaskOutputRecord]?
+  digest : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub async fn WorkerMigration::capture(WorkerMigrationIdentity, WorkerStoragePaths) -> Self raise WorkerMigrationError
+pub fn WorkerMigration::digest(Self) -> String
+pub fn WorkerMigration::from_bytes(Bytes) -> Self raise WorkerMigrationError
+pub fn WorkerMigration::identity(Self) -> WorkerMigrationIdentity
+pub async fn WorkerMigration::install(Self, WorkerMigrationIdentity, WorkerStoragePaths) -> Unit raise WorkerMigrationError
+pub async fn WorkerMigration::load(String, maximum_bundle_bytes? : Int) -> Self raise WorkerMigrationError
+pub fn WorkerMigration::persisted_offset(Self) -> Int64
+pub async fn[R : @io.Reader] WorkerMigration::receive(R, maximum_bundle_bytes? : Int) -> Self raise WorkerMigrationError
+pub async fn WorkerMigration::save(Self, String) -> Unit raise WorkerMigrationError
+pub async fn[W : @io.Writer] WorkerMigration::send(Self, W, maximum_bundle_bytes? : Int) -> Unit raise WorkerMigrationError
+pub fn WorkerMigration::task_id(Self) -> String
+pub fn WorkerMigration::to_bytes(Self) -> Bytes raise WorkerMigrationError
+
+type WorkerMigrationCursorEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct WorkerMigrationIdentity {
+  cluster_id : String
+  coordinator_id : String
+  job_id : String
+  partition : Int
+  start_offset : Int64
+  source_worker_id : String
+  source_incarnation : String
+  source_epoch : Int
+  target_worker_id : String
+  target_incarnation : String
+  target_epoch : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn WorkerMigrationIdentity::cluster_id(Self) -> String
+pub fn WorkerMigrationIdentity::coordinator_id(Self) -> String
+pub fn WorkerMigrationIdentity::job_id(Self) -> String
+pub fn WorkerMigrationIdentity::new(String, String, String, Int, Int64, String, String, Int, String, String, Int) -> Self raise WorkerMigrationError
+pub fn WorkerMigrationIdentity::partition(Self) -> Int
+pub fn WorkerMigrationIdentity::source_epoch(Self) -> Int
+pub fn WorkerMigrationIdentity::source_incarnation(Self) -> String
+pub fn WorkerMigrationIdentity::source_worker_id(Self) -> String
+pub fn WorkerMigrationIdentity::start_offset(Self) -> Int64
+pub fn WorkerMigrationIdentity::target_epoch(Self) -> Int
+pub fn WorkerMigrationIdentity::target_incarnation(Self) -> String
+pub fn WorkerMigrationIdentity::target_worker_id(Self) -> String
+
+type WorkerMigrationInstallation derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 type WorkerRecoveryIntent derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct WorkerRunSummary {
@@ -962,6 +1045,19 @@ pub fn WorkerRunSummary::live_batches(Self) -> Int
 pub fn WorkerRunSummary::persisted_offset(Self) -> Int64
 pub fn WorkerRunSummary::replayed_batches(Self) -> Int
 pub fn WorkerRunSummary::replayed_deltas(Self) -> Int
+
+pub(all) struct WorkerStoragePaths {
+  wal_path : String
+  checkpoint_path : String
+  delta_wal_path : String?
+  output_log_path : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn WorkerStoragePaths::checkpoint_path(Self) -> String
+pub fn WorkerStoragePaths::delta_wal_path(Self) -> String?
+pub fn WorkerStoragePaths::new(String, String, String?, String?) -> Self raise WorkerMigrationError
+pub fn WorkerStoragePaths::output_log_path(Self) -> String?
+pub async fn WorkerStoragePaths::resolve(Self) -> Self raise WorkerMigrationError
+pub fn WorkerStoragePaths::wal_path(Self) -> String
 
 pub(all) struct WorkerTaskResult {
   task_id : String

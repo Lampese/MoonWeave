@@ -102,9 +102,11 @@ pub struct CompiledJob {
   descriptor : OperatorDescriptor
   plan_digest : String
 }
+pub async fn CompiledJob::capture_worker_migration(Self, WorkerNodeConfig, String, String, Int, String) -> Unit raise ApiError
 pub fn CompiledJob::connector_contract(Self) -> ConnectorContract
 pub fn CompiledJob::definition(Self) -> JobDefinition
 pub fn CompiledJob::delivery_guarantee(Self) -> DeliveryGuarantee
+pub async fn CompiledJob::install_worker_migration(Self, WorkerNodeConfig, String) -> Unit raise ApiError
 pub fn CompiledJob::job_id(Self) -> String
 pub fn CompiledJob::operator(Self) -> OperatorRef
 pub fn CompiledJob::operator_descriptor(Self) -> OperatorDescriptor
@@ -112,6 +114,7 @@ pub fn CompiledJob::partition_count(Self) -> Int
 pub fn CompiledJob::partition_for_key(Self, String) -> Int
 pub fn CompiledJob::partitioning(Self) -> Partitioning
 pub fn CompiledJob::plan_digest(Self) -> String
+pub async fn CompiledJob::recover_worker_migration(Self, WorkerNodeConfig, @moonweave/moonweave/runtime/async.CoordinatorStore, @moonweave/moonweave/runtime/async.JobStore, String, reconcile_path? : String) -> Unit raise ApiError
 pub fn CompiledJob::recovery_capability(Self) -> RecoveryCapability
 pub async fn CompiledJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[Event]) -> CoordinatorNodeSummary raise ApiError
 pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
@@ -420,9 +423,12 @@ pub fn KeyedSumEvent::value(Self) -> Int64
 pub struct KeyedSumJob {
   definition : JobDefinition
 } derive(Eq, @debug.Debug)
+pub async fn KeyedSumJob::capture_worker_migration(Self, WorkerNodeConfig, String, String, Int, String) -> Unit raise ApiError
 pub fn KeyedSumJob::compile(Self) -> KeyedSumPlan raise ApiError
+pub async fn KeyedSumJob::install_worker_migration(Self, WorkerNodeConfig, String) -> Unit raise ApiError
 pub fn KeyedSumJob::job_id(Self) -> String
 pub fn KeyedSumJob::new(String) -> Self raise ApiError
+pub async fn KeyedSumJob::recover_worker_migration(Self, WorkerNodeConfig, @moonweave/moonweave/runtime/async.CoordinatorStore, @moonweave/moonweave/runtime/async.JobStore, String, reconcile_path? : String) -> Unit raise ApiError
 pub async fn KeyedSumJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[KeyedSumEvent]) -> CoordinatorNodeSummary raise ApiError
 pub fn KeyedSumJob::run_local(Self) -> KeyedSumRun raise ApiError
 pub async fn KeyedSumJob::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError
@@ -435,10 +441,13 @@ pub fn KeyedSumJob::without_sink(Self) -> Self
 pub struct KeyedSumPlan {
   compiled : CompiledJob
 }
+pub async fn KeyedSumPlan::capture_worker_migration(Self, WorkerNodeConfig, String, String, Int, String) -> Unit raise ApiError
+pub async fn KeyedSumPlan::install_worker_migration(Self, WorkerNodeConfig, String) -> Unit raise ApiError
 pub fn KeyedSumPlan::job_id(Self) -> String
 pub fn KeyedSumPlan::partition_count(Self) -> Int
 pub fn KeyedSumPlan::partition_for_key(Self, String) -> Int
 pub fn KeyedSumPlan::plan_digest(Self) -> String
+pub async fn KeyedSumPlan::recover_worker_migration(Self, WorkerNodeConfig, @moonweave/moonweave/runtime/async.CoordinatorStore, @moonweave/moonweave/runtime/async.JobStore, String, reconcile_path? : String) -> Unit raise ApiError
 pub async fn KeyedSumPlan::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[KeyedSumEvent]) -> CoordinatorNodeSummary raise ApiError
 pub fn KeyedSumPlan::run_local(Self) -> KeyedSumRun raise ApiError
 pub async fn KeyedSumPlan::run_local_cluster(Self, ClusterConfig, ArrayView[KeyedSumEvent]) -> KeyedSumRunSummary raise ApiError

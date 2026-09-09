@@ -16,7 +16,7 @@ fn parse_endpoint(value : String) -> @flow.NodeEndpoint raise {
   if parts.length() != 2 {
     raise @flow.ApiError::InvalidEndpoint(value)
   }
-  let port : Int = @strconv.from_str(parts[1]) catch {
+  let port : Int = @string.parse_int(parts[1]) catch {
     _ => raise @flow.ApiError::InvalidEndpoint(value)
   }
   @flow.NodeEndpoint::new(parts[0].to_owned(), port)
