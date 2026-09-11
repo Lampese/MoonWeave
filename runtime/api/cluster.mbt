@@ -82,7 +82,7 @@ async fn CompiledJob::run_local_cluster_in_group(
     None => ()
     Some(sink) => sink.close()
   })
-  let (input_events, kafka_next_offset) : (Array[Event], Int64?) = match
+  let (input_events, kafka_next_offsets) : (Array[Event], Map[Int, Int64]?) = match
     (external_source, kafka_source) {
     (None, None) => (events.to_owned(), None)
     (Some(source), None) => {
@@ -103,7 +103,7 @@ async fn CompiledJob::run_local_cluster_in_group(
     }
     (None, Some(source)) => {
       let batch = source.poll()
-      (batch.events().to_owned(), Some(batch.next_offset()))
+      (batch.events().to_owned(), Some(batch.next_offsets()))
     }
     _ => raise ApiError::Cluster("multiple external sources")
   }
@@ -127,6 +127,7 @@ async fn CompiledJob::run_local_cluster_in_group(
     config.coordinator_id,
     coordinator_journal,
     checkpoint_path=coordinator_checkpoint,
+    maximum_bytes=config.storage_budget_bytes,
   ) catch {
     error => raise cluster_error_at("open coordinator", error)
   }
@@ -135,6 +136,7 @@ async fn CompiledJob::run_local_cluster_in_group(
     self.spec,
     job_journal,
     checkpoint_path=job_checkpoint,
+    maximum_bytes=config.storage_budget_bytes,
   ) catch {
     error => raise cluster_error_at("open job", error)
   }
@@ -247,6 +249,7 @@ async fn CompiledJob::run_local_cluster_in_group(
           self.definition.job_id,
           self.definition.operator.id(),
           self.spec.partition_count(),
+          maximum_bytes=config.storage_budget_bytes,
         ) catch {
           error => raise cluster_error_at("open output manifest", error)
         },
@@ -308,7 +311,7 @@ async fn CompiledJob::run_local_cluster_in_group(
         partition,
         assignment.epoch(),
         assignment.start_offset(),
-        self.definition.max_state_events.unwrap_or(0),
+        self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
       ) catch {
         error => raise ApiError::TaskFailed(@debug.to_string(error))
       }
@@ -347,6 +350,7 @@ async fn CompiledJob::run_local_cluster_in_group(
             initial_credit_bytes=4L * 1024L * 1024L,
             delta_wal_path~,
             output_log_path?,
+            storage_budget_bytes=config.storage_budget_bytes,
             output_delivery?=match kafka_sink {
               Some(sink) =>
                 Some(record => {
@@ -411,6 +415,7 @@ async fn CompiledJob::run_local_cluster_in_group(
           assignment.epoch().to_string()
         let output_log = @runtime.TaskOutputLog::open(
           config.storage_dir + "/output-p" + partition.to_string() + ".wal",
+          maximum_bytes=config.storage_budget_bytes,
         ) catch {
           error => raise ApiError::Sink(@debug.to_string(error))
         }
@@ -421,6 +426,7 @@ async fn CompiledJob::run_local_cluster_in_group(
           task_id,
           partition,
           assignment.epoch(),
+          maximum_bytes=config.storage_budget_bytes,
         ) catch {
           error => {
             output_log.close()
@@ -447,9 +453,10 @@ async fn CompiledJob::run_local_cluster_in_group(
     _ => ()
   }
   if summary.failed_workers() == 0 {
-    match (external_source, kafka_source, kafka_next_offset) {
+    match (external_source, kafka_source, kafka_next_offsets) {
       (Some(source), _, _) => source.commit(source.polled_offset())
-      (_, Some(source), Some(next_offset)) => source.commit(next_offset)
+      (_, Some(source), Some(next_offsets)) =>
+        source.commit_offsets(next_offsets)
       _ => ()
     }
   }

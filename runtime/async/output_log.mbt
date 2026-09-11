@@ -285,11 +285,12 @@ fn output_retention_marker_from_json(
 ///|
 pub async fn TaskOutputLog::open(
   path : String,
+  maximum_bytes? : Int64,
 ) -> TaskOutputLog raise OutputLogError {
   if path.is_empty() {
     raise OutputLogError::EmptyPath
   }
-  let (wal, replay) = Wal::open(path) catch {
+  let (wal, replay) = Wal::open(path, maximum_bytes?) catch {
     error => raise OutputLogError::Wal(error)
   }
   errdefer wal.close()
@@ -671,14 +672,16 @@ pub async fn TaskOutputLog::append(
       }
     }
   }
+  let payloads = canonical_records.map(record => {
+    @utf8.encode(@json.to_json(record).stringify())
+  })
+  ignore(
+    self.wal.append_all(payloads[:]) catch {
+      error => raise OutputLogError::Wal(error)
+    },
+  )
   for canonical in canonical_records {
     let key = output_key(canonical.task_id, canonical.sequence)
-    let encoded = @utf8.encode(@json.to_json(canonical).stringify())
-    ignore(
-      self.wal.append(encoded) catch {
-        error => raise OutputLogError::Wal(error)
-      },
-    )
     self.records.push(canonical)
     self.known[key] = canonical
     self.next_sequences[task_id] = canonical.sequence + 1L

@@ -193,7 +193,11 @@ async test "invalid and duplicate live peers leave running sessions and Job stat
         let key = "key-" + index.to_string()
         if job.partition_for_key(key) == partition {
           inputs.push(
-            Event::keyed_sum(@causal.EventId::new("input", partition), key, 10L),
+            Event::keyed_sum(
+              @causal.EventId::new("input", partition.to_int64()),
+              key,
+              10L,
+            ),
           )
           break
         }

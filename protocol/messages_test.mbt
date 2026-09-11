@@ -1,7 +1,7 @@
 ///|
 fn message_id(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
 ) -> @causal.EventId raise @causal.CausalError {
   @causal.EventId::new(origin, sequence)
 }

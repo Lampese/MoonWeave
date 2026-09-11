@@ -287,11 +287,32 @@ async fn Consumer::reset_offsets(self : Consumer) -> Unit {
 /// rewind on truncation. READ_COMMITTED consumers filter aborted
 /// transactions; read positions always advance past whole batches, so
 /// markers and aborted ranges are never re-fetched.
-pub async fn Consumer::poll(
+
+///|
+/// One record together with the Kafka partition it came from. The legacy
+/// `poll()` surface returns only records; this partition-preserving surface
+/// is required by stream runtimes that consume more than one partition.
+pub(all) struct PartitionedRecord {
+  partition : Int
+  record : Record
+} derive(@debug.Debug)
+
+///|
+pub fn PartitionedRecord::partition(self : PartitionedRecord) -> Int {
+  self.partition
+}
+
+///|
+pub fn PartitionedRecord::record(self : PartitionedRecord) -> Record {
+  self.record
+}
+
+///|
+pub async fn Consumer::poll_partitioned(
   self : Consumer,
   max_wait_ms? : Int = 500,
   max_bytes? : Int = 1048576,
-) -> Array[Record] {
+) -> Array[PartitionedRecord] {
   self.enforce_poll_interval()
   // Group unpauseed partitions by leader so each leader connection gets
   // one concurrent fetch.
@@ -328,7 +349,7 @@ pub async fn Consumer::poll(
     }
   })
   // Apply the results sequentially: records, positions, error policies.
-  let out : Array[Record] = []
+  let out : Array[PartitionedRecord] = []
   let mut remaining = self.max_poll_records
   let mut refresh = false
   for outcome in outcomes {
@@ -356,10 +377,20 @@ pub async fn Consumer::poll(
             let mut last_seen : Int64? = None
             if !part.batches.is_empty() && part.records_complete {
               let last_batch = part.batches[part.batches.length() - 1]
+              if last_batch.last_offset == 9223372036854775807L {
+                raise ProtocolError::ProtocolError(
+                  "Kafka partition reached the maximum representable offset",
+                )
+              }
               last_seen = Some(last_batch.last_offset + 1L)
             } else if !part.records.is_empty() {
               // Truncated tail: stop at the last complete record.
               let last = part.records[part.records.length() - 1]
+              if last.offset == 9223372036854775807L {
+                raise ProtocolError::ProtocolError(
+                  "Kafka partition reached the maximum representable offset",
+                )
+              }
               last_seen = Some(last.offset + 1L)
             }
             let taken : Array[Record] = []
@@ -378,13 +409,18 @@ pub async fn Consumer::poll(
               taken.push(record)
             }
             for record in taken {
-              out.push(record)
+              out.push({ partition: part.partition, record, })
             }
             remaining -= taken.length()
             if cut {
               // The cap cut mid-delivery: the position stops at the last
               // returned record so the rest is re-fetched next poll.
               let last_taken = taken[taken.length() - 1]
+              if last_taken.offset == 9223372036854775807L {
+                raise ProtocolError::ProtocolError(
+                  "Kafka partition reached the maximum representable offset",
+                )
+              }
               self.set_next_offset(part.partition, last_taken.offset + 1L)
               remaining = 0
             } else {
@@ -423,6 +459,18 @@ pub async fn Consumer::poll(
   }
   self.last_poll_ms = @async.now()
   out
+}
+
+///|
+/// Poll the currently assigned partitions and discard partition metadata.
+/// Existing callers that consume a single topic partition keep this compact
+/// API; multi-partition runtimes use `poll_partitioned` above.
+pub async fn Consumer::poll(
+  self : Consumer,
+  max_wait_ms? : Int = 500,
+  max_bytes? : Int = 1048576,
+) -> Array[Record] {
+  self.poll_partitioned(max_wait_ms~, max_bytes~).map(item => item.record())
 }
 
 ///|

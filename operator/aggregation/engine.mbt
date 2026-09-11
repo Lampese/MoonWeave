@@ -119,6 +119,12 @@ pub fn Engine::outputs(self : Engine) -> Array[KeyedSum] {
 }
 
 ///|
+/// Count retained historical aggregation updates without copying them.
+pub fn Engine::output_count(self : Engine) -> Int {
+  self.history.length()
+}
+
+///|
 pub fn Engine::totals(self : Engine) -> Array[KeyedSum] {
   self.state.totals()
 }

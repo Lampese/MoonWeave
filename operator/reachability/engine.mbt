@@ -92,6 +92,12 @@ pub fn Engine::facts(self : Engine) -> Array[Reachable] {
 }
 
 ///|
+/// Count retained derived reachability facts without materializing a copy.
+pub fn Engine::fact_count(self : Engine) -> Int {
+  self.state.fact_count()
+}
+
+///|
 pub fn Engine::frontier(self : Engine) -> @causal.Frontier {
   self.log.frontier()
 }

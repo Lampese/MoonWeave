@@ -1220,6 +1220,7 @@ pub fn Consumer::membership_error(Self) -> String?
 pub fn Consumer::pause(Self, partitions? : Array[Int]) -> Unit
 pub fn Consumer::paused(Self) -> Array[Int]
 pub async fn Consumer::poll(Self, max_wait_ms? : Int, max_bytes? : Int) -> Array[Record]
+pub async fn Consumer::poll_partitioned(Self, max_wait_ms? : Int, max_bytes? : Int) -> Array[PartitionedRecord]
 pub fn Consumer::position(Self, Int) -> Int64?
 pub fn Consumer::resume(Self, partitions? : Array[Int]) -> Unit
 pub fn Consumer::seek(Self, Int, Int64) -> Unit raise
@@ -1608,6 +1609,13 @@ pub struct PartitionInfo {
 } derive(@debug.Debug)
 
 type PartitionState
+
+pub(all) struct PartitionedRecord {
+  partition : Int
+  record : Record
+} derive(@debug.Debug)
+pub fn PartitionedRecord::partition(Self) -> Int
+pub fn PartitionedRecord::record(Self) -> Record
 
 pub(all) enum Partitioner {
   Murmur2

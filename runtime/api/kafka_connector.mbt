@@ -17,10 +17,9 @@ pub(all) enum KafkaSecurityProtocol {
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
-/// Serializable configuration for one Kafka source partition. A source owns one explicit
-/// partition because the Kafka package's public record type does not expose a
-/// partition number; keeping that identity in the source preserves stable
-/// causal event IDs.
+/// Serializable Kafka source configuration. `partition = -1` means that the
+/// consumer group owns all currently discovered partitions and follows future
+/// rebalances; non-negative values retain the explicit single-partition mode.
 pub(all) struct KafkaSourceSpec {
   bootstrap_servers : Array[String]
   topic : String
@@ -53,8 +52,8 @@ pub fn KafkaSourceSpec::new(
   if group_id.is_empty() {
     raise ApiError::Source("Kafka group id is required")
   }
-  if partition < 0 {
-    raise ApiError::Source("Kafka partition must be non-negative")
+  if partition < -1 {
+    raise ApiError::Source("Kafka partition must be -1 or non-negative")
   }
   {
     bootstrap_servers,
@@ -66,6 +65,17 @@ pub fn KafkaSourceSpec::new(
     credential_ref: None,
     max_poll_records: 128,
   }
+}
+
+///|
+/// Construct a source for every partition of `topic`. Kafka metadata and the
+/// consumer group determine the concrete assignment at runtime.
+pub fn KafkaSourceSpec::new_all(
+  bootstrap_servers : Array[String],
+  topic : String,
+  group_id : String,
+) -> KafkaSourceSpec raise ApiError {
+  KafkaSourceSpec::new(bootstrap_servers, topic, group_id, -1)
 }
 
 ///|
@@ -119,6 +129,11 @@ pub fn KafkaSourceSpec::group_id(self : KafkaSourceSpec) -> String {
 ///|
 pub fn KafkaSourceSpec::partition(self : KafkaSourceSpec) -> Int {
   self.partition
+}
+
+///|
+pub fn KafkaSourceSpec::all_partitions(self : KafkaSourceSpec) -> Bool {
+  self.partition < 0
 }
 
 ///|
@@ -313,8 +328,8 @@ pub fn KafkaSourceConfig::new(
   if group_id.is_empty() {
     raise ApiError::Source("Kafka group id is required")
   }
-  if partition < 0 {
-    raise ApiError::Source("Kafka partition must be non-negative")
+  if partition < -1 {
+    raise ApiError::Source("Kafka partition must be -1 or non-negative")
   }
   {
     bootstrap_servers,
@@ -327,6 +342,16 @@ pub fn KafkaSourceConfig::new(
     tls: None,
     max_poll_records: 128,
   }
+}
+
+///|
+/// Configure a consumer-group source that follows all topic partitions.
+pub fn KafkaSourceConfig::new_all(
+  bootstrap_servers : Array[String],
+  topic : String,
+  group_id : String,
+) -> KafkaSourceConfig raise ApiError {
+  KafkaSourceConfig::new(bootstrap_servers, topic, group_id, -1)
 }
 
 ///|
@@ -374,6 +399,11 @@ pub fn KafkaSourceConfig::partition(self : KafkaSourceConfig) -> Int {
 }
 
 ///|
+pub fn KafkaSourceConfig::all_partitions(self : KafkaSourceConfig) -> Bool {
+  self.partition < 0
+}
+
+///|
 pub fn KafkaSourceConfig::bootstrap_servers(
   self : KafkaSourceConfig,
 ) -> ArrayView[String] {
@@ -405,6 +435,7 @@ pub fn KafkaSourceConfig::tls(
 pub(all) struct KafkaSourceBatch {
   events : Array[Event]
   next_offset : Int64
+  next_offsets : Map[Int, Int64]
 } derive(Debug, Eq)
 
 ///|
@@ -418,6 +449,16 @@ pub fn KafkaSourceBatch::next_offset(self : KafkaSourceBatch) -> Int64 {
 }
 
 ///|
+/// Return the next offset independently for every Kafka partition included in
+/// this poll. The map is the only commit authority for an all-partitions
+/// source; callers must persist the batch before passing it to `commit_offsets`.
+pub fn KafkaSourceBatch::next_offsets(
+  self : KafkaSourceBatch,
+) -> Map[Int, Int64] {
+  self.next_offsets
+}
+
+///|
 /// A Kafka source with explicit offset commit semantics. Polling advances the
 /// client position in memory; `commit` must be called only after the batch has
 /// been durably processed.
@@ -427,6 +468,9 @@ pub struct KafkaSource {
   partition : Int
   mut committed_offset : Int64
   mut pending_next_offset : Int64?
+  committed_offsets : Map[Int, Int64]
+  mut pending_offsets : Map[Int, Int64]?
+  mut pending_partitions : Set[Int]?
   mut closed : Bool
 }
 
@@ -455,6 +499,7 @@ pub async fn KafkaSource::connect(
     enable_auto_commit=false,
     auto_offset_reset=Some(@moonkafka.AutoOffsetReset::ResetNone),
     max_poll_records=config.max_poll_records,
+    group_protocol=@moonkafka.GroupProtocol::PreferClassic,
   ) catch {
     error => raise kafka_source_error("configure", error)
   }
@@ -464,40 +509,51 @@ pub async fn KafkaSource::connect(
   ) catch {
     error => raise kafka_source_error("connect", error)
   }
-  if consumer.position(config.partition) is None {
-    consumer.close()
-    raise ApiError::Source("Kafka partition does not exist in the topic")
-  }
-  consumer.assign([(config.topic, config.partition)]) catch {
-    error => {
+  let committed_offset = if config.partition >= 0 {
+    if consumer.position(config.partition) is None {
       consumer.close()
-      raise kafka_source_error("assign", error)
+      raise ApiError::Source("Kafka partition does not exist in the topic")
     }
-  }
-  // `assign` intentionally treats committed-offset lookup as best effort in
-  // moonkafka. Verify it here so a coordinator/protocol failure cannot
-  // silently reset a production source to its start policy.
-  let committed = consumer.committed(partitions=Some([config.partition])) catch {
-    error => {
-      consumer.close()
-      raise kafka_source_error("read committed offset", error)
-    }
-  }
-  let committed_offset = match committed.get(config.partition) {
-    Some(offset) if offset >= 0L => {
-      consumer.seek(config.partition, offset) catch {
-        error => {
-          consumer.close()
-          raise kafka_source_error("seek committed offset", error)
-        }
+    consumer.assign([(config.topic, config.partition)]) catch {
+      error => {
+        consumer.close()
+        raise kafka_source_error("assign", error)
       }
-      offset
     }
-    Some(-1L) => consumer.position(config.partition).unwrap()
-    _ => {
-      consumer.close()
-      raise ApiError::Source("Kafka committed offset response is incomplete")
+    // Explicit assignment keeps the original single-partition API and still
+    // uses the durable group offset as its source of truth.
+    let committed = consumer.committed(partitions=Some([config.partition])) catch {
+      error => {
+        consumer.close()
+        raise kafka_source_error("read committed offset", error)
+      }
     }
+    let offset = match committed.get(config.partition) {
+      Some(value) if value >= 0L => value
+      Some(-1L) => consumer.position(config.partition).unwrap()
+      _ => {
+        consumer.close()
+        raise ApiError::Source("Kafka committed offset response is incomplete")
+      }
+    }
+    consumer.seek(config.partition, offset) catch {
+      error => {
+        consumer.close()
+        raise kafka_source_error("seek committed offset", error)
+      }
+    }
+    offset
+  } else {
+    // Subscription discovers every current partition and starts the
+    // heartbeat/rebalance loop. Assignment is intentionally asynchronous;
+    // `poll` synchronizes newly assigned partitions before fetching them.
+    consumer.subscribe([config.topic]) catch {
+      error => {
+        consumer.close()
+        raise kafka_source_error("subscribe", error)
+      }
+    }
+    0L
   }
   {
     consumer,
@@ -505,6 +561,13 @@ pub async fn KafkaSource::connect(
     partition: config.partition,
     committed_offset,
     pending_next_offset: None,
+    committed_offsets: if config.partition >= 0 {
+      Map([(config.partition, committed_offset)])
+    } else {
+      Map([])
+    },
+    pending_offsets: None,
+    pending_partitions: None,
     closed: false,
   }
 }
@@ -521,7 +584,28 @@ pub fn KafkaSource::partition(self : KafkaSource) -> Int {
 
 ///|
 pub fn KafkaSource::position(self : KafkaSource) -> Int64? {
-  self.consumer.position(self.partition)
+  if self.partition < 0 {
+    None
+  } else {
+    self.consumer.position(self.partition)
+  }
+}
+
+///|
+/// Return the current read position of every assigned partition. This is the
+/// operational counterpart of `KafkaSourceBatch::next_offsets` for metrics and
+/// restart diagnostics.
+pub fn KafkaSource::positions(self : KafkaSource) -> Map[Int, Int64] {
+  let out : Map[Int, Int64] = Map([])
+  for pair in self.consumer.assignment() {
+    if pair.0 == self.topic {
+      match self.consumer.position(pair.1) {
+        Some(offset) => out[pair.1] = offset
+        None => ()
+      }
+    }
+  }
+  out
 }
 
 ///|
@@ -533,6 +617,16 @@ pub fn KafkaSource::event_from_record(
   record : @moonkafka.Record,
 ) -> Event raise ApiError {
   kafka_record_to_event(self.topic, self.partition, record)
+}
+
+///|
+/// Decode a record whose partition came from Kafka's assignment metadata.
+pub fn KafkaSource::event_from_partitioned_record(
+  self : KafkaSource,
+  partition : Int,
+  record : @moonkafka.Record,
+) -> Event raise ApiError {
+  kafka_record_to_event(self.topic, partition, record)
 }
 
 ///|
@@ -561,14 +655,17 @@ fn kafka_record_to_event(
       )
   }
   let offset = record.offset
-  if offset < 0L || offset > 2147483647L {
+  if offset < 0L {
+    raise ApiError::Source("Kafka record offset must be non-negative")
+  }
+  if offset == 9223372036854775807L {
     raise ApiError::Source(
-      "Kafka record offset is outside the supported EventId range",
+      "Kafka record offset has no representable next offset",
     )
   }
   let id = @causal.EventId::new(
     "kafka/" + topic + "/" + partition.to_string(),
-    offset.to_int(),
+    offset,
   ) catch {
     error => raise ApiError::Source(@debug.to_string(error))
   }
@@ -587,22 +684,101 @@ pub async fn KafkaSource::poll(
   // Always retry from the last acknowledged offset and make a batch eligible
   // for commit only after every record decoded successfully.
   self.pending_next_offset = None
-  self.consumer.seek(self.partition, self.committed_offset) catch {
-    error => raise kafka_source_error("rewind", error)
+  self.pending_offsets = None
+  self.pending_partitions = None
+  if self.partition >= 0 {
+    self.consumer.seek(self.partition, self.committed_offset) catch {
+      error => raise kafka_source_error("rewind", error)
+    }
+  } else {
+    self.sync_group_assignments() catch {
+      error => raise kafka_source_error("sync assignments", error)
+    }
+    for partition, offset in self.committed_offsets {
+      self.consumer.seek(partition, offset) catch {
+        error => raise kafka_source_error("rewind", error)
+      }
+    }
   }
-  let records = self.consumer.poll(max_wait_ms~) catch {
+  let records = self.consumer.poll_partitioned(max_wait_ms~) catch {
     error => raise kafka_source_error("poll", error)
   }
-  let next_offset = match self.consumer.position(self.partition) {
-    Some(offset) => offset
-    None => self.committed_offset
-  }
   let events : Array[Event] = []
-  for record in records {
-    events.push(self.event_from_record(record))
+  let next_offsets : Map[Int, Int64] = Map([])
+  for item in records {
+    let partition = item.partition()
+    let record = item.record()
+    let committed = self.committed_offsets.get(partition).unwrap_or(0L)
+    let next_offset = self.consumer.position(partition).unwrap_or(committed)
+    if next_offset < committed ||
+      record.offset < committed ||
+      record.offset >= next_offset {
+      raise ApiError::Source("Kafka record offset is outside the polled range")
+    }
+    events.push(self.event_from_partitioned_record(partition, record))
+  }
+  let active_partitions : Set[Int] = Set([])
+  if self.partition >= 0 {
+    active_partitions.add(self.partition)
+  } else {
+    for pair in self.consumer.assignment() {
+      if pair.0 == self.topic {
+        active_partitions.add(pair.1)
+      }
+    }
+  }
+  for partition in active_partitions {
+    let committed = self.committed_offsets.get(partition).unwrap_or(0L)
+    let next_offset = self.consumer.position(partition).unwrap_or(committed)
+    if next_offset < committed {
+      raise ApiError::Source("Kafka poll offset regressed or overflowed")
+    }
+    next_offsets[partition] = next_offset
+  }
+  let next_offset = if self.partition >= 0 {
+    next_offsets.get(self.partition).unwrap_or(self.committed_offset)
+  } else {
+    self.committed_offset
   }
   self.pending_next_offset = Some(next_offset)
-  { events, next_offset, }
+  self.pending_offsets = Some(next_offsets.copy())
+  self.pending_partitions = Some(active_partitions)
+  { events, next_offset, next_offsets, }
+}
+
+///|
+/// Synchronize offsets for partitions gained by a consumer-group rebalance.
+/// A missing committed offset uses the configured consumer start position;
+/// no partition is acknowledged until its own durable offset is committed.
+async fn KafkaSource::sync_group_assignments(
+  self : KafkaSource,
+) -> Unit raise Error {
+  let assigned : Array[Int] = []
+  for pair in self.consumer.assignment() {
+    if pair.0 == self.topic {
+      assigned.push(pair.1)
+    }
+  }
+  if assigned.is_empty() {
+    return
+  }
+  let committed = self.consumer.committed(partitions=Some(assigned.copy()))
+  for partition in assigned {
+    let offset = match self.committed_offsets.get(partition) {
+      Some(value) => value
+      None =>
+        match committed.get(partition) {
+          Some(value) if value >= 0L => value
+          Some(-1L) => self.consumer.position(partition).unwrap_or(0L)
+          _ =>
+            raise @moonkafka.ProtocolError::ProtocolError(
+              "Kafka committed offset response is incomplete",
+            )
+        }
+    }
+    self.committed_offsets[partition] = offset
+    self.consumer.seek(partition, offset)
+  }
 }
 
 ///|
@@ -635,6 +811,59 @@ pub async fn KafkaSource::commit(
   }
   self.committed_offset = next_offset
   self.pending_next_offset = None
+  self.committed_offsets[self.partition] = next_offset
+  self.pending_offsets = None
+  self.pending_partitions = None
+}
+
+///|
+/// Commit each partition in one OffsetCommit request. The assignment is
+/// checked immediately before the wire commit, and the consumer group member
+/// epoch/member id fences a revoked owner at the broker.
+pub async fn KafkaSource::commit_offsets(
+  self : KafkaSource,
+  next_offsets : Map[Int, Int64],
+) -> Unit raise ApiError {
+  if self.closed {
+    raise ApiError::Closed
+  }
+  guard self.partition < 0 else {
+    if next_offsets.length() != 1 || next_offsets.get(self.partition) is None {
+      raise ApiError::Source("Kafka commit offsets do not match the source")
+    }
+    return self.commit(next_offsets[self.partition])
+  }
+  guard self.pending_offsets is Some(expected) else {
+    if next_offsets.is_empty() {
+      return
+    }
+    raise ApiError::Source("Kafka commit requires a pending poll")
+  }
+  if expected != next_offsets {
+    raise ApiError::Source("Kafka commit offsets do not match the pending poll")
+  }
+  let current : Set[Int] = Set([])
+  for pair in self.consumer.assignment() {
+    if pair.0 == self.topic {
+      current.add(pair.1)
+    }
+  }
+  guard self.pending_partitions is Some(pending) else {
+    raise ApiError::Source("Kafka pending assignment is missing")
+  }
+  for partition in pending {
+    if !current.contains(partition) {
+      raise ApiError::Source("Kafka partition was revoked before commit")
+    }
+  }
+  self.consumer.commit(offsets=next_offsets) catch {
+    error => raise kafka_source_error("commit", error)
+  }
+  for partition, offset in next_offsets {
+    self.committed_offsets[partition] = offset
+  }
+  self.pending_offsets = None
+  self.pending_partitions = None
 }
 
 ///|
@@ -906,8 +1135,8 @@ fn KafkaSourceSpec::validate(self : KafkaSourceSpec) -> Unit raise ApiError {
   if self.topic.is_empty() || self.group_id.is_empty() {
     raise ApiError::Source("Kafka topic and group id are required")
   }
-  if self.partition < 0 {
-    raise ApiError::Source("Kafka partition must be non-negative")
+  if self.partition < -1 {
+    raise ApiError::Source("Kafka partition must be -1 or non-negative")
   }
   if self.max_poll_records <= 0 {
     raise ApiError::Source("Kafka max poll records must be positive")

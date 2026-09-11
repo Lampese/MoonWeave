@@ -1,5 +1,5 @@
 ///|
-fn edge_event(origin : String, sequence : Int) -> @protocol.EventRecord raise {
+fn edge_event(origin : String, sequence : Int64) -> @protocol.EventRecord raise {
   @protocol.EventRecord::new(
     @causal.EventId::new(origin, sequence),
     [],

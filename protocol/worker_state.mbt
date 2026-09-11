@@ -92,6 +92,10 @@ pub fn WorkerState::grant_credit(
     raise ProtocolError::InvalidCredit
   }
   let assignment = self.checked_assignment(epoch)
+  if events > 9223372036854775807L - assignment.credit_events ||
+    bytes > 9223372036854775807L - assignment.credit_bytes {
+    raise ProtocolError::InvalidCredit
+  }
   assignment.credit_events += events
   assignment.credit_bytes += bytes
 }
@@ -113,6 +117,9 @@ pub fn WorkerState::reserve_batch(
       remaining=assignment.credit_events,
       requested=events,
     )
+  }
+  if events > 9223372036854775807L - assignment.next_offset {
+    raise ProtocolError::InvalidOffset(assignment.next_offset)
   }
   assignment.credit_events -= events
   assignment.credit_bytes -= bytes
@@ -175,6 +182,9 @@ pub fn WorkerState::resume_from(
     raise ProtocolError::InvalidOffset(offset)
   }
   assignment.acked_offset = offset
+  if offset == 9223372036854775807L {
+    raise ProtocolError::InvalidOffset(offset)
+  }
   assignment.next_offset = offset + 1L
 }
 
@@ -188,8 +198,9 @@ pub fn WorkerState::restore_send_cursor(
   next_offset : Int64,
 ) -> Unit raise ProtocolError {
   let assignment = self.checked_assignment(epoch)
-  if next_offset < assignment.next_offset ||
-    next_offset < assignment.acked_offset + 1L {
+  if assignment.acked_offset == 9223372036854775807L ||
+    next_offset < assignment.next_offset ||
+    next_offset <= assignment.acked_offset {
     raise ProtocolError::InvalidOffset(next_offset)
   }
   assignment.next_offset = next_offset

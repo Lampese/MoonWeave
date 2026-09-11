@@ -452,12 +452,34 @@ pub fn Task::state_event_count(self : Task) -> Int {
 
 ///|
 fn Task::check_state_limit(self : Task) -> Unit raise TaskError {
-  if self.max_state_events > 0 &&
-    self.state_event_count() > self.max_state_events {
-    raise TaskError::StateLimitExceeded(
-      limit=self.max_state_events,
-      actual=self.state_event_count(),
-    )
+  let actual = self.state_memory_count()
+  if self.max_state_events > 0 && actual > self.max_state_events {
+    raise TaskError::StateLimitExceeded(limit=self.max_state_events, actual~)
+  }
+}
+
+///|
+/// Count all durable and derived structures retained by a Task. The causal
+/// event count alone is insufficient for reachability (derived closure),
+/// aggregation (historical updates), and custom operators (emitted JSON).
+/// This is deliberately conservative: rejecting a candidate before commit is
+/// preferable to allowing a production process to grow without a bound.
+fn Task::state_memory_count(self : Task) -> Int {
+  match self.operator {
+    OperatorKind::KeyedSum => {
+      let engine = self.aggregation.unwrap()
+      self.state_event_count() + engine.output_count()
+    }
+    OperatorKind::Reachability => {
+      let engine = self.reachability.unwrap()
+      self.state_event_count() + engine.fact_count()
+    }
+    OperatorKind::SecurityChain => {
+      let engine = self.security.unwrap()
+      self.state_event_count() + engine.alert_count()
+    }
+    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+      self.state_event_count() + self.custom_outputs.length()
   }
 }
 
@@ -722,7 +744,9 @@ pub fn Task::stop(self : Task) -> Unit raise TaskError {
 
 ///|
 fn Task::advance_offset(self : Task, offset : Int64) -> Unit raise TaskError {
-  if offset < self.offset || offset != self.offset + 1L {
+  if self.offset == 9223372036854775807L ||
+    offset < self.offset ||
+    offset != self.offset + 1L {
     raise TaskError::InvalidOffset(offset)
   }
   self.offset = offset
@@ -733,7 +757,7 @@ fn Task::validate_next_offset(
   self : Task,
   offset : Int64,
 ) -> Unit raise TaskError {
-  if offset != self.offset + 1L {
+  if self.offset == 9223372036854775807L || offset != self.offset + 1L {
     raise TaskError::InvalidOffset(offset)
   }
 }
@@ -946,7 +970,9 @@ pub fn Task::process_batch(
     outputs.push_iter(
       candidate.process_unchecked(offset, TaskInput::new(event)).iter(),
     )
-    offset += 1L
+    if offset != 9223372036854775807L {
+      offset += 1L
+    }
   }
   outputs.sort()
   self.commit(candidate)

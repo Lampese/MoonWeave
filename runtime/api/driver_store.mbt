@@ -7,6 +7,7 @@ struct DriverJournalEntry {
   kind : String
   submission : JobSubmission?
   events : Array[Event]
+  accepted_events : Int64
   reason : String
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -26,13 +27,21 @@ pub struct DriverStore {
   mut accepted_events : Int64
   mut failure : String?
   inputs : Array[Event]
-  event_index : Map[@causal.EventId, Event]
+  mut event_index : Map[@causal.EventId, Event]
+  maximum_events : Int
   write_lock : @async_runtime.Mutex
 }
 
 ///|
 fn driver_entry(kind : String) -> DriverJournalEntry {
-  { version: 1, kind, submission: None, events: [], reason: "", }
+  {
+    version: 1,
+    kind,
+    submission: None,
+    events: [],
+    accepted_events: -1L,
+    reason: "",
+  }
 }
 
 ///|
@@ -140,6 +149,13 @@ fn DriverStore::validate_input(
         }
     }
   }
+  if self.maximum_events > 0 &&
+    self.event_index.length() + pending_events.length() > self.maximum_events {
+    raise ApiError::StateLimitExceeded(
+      limit=self.maximum_events,
+      actual=self.event_index.length() + pending_events.length(),
+    )
+  }
   accepted
 }
 
@@ -193,6 +209,9 @@ fn DriverStore::install_entry(
           actual=self.phase,
         )
       }
+      if entry.accepted_events >= 0L {
+        self.accepted_events = entry.accepted_events
+      }
       self.phase = JobRunPhase::Cancelled
     }
     "fail" => {
@@ -203,6 +222,9 @@ fn DriverStore::install_entry(
       if entry.reason.is_empty() {
         raise ApiError::Cluster("empty Driver failure")
       }
+      if entry.accepted_events >= 0L {
+        self.accepted_events = entry.accepted_events
+      }
       self.failure = Some(entry.reason)
       self.phase = JobRunPhase::Failed
     }
@@ -210,6 +232,13 @@ fn DriverStore::install_entry(
       if self.phase != JobRunPhase::Draining {
         raise ApiError::Cluster("completion without Driver drain")
       }
+      if entry.accepted_events < 0L {
+        raise ApiError::Cluster("completion without accepted event count")
+      }
+      if entry.accepted_events < self.accepted_events {
+        raise ApiError::Cluster("completion regresses accepted event count")
+      }
+      self.accepted_events = entry.accepted_events
       self.phase = JobRunPhase::Succeeded
     }
     _ => raise ApiError::Cluster("unknown Driver journal command")
@@ -220,11 +249,16 @@ fn DriverStore::install_entry(
 pub async fn DriverStore::open(
   path : String,
   registry? : OperatorRegistry = OperatorRegistry::builtins(),
+  maximum_bytes? : Int64,
+  maximum_events? : Int = 100000,
 ) -> DriverStore raise ApiError {
   if path.is_empty() {
     raise ApiError::Cluster("Driver store path is empty")
   }
-  let (journal, replay) = @runtime.Wal::open(path) catch {
+  if maximum_events < 0 {
+    raise ApiError::Cluster("Driver event limit cannot be negative")
+  }
+  let (journal, replay) = @runtime.Wal::open(path, maximum_bytes?) catch {
     error => raise driver_error("open Driver store", error)
   }
   errdefer journal.close()
@@ -239,6 +273,7 @@ pub async fn DriverStore::open(
     failure: None,
     inputs: [],
     event_index: Map([]),
+    maximum_events,
     write_lock: @async_runtime.Mutex::Mutex(),
   }
   for payload in replay.records() {
@@ -460,8 +495,14 @@ async fn DriverStore::succeed(
       actual=self.phase,
     )
   }
+  // Keep the terminal transition self-describing so a compacted Driver WAL
+  // can drop the full input history while preserving the public count.
+  let entry = DriverJournalEntry::{
+    ..driver_entry("succeeded"),
+    accepted_events: self.accepted_events,
+  }
   ignore(
-    self.journal.append(driver_entry_line(driver_entry("succeeded"))) catch {
+    self.journal.append(driver_entry_line(entry)) catch {
       error => raise driver_error("persist completion", error)
     },
   )
@@ -517,7 +558,12 @@ pub async fn DriverStore::compact(self : DriverStore) -> Unit raise ApiError {
       submission: Some(submission),
     }),
   )
-  if !self.inputs.is_empty() {
+  // A terminal Driver no longer needs to replay every input: the live
+  // execution and JobStore have already reached a durable terminal state.
+  // Keeping the input records for Running/Draining is required for restart.
+  let retain_inputs = self.phase == JobRunPhase::Running ||
+    self.phase == JobRunPhase::Draining
+  if retain_inputs && !self.inputs.is_empty() {
     entries.push(
       driver_entry_line(DriverJournalEntry::{
         ..driver_entry("input"),
@@ -531,20 +577,39 @@ pub async fn DriverStore::compact(self : DriverStore) -> Unit raise ApiError {
       entries.push(driver_entry_line(driver_entry("drain")))
     JobRunPhase::Succeeded => {
       entries.push(driver_entry_line(driver_entry("drain")))
-      entries.push(driver_entry_line(driver_entry("succeeded")))
+      entries.push(
+        driver_entry_line(DriverJournalEntry::{
+          ..driver_entry("succeeded"),
+          accepted_events: self.accepted_events,
+        }),
+      )
     }
     JobRunPhase::Cancelled =>
-      entries.push(driver_entry_line(driver_entry("cancel")))
+      entries.push(
+        driver_entry_line(DriverJournalEntry::{
+          ..driver_entry("cancel"),
+          accepted_events: self.accepted_events,
+        }),
+      )
     JobRunPhase::Failed =>
       entries.push(
         driver_entry_line(DriverJournalEntry::{
           ..driver_entry("fail"),
+          accepted_events: self.accepted_events,
           reason: self.failure.unwrap_or("execution failed"),
         }),
       )
   }
   self.journal.rewrite(entries[:]) catch {
     error => raise driver_error("compact Driver store", error)
+  }
+  if self.phase != JobRunPhase::Created &&
+    self.phase != JobRunPhase::Running &&
+    self.phase != JobRunPhase::Draining {
+    // Terminal jobs never re-enter execution. Release their in-memory input
+    // index after the compacted WAL has become authoritative as well.
+    self.inputs.clear()
+    self.event_index = Map([])
   }
 }
 

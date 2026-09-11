@@ -121,6 +121,7 @@ pub struct CoordinatorNodeConfig {
   bind : NodeEndpoint
   advertised : NodeEndpoint?
   storage_dir : String
+  storage_budget_bytes : Int64
   workers : Array[WorkerSlot]
   migration_required : Bool
   auth_token : String?
@@ -159,6 +160,7 @@ pub fn CoordinatorNodeConfig::new(
     bind,
     advertised: None,
     storage_dir,
+    storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
     workers: copied,
     migration_required: false,
     auth_token: None,
@@ -209,6 +211,26 @@ pub fn CoordinatorNodeConfig::storage_dir(
   self : CoordinatorNodeConfig,
 ) -> String {
   self.storage_dir
+}
+
+///|
+/// Set the physical budget applied to Coordinator journals and Worker WALs
+/// opened through this node configuration. Zero is development-only unlimited.
+pub fn CoordinatorNodeConfig::with_storage_budget(
+  self : CoordinatorNodeConfig,
+  maximum_bytes : Int64,
+) -> CoordinatorNodeConfig raise ApiError {
+  if maximum_bytes < 0L {
+    raise ApiError::Cluster("storage budget cannot be negative")
+  }
+  { ..self, storage_budget_bytes: maximum_bytes, }
+}
+
+///|
+pub fn CoordinatorNodeConfig::storage_budget_bytes(
+  self : CoordinatorNodeConfig,
+) -> Int64 {
+  self.storage_budget_bytes
 }
 
 ///|
@@ -275,6 +297,7 @@ pub struct WorkerNodeConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  storage_budget_bytes : Int64
   partition : Int
   epoch : Int
   start_offset : Int64
@@ -318,6 +341,7 @@ pub fn WorkerNodeConfig::new(
     worker_id,
     incarnation,
     storage_dir,
+    storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
     partition,
     epoch: 0,
     start_offset: 0L,
@@ -413,6 +437,22 @@ pub fn WorkerNodeConfig::storage_dir(self : WorkerNodeConfig) -> String {
 }
 
 ///|
+pub fn WorkerNodeConfig::with_storage_budget(
+  self : WorkerNodeConfig,
+  maximum_bytes : Int64,
+) -> WorkerNodeConfig raise ApiError {
+  if maximum_bytes < 0L {
+    raise ApiError::Cluster("storage budget cannot be negative")
+  }
+  { ..self, storage_budget_bytes: maximum_bytes, }
+}
+
+///|
+pub fn WorkerNodeConfig::storage_budget_bytes(self : WorkerNodeConfig) -> Int64 {
+  self.storage_budget_bytes
+}
+
+///|
 pub fn WorkerNodeConfig::partition(self : WorkerNodeConfig) -> Int {
   self.partition
 }
@@ -464,6 +504,7 @@ pub struct WorkerNodeSetConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  storage_budget_bytes : Int64
   partitions : Array[Int]?
   auth_token : String?
   kafka_runtime : KafkaRuntimeConfig?
@@ -500,6 +541,7 @@ pub fn WorkerNodeSetConfig::new(
     worker_id,
     incarnation,
     storage_dir,
+    storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
     partitions: None,
     auth_token: None,
     kafka_runtime: None,
@@ -598,6 +640,24 @@ pub fn WorkerNodeSetConfig::incarnation(self : WorkerNodeSetConfig) -> String {
 ///|
 pub fn WorkerNodeSetConfig::storage_dir(self : WorkerNodeSetConfig) -> String {
   self.storage_dir
+}
+
+///|
+pub fn WorkerNodeSetConfig::with_storage_budget(
+  self : WorkerNodeSetConfig,
+  maximum_bytes : Int64,
+) -> WorkerNodeSetConfig raise ApiError {
+  if maximum_bytes < 0L {
+    raise ApiError::Cluster("storage budget cannot be negative")
+  }
+  { ..self, storage_budget_bytes: maximum_bytes, }
+}
+
+///|
+pub fn WorkerNodeSetConfig::storage_budget_bytes(
+  self : WorkerNodeSetConfig,
+) -> Int64 {
+  self.storage_budget_bytes
 }
 
 ///|
@@ -1065,8 +1125,9 @@ fn validate_node_migration_intent(
 ///|
 async fn NodeMigrationLog::open(
   path : String,
+  maximum_bytes? : Int64,
 ) -> NodeMigrationLog raise ApiError {
-  let (wal, replay) = @runtime.Wal::open(path) catch {
+  let (wal, replay) = @runtime.Wal::open(path, maximum_bytes?) catch {
     error =>
       raise ApiError::Cluster(
         "open Worker migration intent WAL: " + @debug.to_string(error),
@@ -1287,7 +1348,10 @@ async fn resume_pending_node_migrations(
   config : CoordinatorNodeConfig,
   assignments : Map[Int, @control.PartitionAssignment],
 ) -> Unit raise ApiError {
-  let log = NodeMigrationLog::open(config.storage_dir + "/node-migrations.wal")
+  let log = NodeMigrationLog::open(
+    config.storage_dir + "/node-migrations.wal",
+    maximum_bytes=config.storage_budget_bytes,
+  )
   defer log.wal.close()
   let pending : Array[NodeMigrationIntent] = []
   for intent in log.pending.values() {
@@ -1506,6 +1570,7 @@ async fn recover_node_worker(
     let target = target_slot.unwrap()
     let log = NodeMigrationLog::open(
       config.storage_dir + "/node-migrations.wal",
+      maximum_bytes=config.storage_budget_bytes,
     )
     for partition in failed {
       let expected = node_migration_intent(
@@ -1604,6 +1669,7 @@ pub async fn CoordinatorListener::run(
     self.config.coordinator_id,
     self.config.storage_dir + "/coordinator.wal",
     checkpoint_path=self.config.storage_dir + "/coordinator.json",
+    maximum_bytes=self.config.storage_budget_bytes,
   ) catch {
     error =>
       raise ApiError::Cluster(
@@ -1615,6 +1681,7 @@ pub async fn CoordinatorListener::run(
     job.spec,
     self.config.storage_dir + "/job.wal",
     checkpoint_path=self.config.storage_dir + "/job.json",
+    maximum_bytes=self.config.storage_budget_bytes,
   ) catch {
     error =>
       raise ApiError::Cluster("open Job store: " + @debug.to_string(error))
@@ -1715,6 +1782,7 @@ pub async fn CoordinatorListener::run(
           job.definition.job_id,
           job.definition.operator.id(),
           job.spec.partition_count(),
+          maximum_bytes=self.config.storage_budget_bytes,
         ) catch {
           error =>
             raise ApiError::Cluster(
@@ -1940,7 +2008,7 @@ async fn CompiledJob::run_worker_node_with_sink(
       partition,
       config.epoch,
       config.start_offset,
-      self.definition.max_state_events.unwrap_or(0),
+      self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
     )
     let outcome : Result[@runtime.WorkerRunSummary, @runtime.FrameIoError] = Ok(
       @runtime.run_worker_task(
@@ -1956,6 +2024,7 @@ async fn CompiledJob::run_worker_node_with_sink(
         checkpoint_path=paths.checkpoint_path(),
         delta_wal_path?=paths.delta_wal_path(),
         output_log_path?,
+        storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=!config.assignment_known,
         auth_token?=config.auth_token,
         output_delivery?=match kafka_sink {
@@ -2294,7 +2363,7 @@ async fn CompiledJob::run_worker_node_set_with_sink(
       partition,
       0,
       0L,
-      self.definition.max_state_events.unwrap_or(0),
+      self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
     )
     let output_log_path = paths.output_log_path()
     works.push(
@@ -2315,6 +2384,7 @@ async fn CompiledJob::run_worker_node_set_with_sink(
         checkpoint_path=paths.checkpoint_path(),
         delta_wal_path?=paths.delta_wal_path(),
         output_log_path?,
+        storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=config.partitions is Some(_),
         auth_token?=config.auth_token,
         output_delivery?=match kafka_sink {

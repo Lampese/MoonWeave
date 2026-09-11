@@ -1,7 +1,7 @@
 ///|
 fn sum_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : ArrayView[@causal.EventId],
   key : String,
   value : Int64,

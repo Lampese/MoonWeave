@@ -142,6 +142,19 @@ async fn DriverCoordinator::apply_live_result(
         )
       } else if self.store.phase() == JobRunPhase::Draining {
         ignore(self.store.succeed())
+        // Once every partition has crossed its durable drain barrier, the
+        // Driver intent log no longer needs the full input prefix. Compacting
+        // here bounds terminal-job history while preserving the submission,
+        // phase, and accepted-event count needed by status/restart.
+        ignore(self.store.compact())
+        match self.live_execution {
+          Some(execution) =>
+            execution.compact_completed_source() catch {
+              error =>
+                raise live_execution_error("compact completed source", error)
+            }
+          None => ()
+        }
       } else if self.store.phase() == JobRunPhase::Running {
         ignore(self.store.fail("live execution completed before Driver drain"))
       }

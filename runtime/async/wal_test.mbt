@@ -151,6 +151,103 @@ async test "wal enforces record size" {
 }
 
 ///|
+async test "wal enforces physical capacity and exposes remaining budget" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path, maximum_record_bytes=64, maximum_bytes=35L)
+    assert_eq(wal.maximum_bytes(), 35L)
+    assert_eq(wal.remaining_bytes(), 35L)
+    ignore(wal.append(b"alpha"))
+    assert_eq(wal.write_offset(), 18L)
+    assert_eq(wal.remaining_bytes(), 17L)
+    ignore(wal.append(b"beta"))
+    assert_eq(wal.write_offset(), 35L)
+    assert_eq(wal.remaining_bytes(), 0L)
+    try wal.append(b"overflow") catch {
+      WalError::CapacityExceeded(limit~, actual~) => {
+        assert_eq(limit, 35L)
+        assert_eq(actual, 56L)
+      }
+      _ => fail("expected WAL capacity failure")
+    } noraise {
+      _ => fail("expected WAL capacity failure")
+    }
+    assert_eq(wal.write_offset(), 35L)
+    wal.close()
+  }
+}
+
+///|
+async test "wal rewrite releases physical capacity" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path, maximum_record_bytes=64, maximum_bytes=35L)
+    ignore(wal.append(b"alpha"))
+    ignore(wal.append(b"beta"))
+    try wal.append(b"overflow") catch {
+      WalError::CapacityExceeded(..) => ()
+      _ => fail("expected WAL capacity failure")
+    } noraise {
+      _ => fail("expected WAL capacity failure")
+    }
+    wal.rewrite([b"small"])
+    assert_eq(wal.write_offset(), 18L)
+    assert_eq(wal.remaining_bytes(), 17L)
+    assert_eq(wal.append(b"tail"), 18L)
+    wal.close()
+    let (reopened, replay) = Wal::open(
+      path,
+      maximum_record_bytes=64,
+      maximum_bytes=35L,
+    )
+    defer reopened.close()
+    assert_eq(replay.records(), [b"small", b"tail"])
+    assert_eq(reopened.write_offset(), 35L)
+  }
+}
+
+///|
+async test "wal rejects invalid physical capacity" {
+  with_wal_path <| path => {
+    try Wal::open(path, maximum_bytes=-1L) catch {
+      WalError::InvalidMaximumBytes(value) => assert_eq(value, -1L)
+      _ => fail("expected invalid WAL capacity")
+    } noraise {
+      _ => fail("expected invalid WAL capacity")
+    }
+  }
+}
+
+///|
+async test "wal can recover an existing over-budget file by rewriting it" {
+  with_wal_path <| path => {
+    let (writer, _) = Wal::open(path, maximum_bytes=64L)
+    ignore(writer.append(b"oversized-record"))
+    ignore(writer.append(b"second-record"))
+    writer.close()
+    let (wal, replay) = Wal::open(path, maximum_bytes=35L)
+    assert_true(wal.write_offset() > wal.maximum_bytes())
+    assert_eq(replay.records(), [b"oversized-record", b"second-record"])
+    wal.rewrite([b"ok"])
+    assert_true(wal.write_offset() <= wal.maximum_bytes())
+    ignore(wal.append(b"tail"))
+    wal.close()
+    let (restored, restored_replay) = Wal::open(path, maximum_bytes=35L)
+    defer restored.close()
+    assert_eq(restored_replay.records(), [b"ok", b"tail"])
+  }
+}
+
+///|
+async test "unlimited WAL reports remaining Int64 address space" {
+  with_wal_path <| path => {
+    let (wal, _) = Wal::open(path, maximum_bytes=0L)
+    assert_eq(wal.remaining_bytes(), 9223372036854775807L)
+    ignore(wal.append(b"one"))
+    assert_eq(wal.remaining_bytes(), 9223372036854775791L)
+    wal.close()
+  }
+}
+
+///|
 async test "wal rewrites records atomically under the existing lock" {
   with_wal_path <| path => {
     let (wal, _) = Wal::open(path)

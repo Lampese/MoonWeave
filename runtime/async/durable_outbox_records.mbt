@@ -121,6 +121,11 @@ fn durable_tombstone_entry(
 }
 
 ///|
+fn durable_retire_entry(delta_id : String) -> DurableOutboxEntry {
+  { version: 1, kind: "retire", delta_id, delta: None, delta_digest: None, }
+}
+
+///|
 fn apply_durable_outbox_entry(
   pending : Array[@protocol.DeltaBatch],
   known : Map[String, @protocol.DeltaBatch],
@@ -200,6 +205,22 @@ fn apply_durable_outbox_entry(
       known_digests[entry.delta_id] = digest
       acked.add(entry.delta_id)
       known.remove(entry.delta_id)
+      let mut index = 0
+      while index < pending.length() {
+        if pending[index].delta_id() == entry.delta_id {
+          ignore(pending.remove(index))
+          break
+        }
+        index += 1
+      }
+    }
+    "retire" => {
+      if entry.delta is Some(_) || entry.delta_digest is Some(_) {
+        raise DurableOutboxError::Malformed
+      }
+      acked.remove(entry.delta_id)
+      known.remove(entry.delta_id)
+      known_digests.remove(entry.delta_id)
       let mut index = 0
       while index < pending.length() {
         if pending[index].delta_id() == entry.delta_id {

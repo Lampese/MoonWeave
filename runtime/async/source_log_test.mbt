@@ -1,7 +1,7 @@
 ///|
 fn source_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   key : String,
   target : String,
 ) -> @protocol.EventRecord raise {
@@ -55,6 +55,112 @@ async test "source log recovers content and idempotent offsets" {
     _ => fail("expected source identity conflict")
   }
   restored.close()
+}
+
+///|
+async test "source log applies an explicit in-memory event budget" {
+  let directory = @fs.tmpdir(prefix="moonweave-source-limit")
+  let path = directory + "/source.wal"
+  defer {
+    @fs.remove(path) catch {
+      _ => ()
+    }
+    @fs.remove(path + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let source = SourceLog::open(path, maximum_entries=1)
+  ignore(source.append(0, 0L, source_event("limited", 0L, "a", "B")))
+  try source.append(0, 0L, source_event("limited", 1L, "a", "C")) catch {
+    SourceLogError::StateLimitExceeded(limit~, actual~) => {
+      assert_eq(limit, 1)
+      assert_eq(actual, 2)
+    }
+    _ => fail("expected source state limit")
+  } noraise {
+    _ => fail("expected source state limit")
+  }
+  source.close()
+}
+
+///|
+async test "source log compaction preserves logical offsets and rejects retired offsets" {
+  let directory = @fs.tmpdir(prefix="moonweave-source-compact")
+  let path = directory + "/source.wal"
+  defer {
+    @fs.remove(path) catch {
+      _ => ()
+    }
+    @fs.remove(path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(path + ".compact") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let source = SourceLog::open(path)
+  let first = source_event("compact", 0L, "a", "B")
+  let second = source_event("compact", 1L, "a", "C")
+  ignore(source.append(0, 0L, first))
+  ignore(source.append(0, 0L, second))
+  let barrier = source.retention_barrier(0, 1L)
+  source.compact(barrier)
+  assert_eq(source.event_count(), 1)
+  assert_eq(source.next_offset(0), Some(2L))
+  try source.append(0, 0L, first) catch {
+    SourceLogError::OffsetRetired(partition~, offset~) => {
+      assert_eq(partition, 0)
+      assert_eq(offset, 0L)
+    }
+    _ => fail("expected retired source offset")
+  } noraise {
+    _ => fail("expected retired source offset")
+  }
+  source.close()
+  let restored = SourceLog::open(path)
+  defer restored.close()
+  assert_eq(restored.event_count(), 1)
+  assert_eq(restored.next_offset(0), Some(2L))
+  assert_eq(restored.batches(0, 0, 1L)[0].first_offset(), 1L)
+}
+
+///|
+async test "source retention barrier covers appends after a previous compact" {
+  let directory = @fs.tmpdir(prefix="moonweave-source-barrier")
+  let path = directory + "/source.wal"
+  defer {
+    @fs.remove(path) catch {
+      _ => ()
+    }
+    @fs.remove(path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(path + ".compact") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let source = SourceLog::open(path)
+  let first = source_event("barrier", 0L, "a", "B")
+  let second = source_event("barrier", 1L, "a", "C")
+  let third = source_event("barrier", 2L, "a", "D")
+  ignore(source.append(0, 0L, first))
+  ignore(source.append(0, 0L, second))
+  source.compact(source.retention_barrier(0, 1L))
+  ignore(source.append(0, 1L, third))
+  let stale = source.retention_barrier(0, 1L)
+  source.compact(stale)
+  assert_eq(source.event_count(), 2)
+  assert_eq(source.next_offset(0), Some(3L))
+  source.close()
 }
 
 ///|

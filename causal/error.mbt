@@ -2,7 +2,7 @@
 /// Failures rejected at the causal log boundary.
 pub(all) suberror CausalError {
   EmptyOrigin
-  NegativeSequence(Int)
+  NegativeSequence(Int64)
   EmptyKey
   SelfDependency(EventId)
   DuplicateParent(EventId)

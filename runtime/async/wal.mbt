@@ -3,7 +3,9 @@
 pub(all) suberror WalError {
   EmptyPath
   InvalidMaximumRecordBytes(Int)
+  InvalidMaximumBytes(Int64)
   RecordTooLarge(actual~ : Int, limit~ : Int)
+  CapacityExceeded(limit~ : Int64, actual~ : Int64)
   InvalidRecordLength(position~ : Int64)
   CorruptMagic(position~ : Int64)
   UnsupportedVersion(version~ : Int, position~ : Int64)
@@ -32,6 +34,11 @@ const WAL_VERSION : Int = 1
 
 ///|
 const WAL_HEADER_BYTES : Int = 13
+
+///|
+/// A finite default keeps an accidentally un-compacted WAL from consuming the
+/// whole volume. Callers with a different storage budget pass `maximum_bytes`.
+const WAL_DEFAULT_MAXIMUM_BYTES : Int64 = 256L * 1024L * 1024L
 
 ///|
 /// A point-in-time view of the verified WAL contents. `physical_bytes` includes
@@ -151,6 +158,7 @@ pub struct Wal {
   mut file : @fs.File
   lock_file : @fs.File
   maximum_record_bytes : Int
+  maximum_bytes : Int64
   mut write_offset : Int64
   mut record_count : Int
   mut payload_bytes : Int64
@@ -173,6 +181,24 @@ pub fn Wal::write_offset(self : Wal) -> Int64 {
 ///|
 pub fn Wal::maximum_record_bytes(self : Wal) -> Int {
   self.maximum_record_bytes
+}
+
+///|
+/// Return the configured physical WAL budget, including record headers.
+pub fn Wal::maximum_bytes(self : Wal) -> Int64 {
+  self.maximum_bytes
+}
+
+///|
+/// Return the currently available physical budget.
+pub fn Wal::remaining_bytes(self : Wal) -> Int64 {
+  if self.maximum_bytes == 0L {
+    9223372036854775807L - self.write_offset
+  } else if self.write_offset >= self.maximum_bytes {
+    0L
+  } else {
+    self.maximum_bytes - self.write_offset
+  }
 }
 
 ///|
@@ -334,6 +360,31 @@ fn encode_records(
 }
 
 ///|
+/// Check the whole operation before allocating the encoded buffer or writing
+/// any prefix. Int64 accounting avoids overflowing an Int buffer size.
+fn wal_records_size(
+  records : ArrayView[Bytes],
+  maximum_record_bytes : Int,
+  maximum_bytes : Int64,
+  initial_bytes : Int64,
+) -> Int64 raise WalError {
+  let mut size = initial_bytes
+  for record in records {
+    if record.length() > maximum_record_bytes {
+      raise WalError::RecordTooLarge(
+        actual=record.length(),
+        limit=maximum_record_bytes,
+      )
+    }
+    size += WAL_HEADER_BYTES.to_int64() + record.length().to_int64()
+    if maximum_bytes > 0L && size > maximum_bytes {
+      raise WalError::CapacityExceeded(limit=maximum_bytes, actual=size)
+    }
+  }
+  size - initial_bytes
+}
+
+///|
 async fn open_locked_file(path : String) -> @fs.File raise WalError {
   @fs.open(
     path,
@@ -348,15 +399,26 @@ async fn open_locked_file(path : String) -> @fs.File raise WalError {
 
 ///|
 /// Open a WAL, recover the valid prefix, and retain an exclusive process lock.
+/// Budgets must be non-negative and fit the current single-buffer replay backend
+/// (at most 2^31 - 1 bytes). An existing file may be over the configured
+/// budget: it is opened read-only with respect to new appends so recovery and
+/// compaction can bring it back under budget. This is important when an
+/// operator lowers a budget or a previous process stopped before compaction.
+/// Atomic rewrite temporarily needs room for both the old and new files.
 pub async fn Wal::open(
   path : String,
   maximum_record_bytes? : Int = 1024 * 1024,
+  maximum_bytes? : Int64 = WAL_DEFAULT_MAXIMUM_BYTES,
 ) -> (Wal, WalReplay) raise WalError {
   if path.is_empty() {
     raise WalError::EmptyPath
   }
-  if maximum_record_bytes <= 0 {
+  if maximum_record_bytes <= 0 ||
+    maximum_record_bytes > 2147483647 - WAL_HEADER_BYTES {
     raise WalError::InvalidMaximumRecordBytes(maximum_record_bytes)
+  }
+  if maximum_bytes < 0L || maximum_bytes > 2147483647L {
+    raise WalError::InvalidMaximumBytes(maximum_bytes)
   }
   let lock_path = path + ".lock"
   let lock_file = @fs.open(
@@ -401,6 +463,7 @@ pub async fn Wal::open(
       file,
       lock_file,
       maximum_record_bytes,
+      maximum_bytes,
       write_offset: replay.valid_bytes(),
       record_count: replay.records().length(),
       payload_bytes: replay.stats().payload_bytes(),
@@ -416,19 +479,40 @@ pub async fn Wal::open(
 ///|
 /// Append one payload and synchronize it before reporting its record offset.
 pub async fn Wal::append(self : Wal, payload : Bytes) -> Int64 raise WalError {
-  let record = encode_record(payload, self.maximum_record_bytes)
+  self.append_all([payload])
+}
+
+///|
+/// Append a group of records with one durability barrier. Capacity rejection
+/// writes nothing; an I/O error may have written a prefix and poisons the
+/// handle until recovery. Success means every record is synchronized.
+pub async fn Wal::append_all(
+  self : Wal,
+  payloads : ArrayView[Bytes],
+) -> Int64 raise WalError {
   self.write_lock.acquire() catch {
     error => raise WalError::Io(@debug.to_string(error))
   }
   defer self.release_write()
   self.check_writable()
+  let size = wal_records_size(
+    payloads,
+    self.maximum_record_bytes,
+    self.maximum_bytes,
+    self.write_offset,
+  )
   let offset = self.write_offset
+  if payloads.is_empty() {
+    return offset
+  }
+  let encoded = encode_records(payloads, self.maximum_record_bytes)
   @async.protect_from_cancel(() => {
-    self.file.write(record)
+    self.file.write(encoded)
     self.file.sync()
-    self.write_offset += record.length().to_int64()
-    self.record_count += 1
-    self.payload_bytes += payload.length().to_int64()
+    self.write_offset += size
+    self.record_count += payloads.length()
+    self.payload_bytes += size -
+      WAL_HEADER_BYTES.to_int64() * payloads.length().to_int64()
   }) catch {
     error => {
       self.failed = true
@@ -447,12 +531,20 @@ pub async fn Wal::rewrite(
   self : Wal,
   payloads : ArrayView[Bytes],
 ) -> Unit raise WalError {
-  let encoded = encode_records(payloads, self.maximum_record_bytes)
   self.write_lock.acquire() catch {
     error => raise WalError::Io(@debug.to_string(error))
   }
   defer self.release_write()
   self.check_writable()
+  ignore(
+    wal_records_size(
+      payloads,
+      self.maximum_record_bytes,
+      self.maximum_bytes,
+      0L,
+    ),
+  )
+  let encoded = encode_records(payloads, self.maximum_record_bytes)
   let temporary = self.path + ".compact"
   let replacement = @fs.open(
     temporary,

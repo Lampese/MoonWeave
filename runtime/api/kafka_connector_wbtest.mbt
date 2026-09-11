@@ -57,25 +57,42 @@ test "Kafka records reject invalid UTF-8 without lossy replacement" {
 }
 
 ///|
-test "Kafka offsets outside EventId range fail closed" {
+test "Kafka offsets preserve Int64 precision and reject an overflowing next offset" {
   let input = Event::new(
     @causal.EventId::new("producer", 0),
     [],
     "account-1",
     Json::object({ "value": Json::string("ok") }),
   )
-  let record : @moonkafka.Record = {
-    offset: 2147483648L,
-    timestamp: 0L,
-    key: None,
-    value: Some(@utf8.encode(@json.to_json(input).stringify())),
-    headers: [],
+  for offset in [2147483648L, 9007199254740993L, 9223372036854775806L] {
+    let record : @moonkafka.Record = {
+      offset,
+      timestamp: 0L,
+      key: None,
+      value: Some(@utf8.encode(@json.to_json(input).stringify())),
+      headers: [],
+    }
+    let event = kafka_record_to_event("events", 0, record)
+    assert_eq(event.id(), @causal.EventId::new("kafka/events/0", offset))
+    let restored : Event = @json.from_json(
+      @json.parse(@json.to_json(event).stringify()),
+    )
+    assert_eq(restored, event)
   }
-  try kafka_record_to_event("events", 0, record) catch {
-    ApiError::Source(message) => assert_true(message.contains("EventId range"))
-    _ => fail("expected unsupported Kafka offset rejection")
-  } noraise {
-    _ => fail("unsupported Kafka offset was truncated")
+  for offset in [-1L, 9223372036854775807L] {
+    let record : @moonkafka.Record = {
+      offset,
+      timestamp: 0L,
+      key: None,
+      value: Some(@utf8.encode(@json.to_json(input).stringify())),
+      headers: [],
+    }
+    try kafka_record_to_event("events", 0, record) catch {
+      ApiError::Source(message) => assert_true(message.contains("offset"))
+      _ => fail("expected invalid Kafka offset rejection")
+    } noraise {
+      _ => fail("invalid Kafka offset was accepted")
+    }
   }
 }
 

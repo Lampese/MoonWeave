@@ -22,6 +22,29 @@ async fn with_driver_store(f : async (DriverStore, String) -> Unit) -> Unit {
 }
 
 ///|
+async fn with_limited_driver_store(
+  maximum_events : Int,
+  f : async (DriverStore) -> Unit,
+) -> Unit {
+  let directory = @fs.tmpdir(prefix="moonweave-driver-limit")
+  let path = directory + "/driver.wal"
+  defer {
+    @fs.remove(path) catch {
+      _ => ()
+    }
+    @fs.remove(path + ".lock") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let store = DriverStore::open(path, maximum_events~)
+  defer store.close()
+  f(store)
+}
+
+///|
 fn driver_submission() -> JobSubmission raise ApiError {
   JobDefinition::new("driver-job", OperatorRef::reachability())
   .compile()
@@ -64,7 +87,7 @@ fn static_driver_submission(
 }
 
 ///|
-fn driver_event(sequence : Int) -> Event raise ApiError {
+fn driver_event(sequence : Int64) -> Event raise ApiError {
   Event::new(
     @causal.EventId::new("driver-source", sequence) catch {
       error => raise ApiError::InvalidEvent(@debug.to_string(error))
@@ -73,6 +96,24 @@ fn driver_event(sequence : Int) -> Event raise ApiError {
     "account-1",
     Json::object({ "source": Json::string("A"), "target": Json::string("B") }),
   )
+}
+
+///|
+async test "driver input rejects growth beyond the configured event budget" {
+  with_limited_driver_store(1, store => {
+    ignore(store.submit(driver_submission()))
+    ignore(store.input([driver_event(0L)]))
+    try store.input([driver_event(1L)]) catch {
+      ApiError::StateLimitExceeded(limit~, actual~) => {
+        assert_eq(limit, 1)
+        assert_eq(actual, 2)
+      }
+      _ => fail("expected Driver event budget rejection")
+    } noraise {
+      _ => fail("Driver accepted input beyond its event budget")
+    }
+    assert_eq(store.accepted_events(), 1L)
+  })
 }
 
 ///|

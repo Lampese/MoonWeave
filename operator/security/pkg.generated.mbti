@@ -23,6 +23,7 @@ pub struct Engine {
   mut log : @causal.CausalLog[SecurityEvent]
   state : SecurityState
 }
+pub fn Engine::alert_count(Self) -> Int
 pub fn Engine::alerts(Self) -> Array[SecurityAlert]
 pub fn Engine::apply(Self, @causal.Event[SecurityEvent]) -> Array[SecurityAlert] raise SecurityError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[SecurityAlert] raise SecurityError

@@ -6,6 +6,7 @@ pub(all) suberror OutputConsumerError {
   InvalidPartition(Int)
   InvalidEpoch(Int)
   InvalidBatchSize(Int)
+  InvalidCompactionLimit(Int)
   PathConflict
   IdentityMismatch
   MissingOutput(Int64)
@@ -27,6 +28,7 @@ pub struct TaskOutputConsumer {
   journal : Wal
   binding : OutputConsumerEntry
   operation_lock : @async.Mutex
+  compaction_record_limit : Int
   mut next_sequence : Int64
 }
 
@@ -38,6 +40,8 @@ pub async fn TaskOutputConsumer::open(
   task_id : String,
   partition : Int,
   epoch : Int,
+  maximum_bytes? : Int64,
+  compaction_record_limit? : Int = 256,
 ) -> TaskOutputConsumer raise OutputConsumerError {
   if checkpoint_path.is_empty() {
     raise OutputConsumerError::EmptyPath
@@ -57,6 +61,9 @@ pub async fn TaskOutputConsumer::open(
   if epoch < 0 {
     raise OutputConsumerError::InvalidEpoch(epoch)
   }
+  if compaction_record_limit <= 0 {
+    raise OutputConsumerError::InvalidCompactionLimit(compaction_record_limit)
+  }
   log.wal.check_writable() catch {
     error => raise OutputConsumerError::Source(OutputLogError::Wal(error))
   }
@@ -72,7 +79,7 @@ pub async fn TaskOutputConsumer::open(
     record: None,
     compacted: None,
   }
-  let (journal, replay) = Wal::open(checkpoint_path) catch {
+  let (journal, replay) = Wal::open(checkpoint_path, maximum_bytes?) catch {
     error => raise OutputConsumerError::Wal(error)
   }
   errdefer journal.close()
@@ -89,6 +96,7 @@ pub async fn TaskOutputConsumer::open(
     journal,
     binding,
     operation_lock: @async.Mutex::Mutex(),
+    compaction_record_limit,
     next_sequence,
   }
 }
@@ -129,6 +137,16 @@ pub fn TaskOutputConsumer::checkpoint_stats(
   self : TaskOutputConsumer,
 ) -> WalStats {
   self.journal.stats()
+}
+
+///|
+/// Number of checkpoint WAL records that triggers automatic compaction after
+/// an ACK. Compaction preserves the latest ACK proof and never deletes the
+/// source output log.
+pub fn TaskOutputConsumer::compaction_record_limit(
+  self : TaskOutputConsumer,
+) -> Int {
+  self.compaction_record_limit
 }
 
 ///|
@@ -199,6 +217,9 @@ async fn TaskOutputConsumer::commit_ack(
     },
   )
   self.next_sequence = record.sequence + 1L
+  if self.journal.stats().record_count() >= self.compaction_record_limit {
+    self.compact_unlocked()
+  }
 }
 
 ///|
@@ -221,13 +242,9 @@ pub async fn TaskOutputConsumer::ack(
 /// and latest output proof. Unacknowledged output is never discarded: the
 /// source TaskOutputLog remains the authoritative stream and the next cursor
 /// is recovered from the retained ACK.
-pub async fn TaskOutputConsumer::compact(
+async fn TaskOutputConsumer::compact_unlocked(
   self : TaskOutputConsumer,
 ) -> Unit raise OutputConsumerError {
-  if !self.operation_lock.try_acquire() {
-    raise OutputConsumerError::Busy
-  }
-  defer self.operation_lock.release()
   self.check_open()
   let compacted_binding = OutputConsumerEntry::{
     ..self.binding,
@@ -254,6 +271,20 @@ pub async fn TaskOutputConsumer::compact(
   self.journal.rewrite(entries[:]) catch {
     error => raise OutputConsumerError::Wal(error)
   }
+}
+
+///|
+/// Compact an acknowledged consumer checkpoint while preserving its binding
+/// and latest output proof. Unacknowledged output is never discarded: the
+/// source TaskOutputLog remains authoritative.
+pub async fn TaskOutputConsumer::compact(
+  self : TaskOutputConsumer,
+) -> Unit raise OutputConsumerError {
+  if !self.operation_lock.try_acquire() {
+    raise OutputConsumerError::Busy
+  }
+  defer self.operation_lock.release()
+  self.compact_unlocked()
 }
 
 ///|

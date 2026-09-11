@@ -7,6 +7,7 @@ import {
   "moonbitlang/async/socket",
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
+  "moonbitlang/core/set",
   "moonweave/moonweave/causal",
   "moonweave/moonweave/operator/aggregation",
   "moonweave/moonweave/operator/reachability",
@@ -49,6 +50,7 @@ pub(all) suberror ApiError {
   RequestConflict(String)
   InvalidDriverCommand(String)
   DriverClosed
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   TaskFailed(String)
   Source(String)
   Sink(String)
@@ -69,13 +71,16 @@ pub struct ClusterConfig {
   cluster_id : String
   coordinator_id : String
   storage_dir : String
+  storage_budget_bytes : Int64
   kafka_runtime : KafkaRuntimeConfig?
 }
 pub fn ClusterConfig::cluster_id(Self) -> String
 pub fn ClusterConfig::coordinator_id(Self) -> String
 pub fn ClusterConfig::new(String, String, String) -> Self raise ApiError
+pub fn ClusterConfig::storage_budget_bytes(Self) -> Int64
 pub fn ClusterConfig::storage_dir(Self) -> String
 pub fn ClusterConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
+pub fn ClusterConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 
 pub(all) struct ClusterRunSummary {
   plan_digest : String
@@ -161,6 +166,7 @@ pub struct CoordinatorNodeConfig {
   bind : NodeEndpoint
   advertised : NodeEndpoint?
   storage_dir : String
+  storage_budget_bytes : Int64
   workers : Array[WorkerSlot]
   migration_required : Bool
   auth_token : String?
@@ -173,11 +179,13 @@ pub fn CoordinatorNodeConfig::cluster_id(Self) -> String
 pub fn CoordinatorNodeConfig::coordinator_id(Self) -> String
 pub fn CoordinatorNodeConfig::migration_required(Self) -> Bool
 pub fn CoordinatorNodeConfig::new(String, String, NodeEndpoint, String, ArrayView[WorkerSlot]) -> Self raise ApiError
+pub fn CoordinatorNodeConfig::storage_budget_bytes(Self) -> Int64
 pub fn CoordinatorNodeConfig::storage_dir(Self) -> String
 pub fn CoordinatorNodeConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
 pub fn CoordinatorNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn CoordinatorNodeConfig::with_migration_required(Self, required? : Bool) -> Self
+pub fn CoordinatorNodeConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::workers(Self) -> ArrayView[WorkerSlot]
 
 pub(all) struct CoordinatorNodeSummary {
@@ -304,7 +312,8 @@ pub struct DriverStore {
   mut accepted_events : Int64
   mut failure : String?
   inputs : Array[Event]
-  event_index : Map[@causal.EventId, Event]
+  mut event_index : Map[@causal.EventId, Event]
+  maximum_events : Int
   write_lock : @moonbitlang/async.Mutex
 }
 pub fn DriverStore::accepted_events(Self) -> Int64
@@ -315,7 +324,7 @@ pub async fn DriverStore::drain(Self) -> JobRunStatus raise ApiError
 pub async fn DriverStore::handle(Self, JobCommand) -> Result[JobRunStatus, String]
 pub async fn DriverStore::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
 pub fn DriverStore::inputs(Self) -> Array[Event] raise ApiError
-pub async fn DriverStore::open(String, registry? : OperatorRegistry) -> Self raise ApiError
+pub async fn DriverStore::open(String, registry? : OperatorRegistry, maximum_bytes? : Int64, maximum_events? : Int) -> Self raise ApiError
 pub fn DriverStore::path(Self) -> String
 pub fn DriverStore::phase(Self) -> JobRunPhase
 pub fn DriverStore::stats(Self) -> @moonweave/moonweave/runtime/async.WalStats
@@ -509,23 +518,31 @@ pub struct KafkaSource {
   partition : Int
   mut committed_offset : Int64
   mut pending_next_offset : Int64?
+  committed_offsets : Map[Int, Int64]
+  mut pending_offsets : Map[Int, Int64]?
+  mut pending_partitions : @set.Set[Int]?
   mut closed : Bool
 }
 pub fn KafkaSource::close(Self) -> Unit
 pub async fn KafkaSource::commit(Self, Int64) -> Unit raise ApiError
+pub async fn KafkaSource::commit_offsets(Self, Map[Int, Int64]) -> Unit raise ApiError
 pub async fn KafkaSource::connect(group~ : @moonbitlang/async.TaskGroup[Unit], KafkaSourceConfig) -> Self raise ApiError
+pub fn KafkaSource::event_from_partitioned_record(Self, Int, @moonkafka.Record) -> Event raise ApiError
 pub fn KafkaSource::event_from_record(Self, @moonkafka.Record) -> Event raise ApiError
 pub fn KafkaSource::partition(Self) -> Int
 pub async fn KafkaSource::poll(Self, max_wait_ms? : Int) -> KafkaSourceBatch raise ApiError
 pub fn KafkaSource::position(Self) -> Int64?
+pub fn KafkaSource::positions(Self) -> Map[Int, Int64]
 pub fn KafkaSource::topic(Self) -> String
 
 pub(all) struct KafkaSourceBatch {
   events : Array[Event]
   next_offset : Int64
+  next_offsets : Map[Int, Int64]
 } derive(Eq, @debug.Debug)
 pub fn KafkaSourceBatch::events(Self) -> ArrayView[Event]
 pub fn KafkaSourceBatch::next_offset(Self) -> Int64
+pub fn KafkaSourceBatch::next_offsets(Self) -> Map[Int, Int64]
 
 pub struct KafkaSourceConfig {
   bootstrap_servers : Array[String]
@@ -538,9 +555,11 @@ pub struct KafkaSourceConfig {
   tls : @moonkafka.TlsClientOptions?
   max_poll_records : Int
 }
+pub fn KafkaSourceConfig::all_partitions(Self) -> Bool
 pub fn KafkaSourceConfig::bootstrap_servers(Self) -> ArrayView[String]
 pub fn KafkaSourceConfig::group_id(Self) -> String
 pub fn KafkaSourceConfig::new(Array[String], String, String, Int) -> Self raise ApiError
+pub fn KafkaSourceConfig::new_all(Array[String], String, String) -> Self raise ApiError
 pub fn KafkaSourceConfig::partition(Self) -> Int
 pub fn KafkaSourceConfig::sasl(Self) -> @moonkafka.SaslConfig?
 pub fn KafkaSourceConfig::security_protocol(Self) -> @moonkafka.SecurityProtocol
@@ -560,10 +579,12 @@ pub(all) struct KafkaSourceSpec {
   credential_ref : String?
   max_poll_records : Int
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn KafkaSourceSpec::all_partitions(Self) -> Bool
 pub fn KafkaSourceSpec::bootstrap_servers(Self) -> ArrayView[String]
 pub fn KafkaSourceSpec::credential_ref(Self) -> String?
 pub fn KafkaSourceSpec::group_id(Self) -> String
 pub fn KafkaSourceSpec::new(Array[String], String, String, Int) -> Self raise ApiError
+pub fn KafkaSourceSpec::new_all(Array[String], String, String) -> Self raise ApiError
 pub fn KafkaSourceSpec::partition(Self) -> Int
 pub fn KafkaSourceSpec::security_protocol(Self) -> KafkaSecurityProtocol
 pub fn KafkaSourceSpec::topic(Self) -> String
@@ -949,6 +970,7 @@ pub struct WorkerNodeConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  storage_budget_bytes : Int64
   partition : Int
   epoch : Int
   start_offset : Int64
@@ -967,10 +989,12 @@ pub fn WorkerNodeConfig::new_auto(String, String, NodeEndpoint, String, String, 
 pub fn WorkerNodeConfig::new_auto_for_partition(String, String, NodeEndpoint, String, String, String, Int) -> Self raise ApiError
 pub fn WorkerNodeConfig::partition(Self) -> Int
 pub fn WorkerNodeConfig::start_offset(Self) -> Int64
+pub fn WorkerNodeConfig::storage_budget_bytes(Self) -> Int64
 pub fn WorkerNodeConfig::storage_dir(Self) -> String
 pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn WorkerNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
+pub fn WorkerNodeConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::worker_id(Self) -> String
 
 pub struct WorkerNodeSetConfig {
@@ -980,6 +1004,7 @@ pub struct WorkerNodeSetConfig {
   worker_id : String
   incarnation : String
   storage_dir : String
+  storage_budget_bytes : Int64
   partitions : Array[Int]?
   auth_token : String?
   kafka_runtime : KafkaRuntimeConfig?
@@ -991,10 +1016,12 @@ pub fn WorkerNodeSetConfig::coordinator_id(Self) -> String
 pub fn WorkerNodeSetConfig::incarnation(Self) -> String
 pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::partitions(Self) -> ArrayView[Int]
+pub fn WorkerNodeSetConfig::storage_budget_bytes(Self) -> Int64
 pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
 pub fn WorkerNodeSetConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn WorkerNodeSetConfig::with_partitions(Self, ArrayView[Int]) -> Self raise ApiError
+pub fn WorkerNodeSetConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::worker_id(Self) -> String
 
 pub(all) struct WorkerNodeSetSummary {

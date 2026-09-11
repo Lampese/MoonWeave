@@ -301,7 +301,10 @@ pub async fn recover_worker_leases(
   }
   defer job.supervisor_lock.release()
   let path = reconciliation_sidecar_path(coordinator, job, reconcile_path)
-  let log = ReconciliationLog::open(path)
+  let log = ReconciliationLog::open(
+    path,
+    maximum_bytes=coordinator.journal.maximum_bytes(),
+  )
   defer log.close()
   job.write_lock.acquire() catch {
     error =>

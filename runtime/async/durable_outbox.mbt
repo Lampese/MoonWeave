@@ -3,8 +3,11 @@
 pub(all) suberror DurableOutboxError {
   EmptyPath
   InvalidCapacity(Int)
+  InvalidAckedLimit(Int)
+  InvalidCompactionLimit(Int)
   Closed
   Full(Int)
+  AckRetentionLimitExceeded(limit~ : Int, actual~ : Int)
   UnknownDelta(String)
   IdentityConflict(String)
   Malformed
@@ -19,6 +22,8 @@ pub(all) suberror DurableOutboxError {
 pub struct DurableExchangeOutbox {
   wal : Wal
   capacity : Int
+  maximum_acked : Int
+  compaction_record_limit : Int
   pending : Array[@protocol.DeltaBatch]
   known : Map[String, @protocol.DeltaBatch]
   acked : Set[String]
@@ -40,6 +45,9 @@ async fn durable_outbox_sleep() -> Unit raise DurableOutboxError {
 pub async fn DurableExchangeOutbox::open(
   path : String,
   capacity : Int,
+  maximum_bytes? : Int64,
+  maximum_acked? : Int = 100000,
+  compaction_record_limit? : Int = 256,
 ) -> DurableExchangeOutbox raise DurableOutboxError {
   if path.is_empty() {
     raise DurableOutboxError::EmptyPath
@@ -47,7 +55,13 @@ pub async fn DurableExchangeOutbox::open(
   if capacity <= 0 {
     raise DurableOutboxError::InvalidCapacity(capacity)
   }
-  let (wal, replay) = Wal::open(path) catch {
+  if maximum_acked <= 0 {
+    raise DurableOutboxError::InvalidAckedLimit(maximum_acked)
+  }
+  if compaction_record_limit <= 0 {
+    raise DurableOutboxError::InvalidCompactionLimit(compaction_record_limit)
+  }
+  let (wal, replay) = Wal::open(path, maximum_bytes?) catch {
     error => raise DurableOutboxError::Wal(error)
   }
   errdefer wal.close()
@@ -67,9 +81,17 @@ pub async fn DurableExchangeOutbox::open(
     }
     apply_durable_outbox_entry(pending, known, known_digests, acked, entry)
   }
+  if acked.length() > maximum_acked {
+    raise DurableOutboxError::AckRetentionLimitExceeded(
+      limit=maximum_acked,
+      actual=acked.length(),
+    )
+  }
   {
     wal,
     capacity,
+    maximum_acked,
+    compaction_record_limit,
     pending,
     known,
     known_digests,
@@ -82,8 +104,28 @@ pub async fn DurableExchangeOutbox::open(
 }
 
 ///|
+/// Number of WAL records that triggers automatic physical compaction after an
+/// ACK. Compaction preserves acknowledged identities; only an explicit
+/// upstream retention barrier may release their duplicate-suppression state.
+pub fn DurableExchangeOutbox::compaction_record_limit(
+  self : DurableExchangeOutbox,
+) -> Int {
+  self.compaction_record_limit
+}
+
+///|
 pub fn DurableExchangeOutbox::capacity(self : DurableExchangeOutbox) -> Int {
   self.capacity
+}
+
+///|
+/// Maximum number of acknowledged identities retained for exact duplicate
+/// suppression. A caller must retire entries only after the corresponding
+/// upstream retention barrier has crossed.
+pub fn DurableExchangeOutbox::maximum_acked(
+  self : DurableExchangeOutbox,
+) -> Int {
+  self.maximum_acked
 }
 
 ///|
@@ -297,6 +339,12 @@ pub async fn DurableExchangeOutbox::ack(
   guard self.known.contains(delta_id) else {
     raise DurableOutboxError::UnknownDelta(delta_id)
   }
+  if self.acked.length() >= self.maximum_acked {
+    raise DurableOutboxError::AckRetentionLimitExceeded(
+      limit=self.maximum_acked,
+      actual=self.acked.length() + 1,
+    )
+  }
   self.append_entry(durable_ack_entry(delta_id))
   self.acked.add(delta_id)
   self.known.remove(delta_id)
@@ -308,6 +356,43 @@ pub async fn DurableExchangeOutbox::ack(
       break
     }
     index += 1
+  }
+  if self.wal.stats().record_count() >= self.compaction_record_limit {
+    self.compact_unlocked()
+  }
+}
+
+///|
+/// Retire acknowledged identities only after the upstream retention barrier
+/// proves that no retry of these deltas can still arrive. This is the only
+/// operation that releases exact duplicate-suppression state. Retiring an
+/// identity is durable and intentionally permits a later retransmission to be
+/// treated as a new delta; callers must therefore derive the list from the
+/// same source/checkpoint barrier used for source-log compaction.
+pub async fn DurableExchangeOutbox::retire_acked(
+  self : DurableExchangeOutbox,
+  delta_ids : ArrayView[String],
+) -> Unit raise DurableOutboxError {
+  self.write_lock.acquire() catch {
+    error => raise DurableOutboxError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  if self.disposed {
+    raise DurableOutboxError::Closed
+  }
+  let seen : Set[String] = Set([])
+  for delta_id in delta_ids {
+    if delta_id.is_empty() || !seen.add_and_check(delta_id) {
+      raise DurableOutboxError::Malformed
+    }
+    if !self.acked.contains(delta_id) {
+      raise DurableOutboxError::UnknownDelta(delta_id)
+    }
+  }
+  for delta_id in delta_ids {
+    self.append_entry(durable_retire_entry(delta_id))
+    self.acked.remove(delta_id)
+    self.known_digests.remove(delta_id)
   }
 }
 
@@ -329,15 +414,12 @@ pub fn DurableExchangeOutbox::requeue_all(self : DurableExchangeOutbox) -> Unit 
 
 ///|
 /// Compact the outbox without losing duplicate suppression. Pending payloads
-/// remain as `put` records; acknowledged identities become small tombstones.
-/// Tombstones are retained indefinitely; this does not bound identity history.
-pub async fn DurableExchangeOutbox::compact(
+/// remain as `put` records; acknowledged identities become tombstones. ACK
+/// tombstones are retained indefinitely unless `retire_acked` has been called
+/// under an explicit upstream retention barrier.
+async fn DurableExchangeOutbox::compact_unlocked(
   self : DurableExchangeOutbox,
 ) -> Unit raise DurableOutboxError {
-  self.write_lock.acquire() catch {
-    error => raise DurableOutboxError::Io(@debug.to_string(error))
-  }
-  defer self.write_lock.release()
   if self.disposed {
     raise DurableOutboxError::Closed
   }
@@ -365,4 +447,18 @@ pub async fn DurableExchangeOutbox::compact(
   self.wal.rewrite(entries[:]) catch {
     error => raise DurableOutboxError::Wal(error)
   }
+}
+
+///|
+/// Compact the outbox without releasing acknowledged identities. Automatic
+/// compaction uses the same operation, while callers may invoke it to force a
+/// checkpoint before a controlled restart.
+pub async fn DurableExchangeOutbox::compact(
+  self : DurableExchangeOutbox,
+) -> Unit raise DurableOutboxError {
+  self.write_lock.acquire() catch {
+    error => raise DurableOutboxError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  self.compact_unlocked()
 }

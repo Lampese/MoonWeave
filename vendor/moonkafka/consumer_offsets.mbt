@@ -115,10 +115,19 @@ pub async fn Consumer::commit(
   )
   for attempt in 0..<=self.retries {
     let conn = self.group_coordinator_conn()
+    let generation_id = if self.member_active {
+      match self.member_kind {
+        Kip848Member => self.member_epoch
+        ClassicMember => self.generation_id
+      }
+    } else {
+      -1
+    }
+    let member_id = if self.member_active { self.member_id } else { "" }
     let results = conn.offset_commit(
       group_id,
-      -1, // generation / member epoch: group-less commit
-      "",
+      generation_id,
+      member_id,
       topics=[
         { name: self.topic, topic_id: self.topic_id, partitions: entries, },
       ],

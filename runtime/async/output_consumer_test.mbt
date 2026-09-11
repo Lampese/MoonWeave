@@ -287,6 +287,54 @@ async test "output consumer compaction keeps the latest proof and resumes" {
 }
 
 ///|
+async test "output consumer automatically compacts checkpoint WAL" {
+  with_output_consumer_directory <| directory => {
+    let output_path = directory + "/outputs.wal"
+    let checkpoint_path = directory + "/consumer.wal"
+    let log = TaskOutputLog::open(output_path)
+    defer log.close()
+    log.append("auto-task", 0, 0, 0L, [
+      consumer_output("B"),
+      consumer_output("C"),
+      consumer_output("D"),
+      consumer_output("E"),
+    ])
+    let consumer = TaskOutputConsumer::open(
+      log,
+      checkpoint_path,
+      "auto-sink",
+      "auto-task",
+      0,
+      0,
+      compaction_record_limit=4,
+    )
+    let records = consumer.read()
+    consumer.ack(records[0])
+    consumer.ack(records[1])
+    let before = @fs.read_file(checkpoint_path).binary().length()
+    consumer.ack(records[2])
+    let after = @fs.read_file(checkpoint_path).binary().length()
+    assert_true(after < before)
+    assert_eq(consumer.checkpoint_stats().record_count(), 2)
+    assert_eq(consumer.compaction_record_limit(), 4)
+    consumer.close()
+
+    let restored = TaskOutputConsumer::open(
+      log,
+      checkpoint_path,
+      "auto-sink",
+      "auto-task",
+      0,
+      0,
+      compaction_record_limit=4,
+    )
+    defer restored.close()
+    assert_eq(restored.next_sequence(), 3L)
+    assert_eq(restored.read().map(record => record.sequence()), [3L])
+  }
+}
+
+///|
 async test "empty output consumer compaction keeps a zero cursor" {
   with_output_consumer_directory <| directory => {
     let output_path = directory + "/outputs.wal"

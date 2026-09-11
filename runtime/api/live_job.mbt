@@ -57,6 +57,7 @@ async fn CoordinatorListener::open_source_backed_execution(
     self.config.coordinator_id,
     self.config.storage_dir + "/coordinator.wal",
     checkpoint_path=self.config.storage_dir + "/coordinator.json",
+    maximum_bytes=self.config.storage_budget_bytes,
   ) catch {
     error => raise live_execution_error("open Coordinator store", error)
   }
@@ -65,6 +66,7 @@ async fn CoordinatorListener::open_source_backed_execution(
     job.spec,
     self.config.storage_dir + "/job.wal",
     checkpoint_path=self.config.storage_dir + "/job.json",
+    maximum_bytes=self.config.storage_budget_bytes,
   ) catch {
     error => raise live_execution_error("open Job store", error)
   }
@@ -139,6 +141,7 @@ async fn CoordinatorListener::open_source_backed_execution(
     coordinator,
     job_store,
     required_capability=job.descriptor.capability(),
+    maximum_bytes=self.config.storage_budget_bytes,
   ) catch {
     error => raise live_execution_error("open source-backed execution", error)
   }
@@ -203,6 +206,7 @@ async fn CoordinatorListener::open_source_backed_execution(
           job.definition.job_id,
           job.definition.operator.id(),
           job.spec.partition_count(),
+          maximum_bytes=self.config.storage_budget_bytes,
         ) catch {
           error => raise live_execution_error("open output manifest", error)
         },
@@ -235,6 +239,15 @@ fn SourceBackedExecution::ensure_open(
 ///|
 fn SourceBackedExecution::event_count(self : SourceBackedExecution) -> Int {
   self.source.event_count()
+}
+
+///|
+async fn SourceBackedExecution::compact_completed_source(
+  self : SourceBackedExecution,
+) -> Unit raise ApiError {
+  self.source.compact_completed_source() catch {
+    error => raise live_execution_error("compact completed source", error)
+  }
 }
 
 ///|
@@ -315,8 +328,8 @@ async fn SourceBackedExecution::cancel(
 }
 
 ///|
-/// Poll one explicitly assigned Kafka partition until Driver drain closes
-/// ingress. A batch is committed to Kafka only after its events and refreshed
+/// Poll the Kafka consumer-group assignment until Driver drain closes ingress.
+/// A batch is committed per Kafka partition only after its events and refreshed
 /// delivery plans are durable in SourceLog/JobStore.
 async fn SourceBackedExecution::pump_kafka_source(
   self : SourceBackedExecution,
@@ -344,7 +357,7 @@ async fn SourceBackedExecution::pump_kafka_source(
         error => raise live_execution_error("persist Kafka source batch", error)
       }
     }
-    source.commit(batch.next_offset()) catch {
+    source.commit_offsets(batch.next_offsets()) catch {
       error => raise ApiError::Source(@debug.to_string(error))
     }
   }
@@ -621,6 +634,9 @@ async fn SourceBackedExecution::run_source_supervisor(
     }
     self.coordinator.checkpoint_and_compact() catch {
       error => raise live_execution_error("checkpoint live Coordinator", error)
+    }
+    self.job_store.compact_completed() catch {
+      error => raise live_execution_error("compact completed Job plans", error)
     }
     self.job_store.checkpoint_and_compact() catch {
       error => raise live_execution_error("checkpoint live Job", error)

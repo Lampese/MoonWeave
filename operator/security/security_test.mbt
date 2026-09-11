@@ -1,12 +1,12 @@
 ///|
-fn id(origin : String, sequence : Int) -> @causal.EventId raise {
+fn id(origin : String, sequence : Int64) -> @causal.EventId raise {
   @causal.EventId::new(origin, sequence)
 }
 
 ///|
 fn event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : Array[@causal.EventId],
   kind : String,
 ) -> @causal.Event[SecurityEvent] raise {

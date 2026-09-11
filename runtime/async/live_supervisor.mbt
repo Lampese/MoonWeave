@@ -65,11 +65,12 @@ pub async fn SourceBackedJob::open(
   coordinator : CoordinatorStore,
   job_store : JobStore,
   required_capability? : String,
+  maximum_bytes? : Int64,
 ) -> SourceBackedJob raise FrameIoError {
   if !same_job_spec(plan, job_store.snapshot()) {
     raise FrameIoError::Handler("live source topology does not match JobStore")
   }
-  let source = SourceLog::open(source_path) catch {
+  let source = SourceLog::open(source_path, maximum_bytes?) catch {
     error => raise FrameIoError::SourceLog(error)
   }
   {
@@ -146,6 +147,32 @@ pub async fn SourceBackedJob::cancel(
 ///|
 pub fn SourceBackedJob::event_count(self : SourceBackedJob) -> Int {
   self.source.event_count()
+}
+
+///|
+/// Retire the complete source prefix after all partitions have succeeded.
+/// JobStore's checkpoint is written first by the caller, so the source log no
+/// longer has a dependent replay plan. The logical offsets and retention
+/// markers remain durable while the physical event prefix and indexes go away.
+pub async fn SourceBackedJob::compact_completed_source(
+  self : SourceBackedJob,
+) -> Unit raise FrameIoError {
+  self.ingress_lock.acquire() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  defer self.ingress_lock.release()
+  if self.job_store.phase() != @control.JobPhase::Succeeded {
+    return
+  }
+  for partition in 0..<self.plan.partition_count() {
+    let retain_from = self.source.next_offset(partition).unwrap_or(0L)
+    let barrier = self.source.retention_barrier(partition, retain_from) catch {
+      error => raise FrameIoError::SourceLog(error)
+    }
+    self.source.compact(barrier) catch {
+      error => raise FrameIoError::SourceLog(error)
+    }
+  }
 }
 
 ///|

@@ -1,7 +1,7 @@
 ///|
 fn edge_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   source : String,
   target : String,
 ) -> @protocol.EventRecord raise {
@@ -19,7 +19,7 @@ fn edge_event(
 ///|
 fn security_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : ArrayView[@causal.EventId],
   kind : String,
 ) -> @protocol.EventRecord raise {
@@ -37,7 +37,7 @@ fn security_event(
 ///|
 fn sum_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   key : String,
   value : Int64,
 ) -> @protocol.EventRecord raise {

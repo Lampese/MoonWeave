@@ -27,7 +27,7 @@ pub fn CompiledJob::run_local(self : CompiledJob) -> LocalRun raise ApiError {
       partition,
       0,
       0L,
-      self.definition.max_state_events.unwrap_or(0),
+      self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
     )
     task_set.add(task) catch {
       error => raise ApiError::TaskFailed(@debug.to_string(error))

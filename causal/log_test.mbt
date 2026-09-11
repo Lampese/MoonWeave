@@ -1,7 +1,7 @@
 ///|
 fn id(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
 ) -> @causal.EventId raise @causal.CausalError {
   @causal.EventId::new(origin, sequence)
 }
@@ -9,7 +9,7 @@ fn id(
 ///|
 fn event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : Array[@causal.EventId],
   payload : String,
 ) -> @causal.Event[String] raise @causal.CausalError {
