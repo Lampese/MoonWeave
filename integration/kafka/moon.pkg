@@ -6,6 +6,8 @@ import {
   "moonweave/moonweave/causal",
   "daqing/moonkafka",
   "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/core/debug",
   "moonbitlang/core/env",
   "moonbitlang/core/encoding/utf8",
   "moonbitlang/core/json",

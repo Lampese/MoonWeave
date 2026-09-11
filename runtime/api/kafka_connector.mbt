@@ -609,6 +609,19 @@ pub fn KafkaSource::positions(self : KafkaSource) -> Map[Int, Int64] {
 }
 
 ///|
+/// Return the topic-partitions currently owned by the group member.
+pub fn KafkaSource::assignment(self : KafkaSource) -> Array[(String, Int)] {
+  self.consumer.assignment()
+}
+
+///|
+/// Return the last fatal group-membership error, if the background member
+/// loop stopped before an assignment was installed.
+pub fn KafkaSource::membership_error(self : KafkaSource) -> String? {
+  self.consumer.membership_error()
+}
+
+///|
 /// Decode one Kafka value containing the JSON form of a MoonWeave `Event`.
 /// The Kafka topic/partition/offset becomes the new stable EventId origin and
 /// sequence; the payload event supplies parents, key, and application data.
@@ -693,6 +706,23 @@ pub async fn KafkaSource::poll(
   } else {
     self.sync_group_assignments() catch {
       error => raise kafka_source_error("sync assignments", error)
+    }
+    // Group membership is established by a background Join/SyncGroup loop.
+    // Yield before polling when assignment has not arrived yet; otherwise a
+    // caller that polls in a tight loop can starve the membership task and
+    // keep the process at 100% CPU forever during startup or rebalance.
+    if self.consumer.assignment().is_empty() {
+      let delay_ms = if max_wait_ms < 10 {
+        Int::max(1, max_wait_ms)
+      } else {
+        10
+      }
+      @async_runtime.sleep(delay_ms) catch {
+        error => raise kafka_source_error("wait for assignment", error)
+      }
+      self.sync_group_assignments() catch {
+        error => raise kafka_source_error("sync assignments", error)
+      }
     }
     for partition, offset in self.committed_offsets {
       self.consumer.seek(partition, offset) catch {

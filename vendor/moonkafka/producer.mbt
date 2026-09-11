@@ -184,10 +184,26 @@ fn Producer::pick_partition(
   key : Bytes?,
   override_partition : Int?,
 ) -> PartitionInfo raise ProtocolError {
-  let index = self.router.pick(
-    self.partitions.length(),
-    key,
-    override_partition,
+  let index = match override_partition {
+    Some(partition) => find_partition(self.partitions, partition).index
+    None => self.router.pick(self.partitions.length(), key, None)
+  }
+  find_partition(self.partitions, index)
+}
+
+///|
+/// Resolve a Kafka partition number in metadata whose array order may be
+/// arbitrary. The broker identifies partitions by `index`, not array slot.
+fn find_partition(
+  partitions : Array[PartitionInfo],
+  index : Int,
+) -> PartitionInfo raise ProtocolError {
+  for info in partitions {
+    if info.index == index {
+      return info
+    }
+  }
+  raise ProtocolError::ProtocolError(
+    "partition \{index} is not present in topic metadata",
   )
-  self.partitions[index]
 }

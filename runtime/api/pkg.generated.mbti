@@ -524,12 +524,14 @@ pub struct KafkaSource {
   mut pending_partitions : @set.Set[Int]?
   mut closed : Bool
 }
+pub fn KafkaSource::assignment(Self) -> Array[(String, Int)]
 pub fn KafkaSource::close(Self) -> Unit
 pub async fn KafkaSource::commit(Self, Int64) -> Unit raise ApiError
 pub async fn KafkaSource::commit_offsets(Self, Map[Int, Int64]) -> Unit raise ApiError
 pub async fn KafkaSource::connect(group~ : @moonbitlang/async.TaskGroup[Unit], KafkaSourceConfig) -> Self raise ApiError
 pub fn KafkaSource::event_from_partitioned_record(Self, Int, @moonkafka.Record) -> Event raise ApiError
 pub fn KafkaSource::event_from_record(Self, @moonkafka.Record) -> Event raise ApiError
+pub fn KafkaSource::membership_error(Self) -> String?
 pub fn KafkaSource::partition(Self) -> Int
 pub async fn KafkaSource::poll(Self, max_wait_ms? : Int) -> KafkaSourceBatch raise ApiError
 pub fn KafkaSource::position(Self) -> Int64?
