@@ -1,7 +1,7 @@
 ///|
 fn set_edge_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   source : String,
   target : String,
 ) -> @protocol.EventRecord raise {

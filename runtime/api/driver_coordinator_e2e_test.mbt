@@ -90,6 +90,17 @@ async test "DriverCoordinator executes a submitted Job with a waiting Worker" {
       assert_eq(worker_summary.live_batches(), 1)
       assert_eq(worker_summary.state_events(), 1)
       assert_eq(worker_summary.pending_events(), 0)
+      let restored_driver = DriverStore::open(coordinator_dir + "/driver.wal")
+      assert_eq(restored_driver.phase(), JobRunPhase::Succeeded)
+      assert_eq(restored_driver.accepted_events(), 1L)
+      assert_eq(restored_driver.inputs(), [])
+      restored_driver.close()
+      let restored_source = @runtime.SourceLog::open(
+        coordinator_dir + "/source.wal",
+      )
+      assert_eq(restored_source.event_count(), 0)
+      assert_eq(restored_source.next_offset(0), Some(1L))
+      restored_source.close()
     }
   })
 }

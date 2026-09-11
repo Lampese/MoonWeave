@@ -507,7 +507,10 @@ pub fn EventBatch::new(
   if events.is_empty() {
     raise ProtocolError::EmptyBatch
   }
-  if partition < 0 || epoch < 0 || first_offset < 0L {
+  if partition < 0 ||
+    epoch < 0 ||
+    first_offset < 0L ||
+    events.length().to_int64() > 9223372036854775807L - first_offset {
     raise ProtocolError::InvalidBatchOffset
   }
   { partition, epoch, first_offset, events, }

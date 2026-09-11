@@ -881,6 +881,7 @@ pub async fn JobOutputManifest::open(
   job_id : String,
   operator_id : String,
   partition_count : Int,
+  maximum_bytes? : Int64,
 ) -> JobOutputManifest raise JobOutputManifestError {
   if path.is_empty() {
     raise JobOutputManifestError::EmptyPath
@@ -894,7 +895,7 @@ pub async fn JobOutputManifest::open(
   if partition_count <= 0 {
     raise JobOutputManifestError::InvalidPartitionCount(partition_count)
   }
-  let (wal, replay) = Wal::open(path) catch {
+  let (wal, replay) = Wal::open(path, maximum_bytes?) catch {
     error => raise JobOutputManifestError::Wal(error)
   }
   errdefer wal.close()
@@ -946,6 +947,7 @@ pub async fn JobOutputManifest::open(
 pub async fn JobOutputManifest::open_for_job(
   path : String,
   job : JobStore,
+  maximum_bytes? : Int64,
 ) -> JobOutputManifest raise JobOutputManifestError {
   let snapshot = job.snapshot()
   JobOutputManifest::open(
@@ -953,6 +955,7 @@ pub async fn JobOutputManifest::open_for_job(
     snapshot.job_id(),
     snapshot.operator_id(),
     snapshot.partition_count(),
+    maximum_bytes?,
   )
 }
 

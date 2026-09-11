@@ -9,3 +9,4 @@ target
 # Keep documentation local until it is ready for publication.
 *.md
 docs/
+!PRODUCTION_READINESS.md

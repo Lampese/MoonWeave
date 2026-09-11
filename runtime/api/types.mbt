@@ -30,6 +30,7 @@ pub(all) suberror ApiError {
   RequestConflict(String)
   InvalidDriverCommand(String)
   DriverClosed
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   TaskFailed(String)
   Source(String)
   Sink(String)
@@ -62,8 +63,10 @@ pub fn SourceSpec::json_lines(path : String) -> SourceSpec raise ApiError {
 }
 
 ///|
-/// Read complete MoonWeave `Event` values from one explicitly assigned Kafka
-/// partition. Credentials are injected at execution time.
+/// Read complete MoonWeave `Event` values from Kafka. A source partition of
+/// `-1` follows consumer-group assignment across all topic partitions;
+/// non-negative values keep an explicit partition. Credentials are injected
+/// at execution time.
 pub fn SourceSpec::kafka(config : KafkaSourceSpec) -> SourceSpec {
   SourceSpec::Kafka(config)
 }
@@ -748,8 +751,20 @@ pub struct ClusterConfig {
   cluster_id : String
   coordinator_id : String
   storage_dir : String
+  storage_budget_bytes : Int64
   kafka_runtime : KafkaRuntimeConfig?
 }
+
+///|
+/// Default per-WAL physical budget. A deployment can override this per
+/// process; zero is reserved for explicitly unbounded development runs.
+const DEFAULT_STORAGE_BUDGET_BYTES : Int64 = 256L * 1024L * 1024L
+
+///|
+/// A production runner must not silently create an unbounded in-memory Task.
+/// The explicit JobDefinition limit still overrides this conservative default;
+/// zero/unset remains available to direct in-memory Task tests and experiments.
+const DEFAULT_RUNTIME_STATE_LIMIT : Int = 100000
 
 ///|
 pub fn ClusterConfig::new(
@@ -763,7 +778,13 @@ pub fn ClusterConfig::new(
   if storage_dir.is_empty() {
     raise ApiError::Cluster("storage directory is required")
   }
-  { cluster_id, coordinator_id, storage_dir, kafka_runtime: None, }
+  {
+    cluster_id,
+    coordinator_id,
+    storage_dir,
+    storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
+    kafka_runtime: None,
+  }
 }
 
 ///|
@@ -779,6 +800,24 @@ pub fn ClusterConfig::coordinator_id(self : ClusterConfig) -> String {
 ///|
 pub fn ClusterConfig::storage_dir(self : ClusterConfig) -> String {
   self.storage_dir
+}
+
+///|
+/// Set the physical budget applied to every WAL opened by this local runner.
+/// A zero value disables the guard and is intended only for development.
+pub fn ClusterConfig::with_storage_budget(
+  self : ClusterConfig,
+  maximum_bytes : Int64,
+) -> ClusterConfig raise ApiError {
+  if maximum_bytes < 0L {
+    raise ApiError::Cluster("storage budget cannot be negative")
+  }
+  { ..self, storage_budget_bytes: maximum_bytes, }
+}
+
+///|
+pub fn ClusterConfig::storage_budget_bytes(self : ClusterConfig) -> Int64 {
+  self.storage_budget_bytes
 }
 
 ///|

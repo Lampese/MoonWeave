@@ -305,7 +305,8 @@ pub fn WorkerSession::accept_frame(
           ),
         )
       }
-      if first > self.last_received_offset + 1L {
+      if self.last_received_offset == 9223372036854775807L ||
+        first > self.last_received_offset + 1L {
         raise SessionError::Frame(ProtocolError::InvalidOffset(first))
       }
       if first <= self.last_received_offset && end > self.last_received_offset {

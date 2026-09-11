@@ -14,7 +14,7 @@ async fn create_topic(
   let result = admin.create_topics([
     {
       name: topic,
-      num_partitions: 1,
+      num_partitions: 3,
       replication_factor: 1,
       assignments: [],
       configs: [],
@@ -27,7 +27,11 @@ async fn create_topic(
 
 ///|
 fn input_event(index : Int) -> @api.Event raise {
-  @api.Event::keyed_sum(@causal.EventId::new("producer", index), "account", 1L)
+  @api.Event::keyed_sum(
+    @causal.EventId::new("producer", index.to_int64()),
+    "account",
+    1L,
+  )
 }
 
 ///|
@@ -50,45 +54,58 @@ async fn check_source(
       handles.push(
         producer.send_handle(
           value=@utf8.encode(@json.to_json(input_event(index)).stringify()),
-          partition=0,
+          partition=index % 3,
         ),
       )
     }
     for index, handle in handles {
       assert_eq(handle.await(), index.to_int64())
     }
-    println("Produced one six-record batch")
+    println("Produced six records across three partitions")
   }
-  let config = @api.KafkaSourceConfig::new([brokers], topic, "source-group", 0).with_max_poll_records(
+  let config = @api.KafkaSourceConfig::new_all([brokers], topic, "source-group").with_max_poll_records(
     1,
   )
   let source = @api.KafkaSource::connect(group~, config)
   defer source.close()
   if produce {
-    for index in 0..<6 {
-      let batch = @async.with_timeout(10000, () => {
-        for ;; {
-          let batch = source.poll(max_wait_ms=100)
-          if !batch.events().is_empty() {
-            return batch
-          }
-        }
-      })
-      assert_eq(batch.events().length(), 1)
-      assert_eq(
-        batch.events()[0].id(),
-        @causal.EventId::new("kafka/" + topic + "/0", index),
-      )
-      assert_eq(batch.next_offset(), index.to_int64() + 1L)
-      let replay = source.poll(max_wait_ms=100)
-      assert_eq(replay, batch)
-      source.commit(batch.next_offset())
+    let seen : Array[@api.Event] = []
+    while seen.length() < 6 {
+      let batch = source.poll(max_wait_ms=100)
+      for event in batch.events() {
+        seen.push(event)
+      }
+      if !batch.events().is_empty() {
+        source.commit_offsets(batch.next_offsets())
+      }
     }
-    println("PASS: batched source, retry and committed offset")
+    for index in 0..<6 {
+      let partition = index % 3
+      let offset = (index / 3).to_int64()
+      assert_true(
+        seen.any(event => {
+          event.id() ==
+          @causal.EventId::new(
+            "kafka/" + topic + "/" + partition.to_string(),
+            offset,
+          )
+        }),
+      )
+    }
+    println("PASS: multi-partition source, per-partition commit and recovery")
   } else {
-    assert_eq(source.position(), Some(6L))
-    assert_true(source.poll(max_wait_ms=100).events().is_empty())
-    println("PASS: committed offset survived broker restart")
+    let positions = @async.with_timeout(10000, () => {
+      for ;; {
+        let batch = source.poll(max_wait_ms=100)
+        if batch.next_offsets().length() == 3 {
+          return batch.next_offsets()
+        }
+      }
+    })
+    assert_eq(positions.get(0), Some(2L))
+    assert_eq(positions.get(1), Some(2L))
+    assert_eq(positions.get(2), Some(2L))
+    println("PASS: per-partition committed offsets survived broker restart")
   }
 }
 

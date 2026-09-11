@@ -70,6 +70,7 @@ pub fn Engine::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCe
 pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
 pub fn Engine::events(Self) -> Array[@causal.Event[Edge]]
+pub fn Engine::fact_count(Self) -> Int
 pub fn Engine::facts(Self) -> Array[Reachable]
 pub fn Engine::frontier(Self) -> @causal.Frontier
 pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError

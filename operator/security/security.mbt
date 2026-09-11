@@ -193,6 +193,12 @@ pub fn Engine::alerts(self : Engine) -> Array[SecurityAlert] {
 }
 
 ///|
+/// Count retained security alerts without materializing a copy.
+pub fn Engine::alert_count(self : Engine) -> Int {
+  self.state.alerts.length()
+}
+
+///|
 pub fn Engine::apply(
   self : Engine,
   event : @causal.Event[SecurityEvent],

@@ -79,7 +79,7 @@ pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorSt
 
 pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int, auth_token? : String) -> WorkerRunSummary raise FrameIoError
 
-pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
 
@@ -101,6 +101,18 @@ pub(all) suberror CheckpointError {
   Io(String)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror CoordinatorHaError {
+  InvalidReplicaCount(Int)
+  InvalidQuorum(Int)
+  EmptyReplicaId
+  DuplicateReplica(String)
+  DuplicatePath(String)
+  NoQuorum(required~ : Int, available~ : Int)
+  Closed
+  Replica(index~ : Int, reason~ : String)
+  Store(CoordinatorStoreError)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror CoordinatorStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
@@ -115,8 +127,11 @@ pub(all) suberror CoordinatorStoreError {
 pub(all) suberror DurableOutboxError {
   EmptyPath
   InvalidCapacity(Int)
+  InvalidAckedLimit(Int)
+  InvalidCompactionLimit(Int)
   Closed
   Full(Int)
+  AckRetentionLimitExceeded(limit~ : Int, actual~ : Int)
   UnknownDelta(String)
   IdentityConflict(String)
   Malformed
@@ -289,6 +304,8 @@ pub(all) suberror SourceLogError {
   DuplicateOutbox(Int)
   MissingOutbox(Int)
   ClosedOutbox(Int)
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
+  OffsetRetired(partition~ : Int, offset~ : Int64)
   OffsetGap(expected~ : Int64, actual~ : Int64)
   IdentityConflict(@causal.EventId)
   Malformed
@@ -315,7 +332,9 @@ pub(all) suberror SupervisorPlanError {
 pub(all) suberror WalError {
   EmptyPath
   InvalidMaximumRecordBytes(Int)
+  InvalidMaximumBytes(Int64)
   RecordTooLarge(actual~ : Int, limit~ : Int)
+  CapacityExceeded(limit~ : Int64, actual~ : Int64)
   InvalidRecordLength(position~ : Int64)
   CorruptMagic(position~ : Int64)
   UnsupportedVersion(version~ : Int, position~ : Int64)
@@ -371,9 +390,53 @@ pub async fn Checkpoint::save(Self, String) -> Unit raise CheckpointError
 pub fn Checkpoint::state_schema(Self) -> String
 pub fn Checkpoint::wal_offset(Self) -> Int64
 
+pub struct CoordinatorHa {
+  cluster_id : String
+  coordinator_id : String
+  configs : Array[CoordinatorReplicaConfig]
+  stores : Array[CoordinatorStore]
+  active : Array[Bool]
+  quorum : Int
+  mut leader : Int
+  mut closed : Bool
+}
+pub async fn CoordinatorHa::assign(Self, Int, String, start_offset? : Int64) -> @control.PartitionAssignment raise CoordinatorHaError
+pub fn CoordinatorHa::available_replicas(Self) -> Int
+pub async fn CoordinatorHa::checkpoint(Self, compact? : Bool) -> Unit raise CoordinatorHaError
+pub fn CoordinatorHa::close(Self) -> Unit
+pub fn CoordinatorHa::cluster_id(Self) -> String
+pub fn CoordinatorHa::coordinator_id(Self) -> String
+pub fn CoordinatorHa::deactivate_replica(Self, Int) -> Unit raise CoordinatorHaError
+pub async fn CoordinatorHa::fence_and_reassign(Self, String, @protocol.Incarnation, String) -> Array[@control.PartitionAssignment] raise CoordinatorHaError
+pub fn CoordinatorHa::leader_id(Self) -> String raise CoordinatorHaError
+pub fn CoordinatorHa::leader_index(Self) -> Int raise CoordinatorHaError
+pub async fn CoordinatorHa::open(String, String, ArrayView[CoordinatorReplicaConfig], quorum? : Int, maximum_bytes? : Int64) -> Self raise CoordinatorHaError
+pub fn CoordinatorHa::quorum(Self) -> Int
+pub async fn CoordinatorHa::recover_replica(Self, Int, maximum_bytes? : Int64) -> Unit raise CoordinatorHaError
+pub async fn CoordinatorHa::register_worker(Self, String, @protocol.Incarnation, ArrayView[String]) -> @control.RegisterStatus raise CoordinatorHaError
+pub fn CoordinatorHa::snapshot(Self) -> @control.CoordinatorSnapshot raise CoordinatorHaError
+pub fn CoordinatorHa::statuses(Self) -> Array[CoordinatorReplicaStatus]
+
 type CoordinatorJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type CoordinatorJournalGenerationMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct CoordinatorReplicaConfig {
+  replica_id : String
+  journal_path : String
+  checkpoint_path : String?
+} derive(Eq, @debug.Debug)
+pub fn CoordinatorReplicaConfig::checkpoint_path(Self) -> String?
+pub fn CoordinatorReplicaConfig::journal_path(Self) -> String
+pub fn CoordinatorReplicaConfig::new(String, String, checkpoint_path? : String) -> Self raise CoordinatorHaError
+pub fn CoordinatorReplicaConfig::replica_id(Self) -> String
+
+pub(all) struct CoordinatorReplicaStatus {
+  replica_id : String
+  available : Bool
+} derive(Eq, @debug.Debug)
+pub fn CoordinatorReplicaStatus::available(Self) -> Bool
+pub fn CoordinatorReplicaStatus::replica_id(Self) -> String
 
 pub struct CoordinatorRunSummary {
   sent_batches : Int
@@ -389,7 +452,7 @@ pub fn CoordinatorRunSummary::sent_batches(Self) -> Int
 pub fn CoordinatorRunSummary::sent_deltas(Self) -> Int
 
 pub struct CoordinatorStore {
-  state : @control.CoordinatorState
+  mut state : @control.CoordinatorState
   journal_path : String
   checkpoint_path : String
   journal : Wal
@@ -408,13 +471,14 @@ pub fn CoordinatorStore::journal_generation(Self) -> Int64
 pub fn CoordinatorStore::journal_offset(Self) -> Int64
 pub fn CoordinatorStore::journal_path(Self) -> String
 pub async fn CoordinatorStore::mark_suspect(Self, String) -> Unit raise CoordinatorStoreError
-pub async fn CoordinatorStore::open(String, String, String, checkpoint_path? : String) -> Self raise CoordinatorStoreError
+pub async fn CoordinatorStore::open(String, String, String, checkpoint_path? : String, maximum_bytes? : Int64) -> Self raise CoordinatorStoreError
 pub async fn CoordinatorStore::reassign(Self, Int, String, start_offset? : Int64) -> @control.PartitionAssignment raise CoordinatorStoreError
 pub async fn CoordinatorStore::record_batch_sent(Self, Int, String, @protocol.Incarnation, Int, Int64, Int64) -> Int64 raise CoordinatorStoreError
 pub async fn CoordinatorStore::record_heartbeat(Self, String, @protocol.Incarnation, Int64) -> Unit raise CoordinatorStoreError
 pub async fn CoordinatorStore::record_progress(Self, Int, String, @protocol.Incarnation, Int, Int64, Int64) -> Unit raise CoordinatorStoreError
 pub async fn CoordinatorStore::record_resume(Self, Int, String, @protocol.Incarnation, Int, Int64) -> Unit raise CoordinatorStoreError
 pub async fn CoordinatorStore::register_worker(Self, String, @protocol.Incarnation, ArrayView[String]) -> @control.RegisterStatus raise CoordinatorStoreError
+pub async fn CoordinatorStore::replace_snapshot(Self, @control.CoordinatorSnapshot) -> Unit raise CoordinatorStoreError
 pub async fn CoordinatorStore::revoke(Self, Int) -> Unit raise CoordinatorStoreError
 pub async fn CoordinatorStore::set_suspect(Self, String) -> Unit raise CoordinatorStoreError
 pub fn CoordinatorStore::snapshot(Self) -> @control.CoordinatorSnapshot
@@ -426,6 +490,8 @@ type DeltaWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub struct DurableExchangeOutbox {
   wal : Wal
   capacity : Int
+  maximum_acked : Int
+  compaction_record_limit : Int
   pending : Array[@protocol.DeltaBatch]
   known : Map[String, @protocol.DeltaBatch]
   acked : @set.Set[String]
@@ -440,9 +506,11 @@ pub fn DurableExchangeOutbox::acked_count(Self) -> Int
 pub fn DurableExchangeOutbox::capacity(Self) -> Int
 pub fn DurableExchangeOutbox::close(Self) -> Unit
 pub async fn DurableExchangeOutbox::compact(Self) -> Unit raise DurableOutboxError
+pub fn DurableExchangeOutbox::compaction_record_limit(Self) -> Int
 pub fn DurableExchangeOutbox::inflight_count(Self) -> Int
 pub fn DurableExchangeOutbox::is_closed(Self) -> Bool
-pub async fn DurableExchangeOutbox::open(String, Int) -> Self raise DurableOutboxError
+pub fn DurableExchangeOutbox::maximum_acked(Self) -> Int
+pub async fn DurableExchangeOutbox::open(String, Int, maximum_bytes? : Int64, maximum_acked? : Int, compaction_record_limit? : Int) -> Self raise DurableOutboxError
 pub fn DurableExchangeOutbox::path(Self) -> String
 pub fn DurableExchangeOutbox::pending(Self) -> Array[@protocol.DeltaBatch]
 pub fn DurableExchangeOutbox::pending_count(Self) -> Int
@@ -450,6 +518,7 @@ pub async fn DurableExchangeOutbox::pop(Self) -> @protocol.DeltaBatch raise Dura
 pub async fn DurableExchangeOutbox::push(Self, @protocol.DeltaBatch) -> Unit raise DurableOutboxError
 pub fn DurableExchangeOutbox::requeue(Self, String) -> Unit
 pub fn DurableExchangeOutbox::requeue_all(Self) -> Unit
+pub async fn DurableExchangeOutbox::retire_acked(Self, ArrayView[String]) -> Unit raise DurableOutboxError
 pub fn DurableExchangeOutbox::seal(Self) -> Unit
 pub fn DurableExchangeOutbox::try_pop(Self) -> @protocol.DeltaBatch?
 pub async fn DurableExchangeOutbox::try_push(Self, @protocol.DeltaBatch) -> Bool raise DurableOutboxError
@@ -498,7 +567,7 @@ pub fn IngressRouter::close(Self) -> Unit
 pub async fn IngressRouter::dispatch(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
 pub async fn IngressRouter::dispatch_and_enqueue(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
 pub fn IngressRouter::durable_outbox(Self, Int) -> DurableExchangeOutbox?
-pub async fn IngressRouter::open(@plan.JobSpec, @control.CoordinatorState, String) -> Self raise SourceLogError
+pub async fn IngressRouter::open(@plan.JobSpec, @control.CoordinatorState, String, maximum_bytes? : Int64) -> Self raise SourceLogError
 pub fn IngressRouter::outbox(Self, Int) -> ExchangeOutbox?
 pub fn IngressRouter::register_durable_outbox(Self, Int, DurableExchangeOutbox) -> Unit raise SourceLogError
 pub fn IngressRouter::register_outbox(Self, Int, ExchangeOutbox) -> Unit raise SourceLogError
@@ -569,8 +638,8 @@ pub fn JobOutputManifest::frontier_digest(Self) -> String
 pub fn JobOutputManifest::is_complete(Self) -> Bool
 pub fn JobOutputManifest::is_fully_consumed(Self) -> Bool
 pub fn JobOutputManifest::job_id(Self) -> String
-pub async fn JobOutputManifest::open(String, String, String, Int) -> Self raise JobOutputManifestError
-pub async fn JobOutputManifest::open_for_job(String, JobStore) -> Self raise JobOutputManifestError
+pub async fn JobOutputManifest::open(String, String, String, Int, maximum_bytes? : Int64) -> Self raise JobOutputManifestError
+pub async fn JobOutputManifest::open_for_job(String, JobStore, maximum_bytes? : Int64) -> Self raise JobOutputManifestError
 pub fn JobOutputManifest::operator_id(Self) -> String
 pub fn JobOutputManifest::output_digest(Self) -> String
 pub fn JobOutputManifest::partition(Self, Int) -> JobOutputPartitionSummary?
@@ -662,7 +731,7 @@ pub struct JobStore {
   write_lock : @moonbitlang/async.Mutex
   mut journal_offset : Int64
   mut journal_generation : Int64
-  work_plans : Map[Int, JobExecutionPlan]
+  mut work_plans : Map[Int, JobExecutionPlan]
   supervisor_lock : @moonbitlang/async.Mutex
 }
 pub async fn JobStore::assign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
@@ -671,6 +740,7 @@ pub async fn JobStore::checkpoint(Self) -> Unit raise JobStoreError
 pub async fn JobStore::checkpoint_and_compact(Self) -> Unit raise JobStoreError
 pub fn JobStore::checkpoint_path(Self) -> String
 pub fn JobStore::close(Self) -> Unit
+pub async fn JobStore::compact_completed(Self) -> Unit raise JobStoreError
 pub async fn JobStore::drain(Self) -> Unit raise JobStoreError
 pub async fn JobStore::drain_partition(Self, Int, String, Int) -> Unit raise JobStoreError
 pub async fn JobStore::fail(Self, String) -> Unit raise JobStoreError
@@ -679,7 +749,7 @@ pub fn JobStore::job_id(Self) -> String
 pub fn JobStore::journal_generation(Self) -> Int64
 pub fn JobStore::journal_offset(Self) -> Int64
 pub fn JobStore::journal_path(Self) -> String
-pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String) -> Self raise JobStoreError
+pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String, maximum_bytes? : Int64) -> Self raise JobStoreError
 pub fn JobStore::phase(Self) -> @control.JobPhase
 pub async fn JobStore::reassign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
 pub async fn JobStore::reassign_many(Self, ArrayView[@control.JobReassignment]) -> Array[@control.JobPartition] raise JobStoreError
@@ -794,12 +864,13 @@ pub struct SourceBackedJob {
 }
 pub async fn SourceBackedJob::cancel(Self) -> Unit raise FrameIoError
 pub fn SourceBackedJob::close(Self) -> Unit
+pub async fn SourceBackedJob::compact_completed_source(Self) -> Unit raise FrameIoError
 pub fn SourceBackedJob::coordinator(Self) -> CoordinatorStore
 pub fn SourceBackedJob::event_count(Self) -> Int
 pub async fn SourceBackedJob::ingest(Self, @protocol.EventRecord) -> Int64 raise FrameIoError
 pub async fn SourceBackedJob::ingest_all(Self, ArrayView[@protocol.EventRecord]) -> Unit raise FrameIoError
 pub fn SourceBackedJob::job_store(Self) -> JobStore
-pub async fn SourceBackedJob::open(String, @plan.JobSpec, CoordinatorStore, JobStore, required_capability? : String) -> Self raise FrameIoError
+pub async fn SourceBackedJob::open(String, @plan.JobSpec, CoordinatorStore, JobStore, required_capability? : String, maximum_bytes? : Int64) -> Self raise FrameIoError
 pub fn SourceBackedJob::plan(Self) -> @plan.JobSpec
 pub async fn SourceBackedJob::refresh_work_plans(Self) -> Unit raise FrameIoError
 pub async fn SourceBackedJob::seal(Self) -> Unit raise FrameIoError
@@ -813,15 +884,37 @@ pub struct SourceLog {
   entries : Map[Int, Array[SourceEntry]]
   locations : Map[@causal.EventId, SourceLocation]
   next_offsets : Map[Int, Int64]
+  retention : Map[Int, SourceRetentionMarker]
+  maximum_entries : Int
   write_lock : @moonbitlang/async.Mutex
 }
 pub async fn SourceLog::append(Self, Int, Int64, @protocol.EventRecord) -> Int64 raise SourceLogError
 pub fn SourceLog::batches(Self, Int, Int, Int64, maximum_batch_events? : Int) -> Array[@protocol.EventBatch] raise SourceLogError
 pub fn SourceLog::close(Self) -> Unit
+pub async fn SourceLog::compact(Self, SourceRetentionBarrier) -> Unit raise SourceLogError
 pub fn SourceLog::contains(Self, @causal.EventId) -> Bool
 pub fn SourceLog::event_count(Self) -> Int
 pub fn SourceLog::next_offset(Self, Int) -> Int64?
-pub async fn SourceLog::open(String) -> Self raise SourceLogError
+pub async fn SourceLog::open(String, maximum_bytes? : Int64, maximum_entries? : Int) -> Self raise SourceLogError
+pub fn SourceLog::retention_barrier(Self, Int, Int64) -> SourceRetentionBarrier raise SourceLogError
+
+pub(all) struct SourceRetentionBarrier {
+  partition : Int
+  retain_from : Int64
+  covered_to : Int64
+  event_count : Int
+  event_digest : String
+  event_hash : UInt64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn SourceRetentionBarrier::covered_to(Self) -> Int64
+pub fn SourceRetentionBarrier::event_count(Self) -> Int
+pub fn SourceRetentionBarrier::event_digest(Self) -> String
+pub fn SourceRetentionBarrier::event_hash(Self) -> UInt64
+pub fn SourceRetentionBarrier::new(Int, Int64, Int64, Int, String, UInt64) -> Self raise SourceLogError
+pub fn SourceRetentionBarrier::partition(Self) -> Int
+pub fn SourceRetentionBarrier::retain_from(Self) -> Int64
+
+type SourceRetentionMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct SupervisorFailure {
   worker_id : String
@@ -883,7 +976,7 @@ pub async fn TaskOutputConsumer::consume(Self, async (TaskOutputRecord) -> Unit,
 pub fn TaskOutputConsumer::consumer_id(Self) -> String
 pub fn TaskOutputConsumer::epoch(Self) -> Int
 pub fn TaskOutputConsumer::next_sequence(Self) -> Int64
-pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int) -> Self raise OutputConsumerError
+pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int, maximum_bytes? : Int64) -> Self raise OutputConsumerError
 pub fn TaskOutputConsumer::partition(Self) -> Int
 pub fn TaskOutputConsumer::read(Self, maximum_records? : Int) -> Array[TaskOutputRecord] raise OutputConsumerError
 pub fn TaskOutputConsumer::task_id(Self) -> String
@@ -902,7 +995,7 @@ pub fn TaskOutputLog::close(Self) -> Unit
 pub async fn TaskOutputLog::compact(Self, TaskOutputRetentionBarrier) -> Unit raise OutputLogError
 pub fn TaskOutputLog::is_trimmed(Self, String, Int64) -> Bool
 pub fn TaskOutputLog::next_sequence(Self, String) -> Int64
-pub async fn TaskOutputLog::open(String) -> Self raise OutputLogError
+pub async fn TaskOutputLog::open(String, maximum_bytes? : Int64) -> Self raise OutputLogError
 pub fn TaskOutputLog::output_digest(Self, String) -> String
 pub fn TaskOutputLog::path(Self) -> String
 pub fn TaskOutputLog::records(Self) -> Array[TaskOutputRecord]
@@ -948,6 +1041,7 @@ pub struct Wal {
   mut file : @fs.File
   lock_file : @fs.File
   maximum_record_bytes : Int
+  maximum_bytes : Int64
   mut write_offset : Int64
   mut record_count : Int
   mut payload_bytes : Int64
@@ -957,11 +1051,14 @@ pub struct Wal {
   mut failed : Bool
 }
 pub async fn Wal::append(Self, Bytes) -> Int64 raise WalError
+pub async fn Wal::append_all(Self, ArrayView[Bytes]) -> Int64 raise WalError
 pub fn Wal::close(Self) -> Unit
 pub fn Wal::lifecycle(Self) -> WalLifecycle
+pub fn Wal::maximum_bytes(Self) -> Int64
 pub fn Wal::maximum_record_bytes(Self) -> Int
-pub async fn Wal::open(String, maximum_record_bytes? : Int) -> (Self, WalReplay) raise WalError
+pub async fn Wal::open(String, maximum_record_bytes? : Int, maximum_bytes? : Int64) -> (Self, WalReplay) raise WalError
 pub fn Wal::path(Self) -> String
+pub fn Wal::remaining_bytes(Self) -> Int64
 pub async fn Wal::rewrite(Self, ArrayView[Bytes]) -> Unit raise WalError
 pub fn Wal::stats(Self) -> WalStats
 pub fn Wal::write_offset(Self) -> Int64
@@ -1126,8 +1223,9 @@ pub struct WorkerTaskWork {
   output_delivery : (async (TaskOutputRecord) -> Unit)?
   output_consumer_checkpoint_prefix : String?
   output_consumer_id : String?
+  storage_budget_bytes : Int64?
 }
-pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String) -> Self
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64) -> Self
 pub fn WorkerTaskWork::partition(Self) -> Int
 pub fn WorkerTaskWork::task(Self) -> @task.Task
 pub fn WorkerTaskWork::task_id(Self) -> String

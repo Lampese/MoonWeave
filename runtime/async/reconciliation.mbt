@@ -242,11 +242,12 @@ fn install_reconciliation_entry(
 ///|
 async fn ReconciliationLog::open(
   path : String,
+  maximum_bytes? : Int64,
 ) -> ReconciliationLog raise ReconciliationError {
   if path.is_empty() {
     raise ReconciliationError::EmptyPath
   }
-  let (wal, replay) = Wal::open(path) catch {
+  let (wal, replay) = Wal::open(path, maximum_bytes?) catch {
     error => raise ReconciliationError::Wal(error)
   }
   errdefer wal.close()

@@ -1,7 +1,7 @@
 ///|
 fn edge_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : ArrayView[@causal.EventId],
   source : String,
   target : String,

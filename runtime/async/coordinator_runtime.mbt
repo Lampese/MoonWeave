@@ -61,6 +61,11 @@ fn validate_batch_plan(
         @protocol.ProtocolError::InvalidOffset(batch.first_offset()),
       )
     }
+    if batch.end_offset() == 9223372036854775807L {
+      raise FrameIoError::Protocol(
+        @protocol.ProtocolError::InvalidOffset(batch.end_offset()),
+      )
+    }
     expected = batch.end_offset() + 1L
   }
 }

@@ -12,7 +12,7 @@ import {
 // Errors
 pub(all) suberror CausalError {
   EmptyOrigin
-  NegativeSequence(Int)
+  NegativeSequence(Int64)
   EmptyKey
   SelfDependency(EventId)
   DuplicateParent(EventId)
@@ -64,11 +64,11 @@ pub fn[T] Event::payload(Self[T]) -> T
 
 pub struct EventId {
   origin : String
-  sequence : Int
+  sequence : Int64
 } derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
-pub fn EventId::new(String, Int) -> Self raise CausalError
+pub fn EventId::new(String, Int64) -> Self raise CausalError
 pub fn EventId::origin(Self) -> String
-pub fn EventId::sequence(Self) -> Int
+pub fn EventId::sequence(Self) -> Int64
 
 pub struct Frontier {
   ids : ReadOnlyArray[EventId]

@@ -40,6 +40,7 @@ pub fn Engine::event_count(Self) -> Int
 pub fn Engine::events(Self) -> Array[@causal.Event[Contribution]]
 pub fn Engine::frontier(Self) -> @causal.Frontier
 pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
+pub fn Engine::output_count(Self) -> Int
 pub fn Engine::outputs(Self) -> Array[KeyedSum]
 pub fn Engine::pending_count(Self) -> Int
 pub fn Engine::pending_events(Self) -> Array[@causal.Event[Contribution]]

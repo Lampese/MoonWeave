@@ -53,7 +53,7 @@ struct CoordinatorJournalGenerationMarker {
 /// Async durable wrapper around the synchronous Coordinator state machine.
 /// The lock file prevents two Coordinator processes from owning one journal.
 pub struct CoordinatorStore {
-  state : @control.CoordinatorState
+  mut state : @control.CoordinatorState
   journal_path : String
   checkpoint_path : String
   journal : Wal
@@ -395,7 +395,10 @@ async fn recover_coordinator_journal_candidate(
   if !candidate_exists {
     raise CoordinatorStoreError::InvalidJournalGeneration(expected_generation)
   }
-  let (candidate, candidate_replay) = Wal::open(candidate_path) catch {
+  let (candidate, candidate_replay) = Wal::open(
+    candidate_path,
+    maximum_bytes=journal.maximum_bytes(),
+  ) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   let candidate_generation = coordinator_replay_generation(candidate_replay)
@@ -419,6 +422,7 @@ pub async fn CoordinatorStore::open(
   coordinator_id : String,
   journal_path : String,
   checkpoint_path? : String,
+  maximum_bytes? : Int64,
 ) -> CoordinatorStore raise CoordinatorStoreError {
   if journal_path.is_empty() {
     raise CoordinatorStoreError::EmptyPath
@@ -433,7 +437,7 @@ pub async fn CoordinatorStore::open(
     Some(value) => value.journal_generation
     None => 0L
   }
-  let (journal, initial_replay) = Wal::open(journal_path) catch {
+  let (journal, initial_replay) = Wal::open(journal_path, maximum_bytes?) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   errdefer journal.close()
@@ -652,7 +656,10 @@ pub async fn CoordinatorStore::checkpoint_and_compact(
   let generation = self.journal_generation + 1L
   let marker = coordinator_generation_marker(generation)
   let candidate_path = self.journal_path + ".next"
-  let (candidate, _) = Wal::open(candidate_path) catch {
+  let (candidate, _) = Wal::open(
+    candidate_path,
+    maximum_bytes=self.journal.maximum_bytes(),
+  ) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   errdefer candidate.close()
@@ -681,6 +688,76 @@ pub async fn CoordinatorStore::checkpoint_and_compact(
   self.journal.rewrite([marker]) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
+  self.journal_generation = generation
+  self.journal_offset = self.journal.write_offset()
+  cleanup_coordinator_candidate(candidate_path)
+}
+
+///|
+/// Install an authoritative snapshot received from a Coordinator quorum
+/// peer. This uses the same staged generation protocol as local compaction, so
+/// a crash between checkpoint replacement and journal replacement is recovered
+/// by `CoordinatorStore::open`. It is intentionally a current-schema snapshot
+/// replacement; no compatibility or v2 migration layer is introduced.
+pub async fn CoordinatorStore::replace_snapshot(
+  self : CoordinatorStore,
+  snapshot : @control.CoordinatorSnapshot,
+) -> Unit raise CoordinatorStoreError {
+  self.write_lock.acquire() catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  self.journal.check_writable() catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  if snapshot.cluster_id != self.state.cluster_id ||
+    snapshot.coordinator_id != self.state.coordinator_id {
+    raise CoordinatorStoreError::Malformed
+  }
+  let state = @control.CoordinatorState::from_snapshot(snapshot) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+  if self.journal_generation == 9223372036854775807L {
+    raise CoordinatorStoreError::InvalidJournalGeneration(
+      self.journal_generation,
+    )
+  }
+  let generation = self.journal_generation + 1L
+  let marker = coordinator_generation_marker(generation)
+  let candidate_path = self.journal_path + ".next"
+  let (candidate, _) = Wal::open(
+    candidate_path,
+    maximum_bytes=self.journal.maximum_bytes(),
+  ) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  errdefer candidate.close()
+  candidate.rewrite([marker]) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  let candidate_offset = candidate.write_offset()
+  candidate.close()
+  let checkpoint = CoordinatorStoreCheckpoint::{
+    journal_offset: candidate_offset,
+    snapshot,
+    journal_generation: generation,
+  }
+  let temporary = self.checkpoint_path + ".tmp"
+  @fs.write_file(
+    temporary,
+    @utf8.encode(@json.to_json(checkpoint).stringify()),
+    create_mode=@fs.CreateOrTruncate,
+    sync=@fs.Full,
+  ) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  self.journal.rewrite([marker]) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  self.state = state
   self.journal_generation = generation
   self.journal_offset = self.journal.write_offset()
   cleanup_coordinator_candidate(candidate_path)

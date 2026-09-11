@@ -29,6 +29,7 @@ pub async fn run_worker_task(
   output_delivery? : async (TaskOutputRecord) -> Unit,
   output_consumer_checkpoint_prefix? : String,
   output_consumer_id? : String,
+  storage_budget_bytes? : Int64,
 ) -> WorkerRunSummary raise FrameIoError {
   let canonical_wal_path = wal_path
   if !dynamic_assignment {
@@ -251,7 +252,7 @@ pub async fn run_worker_task(
           None => ()
           Some(path) =>
             output_log = Some(
-              TaskOutputLog::open(path) catch {
+              TaskOutputLog::open(path, maximum_bytes?=storage_budget_bytes) catch {
                 error => {
                   task.fail()
                   raise FrameIoError::OutputLog(error)
@@ -287,6 +288,7 @@ pub async fn run_worker_task(
                 task.task_id(),
                 assignment.partition(),
                 assignment.epoch(),
+                maximum_bytes?=storage_budget_bytes,
               ) catch {
                 error => raise FrameIoError::Handler(@debug.to_string(error))
               },

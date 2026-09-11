@@ -9,6 +9,7 @@ test "Kafka connector configurations validate broker identity" {
   assert_eq(source.topic(), "events")
   assert_eq(source.group_id(), "moonweave-workers")
   assert_eq(source.partition(), 2)
+  assert_false(source.all_partitions())
   assert_eq(source.bootstrap_servers().to_owned(), ["broker-a:9092"])
   let bounded = source.with_max_poll_records(32)
   assert_eq(bounded.partition(), 2)
@@ -120,7 +121,7 @@ test "Kafka job specs reject invalid fields during compile" {
   } noraise {
     _ => fail("expected invalid Kafka group rejection")
   }
-  let invalid_partition = KafkaSourceSpec::{ ..source, partition: -1, }
+  let invalid_partition = KafkaSourceSpec::{ ..source, partition: -2, }
   try
     JobDefinition::new("invalid-kafka-partition", OperatorRef::keyed_sum())
     .with_source(SourceSpec::kafka(invalid_partition))
@@ -142,6 +143,24 @@ test "Kafka job specs reject invalid fields during compile" {
   } noraise {
     _ => fail("expected invalid Kafka poll limit rejection")
   }
+}
+
+///|
+test "Kafka source can follow all topic partitions" {
+  let source = KafkaSourceSpec::new_all(["broker-a:9092"], "events", "workers")
+  assert_true(source.all_partitions())
+  assert_eq(source.partition(), -1)
+  let config = KafkaSourceConfig::new_all(
+    ["broker-a:9092"],
+    "events",
+    "workers",
+  )
+  assert_true(config.all_partitions())
+  assert_eq(config.partition(), -1)
+  let compiled = JobDefinition::new("all-kafka", OperatorRef::keyed_sum())
+    .with_source(SourceSpec::kafka(source))
+    .compile()
+  assert_true(compiled.definition.source is SourceSpec::Kafka(_))
 }
 
 ///|

@@ -522,7 +522,8 @@ pub fn CoordinatorState::record_resume(
       actual=persisted_offset,
     )
   }
-  if persisted_offset >= assignment.next_offset() {
+  if persisted_offset >= assignment.next_offset() ||
+    persisted_offset == 9223372036854775807L {
     raise CoordinatorError::ProgressAheadOfSent
   }
   assignment.next_offset = persisted_offset + 1L
@@ -653,6 +654,9 @@ pub fn CoordinatorState::record_batch_sent(
       expected=assignment.next_offset(),
       actual=first_offset,
     )
+  }
+  if event_count > 9223372036854775807L - first_offset {
+    raise CoordinatorError::InvalidEventCount(event_count)
   }
   let end_offset = first_offset + event_count - 1L
   assignment.next_offset += event_count

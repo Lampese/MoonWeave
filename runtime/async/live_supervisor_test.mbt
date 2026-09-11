@@ -1,6 +1,6 @@
 ///|
 fn live_edge_event(
-  sequence : Int,
+  sequence : Int64,
   parents : ArrayView[@causal.EventId],
   source : String,
   target : String,
@@ -172,6 +172,13 @@ async test "live supervisor streams durable source input before drain" {
       @task.TaskOutput::Reachable(@reachability.Reachable::new("B", "C")),
     ])
     assert_eq(job_store.phase(), @control.JobPhase::Succeeded)
+    live.compact_completed_source()
+    assert_eq(live.event_count(), 0)
+    live.close()
+    let restored = SourceLog::open(source_path)
+    defer restored.close()
+    assert_eq(restored.event_count(), 0)
+    assert_eq(restored.next_offset(0), Some(2L))
   })
 }
 

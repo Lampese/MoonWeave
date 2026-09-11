@@ -219,7 +219,8 @@ fn load_wal_batches(
       }
       raise FrameIoError::Handler("WAL contains overlapping batches")
     }
-    if batch.first_offset() != last_offset + 1L {
+    if last_offset == 9223372036854775807L ||
+      batch.first_offset() != last_offset + 1L {
       raise FrameIoError::Handler("WAL contains a gap between batches")
     }
     batches.push(batch)
@@ -522,6 +523,7 @@ async fn run_worker_impl(
   output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
   auth_token? : String,
   storage_prepare? : async (@protocol.Assignment) -> (String, String?, String?) raise FrameIoError,
+  storage_budget_bytes? : Int64,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -553,14 +555,17 @@ async fn run_worker_impl(
     None => (wal_path, checkpoint_path, delta_wal_path)
     Some(prepare) => prepare(assignment)
   }
-  let (wal, replay) = Wal::open(wal_path) catch {
+  let (wal, replay) = Wal::open(wal_path, maximum_bytes?=storage_budget_bytes) catch {
     error => raise FrameIoError::Wal(error)
   }
   defer wal.close()
   let (delta_wal, delta_replay) = match delta_wal_path {
     None => (None, None)
     Some(path) => {
-      let (opened, replay) = Wal::open(path) catch {
+      let (opened, replay) = Wal::open(
+        path,
+        maximum_bytes?=storage_budget_bytes,
+      ) catch {
         error => raise FrameIoError::Wal(error)
       }
       (Some(opened), Some(replay))

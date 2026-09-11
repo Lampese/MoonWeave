@@ -49,6 +49,33 @@ async test "outbox compacts freshly acknowledged deltas without reviving them" {
 }
 
 ///|
+async test "outbox automatically compacts acknowledged WAL records" {
+  with_durable_outbox_path <| path => {
+    let delta = durable_test_delta("auto-compact", "A", "B")
+    let outbox = DurableExchangeOutbox::open(path, 1, compaction_record_limit=2)
+    outbox.push(delta)
+    ignore(outbox.try_pop())
+    let before_ack = @fs.read_file(path).binary().length()
+    outbox.ack(delta.delta_id())
+    let after_ack = @fs.read_file(path).binary().length()
+    assert_true(after_ack < before_ack)
+    assert_eq(outbox.acked_count(), 1)
+    assert_eq(outbox.compaction_record_limit(), 2)
+    outbox.close()
+
+    let restored = DurableExchangeOutbox::open(
+      path,
+      1,
+      compaction_record_limit=2,
+    )
+    defer restored.close()
+    assert_true(restored.try_push(delta))
+    assert_eq(restored.pending_count(), 0)
+    assert_eq(restored.acked_count(), 1)
+  }
+}
+
+///|
 async test "outbox tombstones use semantic JSON identity" {
   with_durable_outbox_path <| path => {
     let event_id = @causal.EventId::new("canonical", 0)
@@ -74,6 +101,58 @@ async test "outbox tombstones use semantic JSON identity" {
     defer restored.close()
     restored.push(reordered)
     assert_eq(restored.pending_count(), 0)
+  }
+}
+
+///|
+async test "outbox retirement is an explicit durable retention barrier" {
+  with_durable_outbox_path <| path => {
+    let delta = durable_test_delta("retire-delta", "A", "B")
+    let outbox = DurableExchangeOutbox::open(path, 1)
+    outbox.push(delta)
+    ignore(outbox.try_pop())
+    outbox.ack(delta.delta_id())
+    outbox.compact()
+    outbox.close()
+
+    let retained = DurableExchangeOutbox::open(path, 1)
+    assert_true(retained.try_push(delta))
+    assert_eq(retained.pending_count(), 0)
+    retained.retire_acked([delta.delta_id()])
+    retained.compact()
+    retained.close()
+
+    let reopened = DurableExchangeOutbox::open(path, 1)
+    defer reopened.close()
+    assert_true(reopened.try_push(delta))
+    assert_eq(reopened.pending_count(), 1)
+  }
+}
+
+///|
+async test "outbox bounds acknowledged identity memory until retirement" {
+  with_durable_outbox_path <| path => {
+    let first = durable_test_delta("acked-limit-first", "A", "B")
+    let second = durable_test_delta("acked-limit-second", "B", "C")
+    let outbox = DurableExchangeOutbox::open(path, 1, maximum_acked=1)
+    outbox.push(first)
+    ignore(outbox.try_pop())
+    outbox.ack(first.delta_id())
+    outbox.push(second)
+    ignore(outbox.try_pop())
+    try outbox.ack(second.delta_id()) catch {
+      DurableOutboxError::AckRetentionLimitExceeded(limit~, actual~) => {
+        assert_eq(limit, 1)
+        assert_eq(actual, 2)
+      }
+      _ => fail("expected acknowledged identity limit")
+    } noraise {
+      _ => fail("expected acknowledged identity limit")
+    }
+    outbox.retire_acked([first.delta_id()])
+    outbox.ack(second.delta_id())
+    assert_eq(outbox.acked_count(), 1)
+    outbox.close()
   }
 }
 

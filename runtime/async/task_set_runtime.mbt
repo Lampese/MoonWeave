@@ -23,6 +23,7 @@ pub struct WorkerTaskWork {
   output_delivery : (async (TaskOutputRecord) -> Unit)?
   output_consumer_checkpoint_prefix : String?
   output_consumer_id : String?
+  storage_budget_bytes : Int64?
 }
 
 ///|
@@ -47,6 +48,7 @@ pub fn WorkerTaskWork::new(
   output_delivery? : async (TaskOutputRecord) -> Unit,
   output_consumer_checkpoint_prefix? : String,
   output_consumer_id? : String,
+  storage_budget_bytes? : Int64,
 ) -> WorkerTaskWork {
   {
     connection,
@@ -69,6 +71,7 @@ pub fn WorkerTaskWork::new(
     output_delivery,
     output_consumer_checkpoint_prefix,
     output_consumer_id,
+    storage_budget_bytes,
   }
 }
 
@@ -240,6 +243,7 @@ pub async fn run_worker_task_set(
             output_delivery?=work.output_delivery,
             output_consumer_checkpoint_prefix?=work.output_consumer_checkpoint_prefix,
             output_consumer_id?=work.output_consumer_id,
+            storage_budget_bytes?=work.storage_budget_bytes,
           ),
         ) catch {
           error => Err(error)

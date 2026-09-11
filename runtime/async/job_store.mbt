@@ -62,7 +62,7 @@ pub struct JobStore {
   write_lock : @async.Mutex
   mut journal_offset : Int64
   mut journal_generation : Int64
-  work_plans : Map[Int, JobExecutionPlan]
+  mut work_plans : Map[Int, JobExecutionPlan]
   supervisor_lock : @async.Mutex
 }
 
@@ -367,7 +367,10 @@ async fn recover_job_journal_candidate(
   if !candidate_exists {
     raise JobStoreError::InvalidJournalGeneration(expected_generation)
   }
-  let (candidate, candidate_replay) = Wal::open(candidate_path) catch {
+  let (candidate, candidate_replay) = Wal::open(
+    candidate_path,
+    maximum_bytes=journal.maximum_bytes(),
+  ) catch {
     error => raise JobStoreError::Wal(error)
   }
   let candidate_generation = job_replay_generation(candidate_replay)
@@ -399,6 +402,7 @@ pub async fn JobStore::open(
   spec : @plan.JobSpec,
   journal_path : String,
   checkpoint_path? : String,
+  maximum_bytes? : Int64,
 ) -> JobStore raise JobStoreError {
   if journal_path.is_empty() {
     raise JobStoreError::EmptyPath
@@ -413,7 +417,7 @@ pub async fn JobStore::open(
     Some(value) => value.journal_generation
     None => 0L
   }
-  let (journal, initial_replay) = Wal::open(journal_path) catch {
+  let (journal, initial_replay) = Wal::open(journal_path, maximum_bytes?) catch {
     error => raise JobStoreError::Wal(error)
   }
   errdefer journal.close()
@@ -639,7 +643,10 @@ pub async fn JobStore::checkpoint_and_compact(
   let generation = self.journal_generation + 1L
   let marker = job_generation_marker(generation)
   let candidate_path = self.journal_path + ".next"
-  let (candidate, _) = Wal::open(candidate_path) catch {
+  let (candidate, _) = Wal::open(
+    candidate_path,
+    maximum_bytes=self.journal.maximum_bytes(),
+  ) catch {
     error => raise JobStoreError::Wal(error)
   }
   errdefer candidate.close()
@@ -674,6 +681,23 @@ pub async fn JobStore::checkpoint_and_compact(
   self.journal_generation = generation
   self.journal_offset = self.journal.write_offset()
   cleanup_job_candidate(candidate_path)
+}
+
+///|
+/// Drop completed delivery plans before the next checkpoint. A succeeded Job
+/// has durable partition offsets in its snapshot; retaining every historical
+/// batch and delta in the work-plan map would keep the whole input in memory
+/// even after its WAL was compacted.
+pub async fn JobStore::compact_completed(
+  self : JobStore,
+) -> Unit raise JobStoreError {
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  if self.state.phase() == @control.JobPhase::Succeeded {
+    self.work_plans = Map([])
+  }
 }
 
 ///|

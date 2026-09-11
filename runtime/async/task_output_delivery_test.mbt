@@ -19,7 +19,7 @@ async fn with_task_output_delivery_directory(
 ///|
 fn task_output_delivery_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   source : String,
   target : String,
 ) -> @protocol.EventRecord raise {

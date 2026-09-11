@@ -464,7 +464,10 @@ pub async fn reconcile_job_coordinator(
   replay_only? : Bool = false,
 ) -> ReconciliationSummary raise ReconciliationError {
   let path = reconciliation_sidecar_path(coordinator, job, reconcile_path)
-  let log = ReconciliationLog::open(path)
+  let log = ReconciliationLog::open(
+    path,
+    maximum_bytes=coordinator.journal.maximum_bytes(),
+  )
   defer log.close()
   job.write_lock.acquire() catch {
     error =>

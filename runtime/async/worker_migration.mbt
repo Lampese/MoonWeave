@@ -1309,7 +1309,10 @@ pub async fn commit_worker_migration(
     path == coordinator.checkpoint_path() {
     raise WorkerMigrationError::PathConflict
   }
-  let (journal, replay) = Wal::open(path) catch {
+  let (journal, replay) = Wal::open(
+    path,
+    maximum_bytes=coordinator.journal.maximum_bytes(),
+  ) catch {
     error => raise WorkerMigrationError::Wal(error)
   }
   defer journal.close()

@@ -1,7 +1,7 @@
 ///|
 fn sim_id(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
 ) -> @causal.EventId raise @causal.CausalError {
   @causal.EventId::new(origin, sequence)
 }
@@ -9,7 +9,7 @@ fn sim_id(
 ///|
 fn edge_event(
   origin : String,
-  sequence : Int,
+  sequence : Int64,
   parents : Array[@causal.EventId],
   source : String,
   target : String,

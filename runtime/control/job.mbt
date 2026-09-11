@@ -552,6 +552,9 @@ pub fn JobState::record_batch_sent(
   if first_offset != current.next_offset {
     raise JobError::InvalidOffset(first_offset)
   }
+  if event_count > 9223372036854775807L - first_offset {
+    raise JobError::InvalidEventCount(event_count)
+  }
   let end_offset = first_offset + event_count - 1L
   current.next_offset += event_count
   end_offset
