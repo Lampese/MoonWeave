@@ -72,7 +72,8 @@ async test "DriverCoordinator executes a submitted Job with a waiting Worker" {
         }),
       )
       assert_eq(client.input([event]).accepted_events(), 1L)
-      assert_eq(client.drain().phase(), JobRunPhase::Succeeded)
+      coordinator.shutdown_gracefully()
+      assert_eq(client.status().phase(), JobRunPhase::Succeeded)
       client.close()
       let execution = coordinator_task.wait()
       let worker = worker_task.wait()
