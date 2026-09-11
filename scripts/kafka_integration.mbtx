@@ -8,6 +8,35 @@ import {
 }
 
 ///|
+async fn wait_for_file(path : String) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        break
+      }
+      @async.sleep(50)
+    }
+  })
+}
+
+///|
+fn require_state(text : String, needle : String, label : String) -> Unit raise {
+  if !text.contains(needle) {
+    fail("Kafka group acceptance missing " + label + ": " + needle)
+  }
+}
+
+///|
+fn require_disjoint(left : String, right : String) -> Unit raise {
+  for partition in [0, 1, 2, 3] {
+    let token = "rebalance-topic:" + partition.to_string()
+    if left.contains(token) && right.contains(token) {
+      fail("Kafka group assignment overlap for " + token)
+    }
+  }
+}
+
+///|
 // Run from the repository root:
 // moon run scripts/kafka_integration.mbtx /path/to/kafka_2.13-4.0.0
 // Requires Java 17+ and an extracted Apache Kafka distribution. All broker
@@ -69,6 +98,20 @@ async fn main {
       stdout=log,
       stderr=log,
     )
+    let mut running_pid = Some(broker_pid)
+    defer {
+      if running_pid is Some(pid) {
+        @async.protect_from_cancel(() => {
+          ignore(@process.run("/bin/kill", ["-TERM", pid.to_string()]))
+          @async.with_timeout(15000, () => ignore(@process.wait_pid(pid))) catch {
+            _ => {
+              ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+              ignore(@process.wait_pid(pid))
+            }
+          }
+        }) catch { _ => () }
+      }
+    }
     @async.with_timeout(60000, () => {
       for ;; {
         try @socket.Tcp::connect(@socket.Addr::parse(brokers)) catch {
@@ -85,8 +128,106 @@ async fn main {
       "moon",
       ["run", "--target", "native", "integration/kafka", brokers, root, "initial"],
     ).run(timeout_ms=180000)
+
+    // Real cross-process classic-group acceptance: two native members split
+    // two partitions, then both discover partitions added while running.
+    let integration_exe = @fs.realpath(
+      "_build/native/debug/build/moonweave/moonweave/integration/kafka/kafka.exe",
+    )
+    @shell.Cmd(
+      "moon",
+      ["run", "--target", "native", "integration/kafka", brokers, root, "prepare"],
+    ).run(timeout_ms=120000)
+    let member_a_log = @process.redirect_to_file(root + "/member-a.log")
+    let member_b_log = @process.redirect_to_file(root + "/member-b.log")
+    defer member_a_log.close()
+    defer member_b_log.close()
+    let member_a_pid = @process.spawn_orphan(
+      integration_exe,
+      [brokers, root, "member", "member-a"],
+      stdout=member_a_log,
+      stderr=member_a_log,
+    )
+    let mut member_b_pid : Int? = None
+    let mut members_done = false
+    defer {
+      @async.protect_from_cancel(() => {
+        if !members_done {
+          ignore(@process.run("/bin/kill", ["-KILL", member_a_pid.to_string()]))
+          ignore(@process.wait_pid(member_a_pid))
+          match member_b_pid {
+            Some(pid) => {
+              ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+              ignore(@process.wait_pid(pid))
+            }
+            None => ()
+          }
+        }
+      }) catch { _ => () }
+    }
+    wait_for_file(root + "/member-a.initial")
+    let spawned_b = @process.spawn_orphan(
+      integration_exe,
+      [brokers, root, "member", "member-b"],
+      stdout=member_b_log,
+      stderr=member_b_log,
+    )
+    member_b_pid = Some(spawned_b)
+    wait_for_file(root + "/member-b.initial")
+    @async.sleep(2500)
+    @fs.write_file(root + "/check-rebalance", "\n")
+    wait_for_file(root + "/member-a.rebalanced")
+    wait_for_file(root + "/member-b.rebalanced")
+    let rebalanced_a = @fs.read_file(root + "/member-a.rebalanced").text()
+    let rebalanced_b = @fs.read_file(root + "/member-b.rebalanced").text()
+    require_state(rebalanced_a, "assignment_count=1", "member-a split assignment")
+    require_state(rebalanced_b, "assignment_count=1", "member-b split assignment")
+    require_disjoint(rebalanced_a, rebalanced_b)
+    println("PASS: two independent classic members rebalance without overlap")
+
+    @shell.Cmd(
+      "moon",
+      ["run", "--target", "native", "integration/kafka", brokers, root, "expand"],
+    ).run(timeout_ms=120000)
+    @fs.write_file(root + "/check-expand", "\n")
+    wait_for_file(root + "/member-a.expanded")
+    wait_for_file(root + "/member-b.expanded")
+    let expanded_a = @fs.read_file(root + "/member-a.expanded").text()
+    let expanded_b = @fs.read_file(root + "/member-b.expanded").text()
+    require_state(expanded_a, "assignment_count=2", "member-a expanded assignment")
+    require_state(expanded_b, "assignment_count=2", "member-b expanded assignment")
+    require_state(expanded_a + expanded_b, "rebalance-topic:2", "new partition 2")
+    require_state(expanded_a + expanded_b, "rebalance-topic:3", "new partition 3")
+    require_disjoint(expanded_a, expanded_b)
+    println("PASS: both members discovered partitions added during runtime")
+    @shell.Cmd(
+      "moon",
+      ["run", "--target", "native", "integration/kafka", brokers, root, "verify"],
+    ).run(timeout_ms=120000)
+    @fs.write_file(root + "/stop", "\n")
+    let member_a_status = @async.with_timeout(30000, () => @process.wait_pid(member_a_pid)) catch {
+      _ => {
+        ignore(@process.run("/bin/kill", ["-KILL", member_a_pid.to_string()]))
+        @process.wait_pid(member_a_pid)
+      }
+    }
+    let member_b_status = match member_b_pid {
+      Some(pid) => @async.with_timeout(30000, () => @process.wait_pid(pid)) catch {
+        _ => {
+          ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+          @process.wait_pid(pid)
+        }
+      }
+      None => 0
+    }
+    if member_a_status != 0 || member_b_status != 0 {
+      fail("Kafka group member did not exit cleanly")
+    }
+    members_done = true
+    println("PASS: committed offsets recovered for all four partitions")
     ignore(@process.run("/bin/kill", ["-TERM", broker_pid.to_string()]))
     ignore(@process.wait_pid(broker_pid))
+    running_pid = None
     println("Broker stopped; restarting with the same log directory")
     let restarted_pid = @process.spawn_orphan(
       "java",
@@ -94,6 +235,7 @@ async fn main {
       stdout=log,
       stderr=log,
     )
+    running_pid = Some(restarted_pid)
     @async.with_timeout(60000, () => {
       for ;; {
         try @socket.Tcp::connect(@socket.Addr::parse(brokers)) catch {
@@ -112,6 +254,7 @@ async fn main {
     ).run(timeout_ms=180000)
     ignore(@process.run("/bin/kill", ["-TERM", restarted_pid.to_string()]))
     ignore(@process.wait_pid(restarted_pid))
+    running_pid = None
   })
   println("PASS: Kafka integration")
 }

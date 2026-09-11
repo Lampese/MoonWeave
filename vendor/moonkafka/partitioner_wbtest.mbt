@@ -125,6 +125,25 @@ test "explicit partition override wins and validates the range" {
 }
 
 ///|
+test "producer resolves explicit partitions by metadata index" {
+  let metadata : Array[PartitionInfo] = [
+    { index: 1, leader: 0, leader_epoch: 0, },
+    { index: 0, leader: 0, leader_epoch: 0, },
+    { index: 3, leader: 0, leader_epoch: 0, },
+    { index: 2, leader: 0, leader_epoch: 0, },
+  ]
+  assert_eq(find_partition(metadata, 0).index, 0)
+  assert_eq(find_partition(metadata, 2).index, 2)
+  try find_partition(metadata, 4) catch {
+    ProtocolError::ProtocolError(message) =>
+      assert_true(message.contains("partition 4"))
+    _ => fail("unexpected partition lookup error")
+  } noraise {
+    _ => fail("missing partition should raise")
+  }
+}
+
+///|
 test "single-partition topics always route to zero" {
   for strategy in [Murmur2, Murmur2RoundRobin, RoundRobin] {
     let r = PartitionRouter::new(strategy, 1UL)

@@ -207,7 +207,10 @@ fn Consumer::start_membership(self : Consumer) -> Unit raise {
     // The loop picks the new subscription up on its next heartbeat.
     return
   }
-  if self.member_id.is_empty() {
+  // KIP-848 requires a client-generated identity. Classic JoinGroup uses an
+  // empty member id for the first request so the broker can allocate a
+  // collision-free id (important when multiple processes start together).
+  if self.member_id.is_empty() && self.member_kind is Kip848Member {
     self.member_id = new_member_id()
   }
   self.member_active = true

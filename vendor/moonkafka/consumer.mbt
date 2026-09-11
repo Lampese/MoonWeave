@@ -157,7 +157,7 @@ pub async fn Consumer::connect_with_config(
     subscribed_names: None,
     subscribed_regex: None,
     assignment: [],
-    heartbeat_interval_ms: 0,
+    heartbeat_interval_ms: config.heartbeat_interval_ms,
     session_timeout_ms: config.session_timeout_ms,
     member_active: false,
     member_spawned: false,
@@ -177,7 +177,7 @@ pub async fn Consumer::connect_with_config(
     partitions: [],
     closed: false,
   }
-  consumer.refresh_metadata()
+  ignore(consumer.refresh_metadata())
   consumer.reset_offsets()
   if consumer.autocommit_enabled() {
     // The autocommit loop tears the cluster down on exit, so close()
@@ -216,11 +216,12 @@ fn Consumer::autocommit_enabled(self : Consumer) -> Bool {
 /// the refresh.
 async fn Consumer::recover(self : Consumer) -> Unit {
   self.cluster.reconnect()
-  self.refresh_metadata()
+  ignore(self.refresh_metadata())
 }
 
 ///|
-async fn Consumer::refresh_metadata(self : Consumer) -> Unit {
+async fn Consumer::refresh_metadata(self : Consumer) -> Bool {
+  let old_count = self.partitions.length()
   let topic_meta = self.cluster.wait_for_topic(
     self.topic,
     timeout_ms=self.request_timeout_ms,
@@ -243,6 +244,7 @@ async fn Consumer::refresh_metadata(self : Consumer) -> Unit {
   // Leader connections come from the cluster client's pool on demand;
   // fetch sessions die with every refresh.
   self.fetch_sessions.clear()
+  old_count != self.partitions.length()
 }
 
 ///|

@@ -1,0 +1,178 @@
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+}
+
+///|
+// Run from the repository root:
+// moon run scripts/signal_acceptance.mbtx
+//
+// This acceptance run deliberately uses independent native Coordinator,
+// Worker, and Driver processes.  SIGTERM is sent only to Coordinator; its
+// cancellation handler must durably drain the submitted fixture before exit.
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-signal-acceptance-")
+  let coordinator_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let coordinator_port = coordinator_listener.addr.port()
+  let driver_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let driver_port = driver_listener.addr.port()
+  coordinator_listener.close()
+  driver_listener.close()
+
+  let submission = @fs.realpath("cmd/driver_fixture/process-submission.json")
+  let events = @fs.realpath("cmd/driver_fixture/process-events.json")
+  let coordinator = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/coordinator/coordinator.exe",
+  )
+  let worker = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/worker/worker.exe",
+  )
+  let driver = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/driver/driver.exe",
+  )
+  let cluster = "signal-acceptance-cluster"
+  let coordinator_id = "coordinator-0"
+  let coordinator_endpoint = "127.0.0.1:\{coordinator_port}"
+  let driver_endpoint = "127.0.0.1:\{driver_port}"
+  let storage = root + "/coordinator"
+  let worker_storage = root + "/worker"
+  let coordinator_log = root + "/coordinator.log"
+  let worker_log = root + "/worker.log"
+  println("Signal acceptance state: " + root)
+
+  @shell.Cmd(
+    "moon",
+    ["build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver"],
+  ).run(timeout_ms=120000)
+
+  let coordinator_output = @process.redirect_to_file(coordinator_log)
+  defer coordinator_output.close()
+  let coordinator_pid = @process.spawn_orphan(
+    coordinator,
+    [
+      "--cluster", cluster,
+      "--coordinator", coordinator_id,
+      "--bind", coordinator_endpoint,
+      "--advertise", coordinator_endpoint,
+      "--driver-bind", driver_endpoint,
+      "--driver-advertise", driver_endpoint,
+      "--storage", storage,
+      "--workers", "worker-0@boot-0",
+    ],
+    stdout=coordinator_output,
+    stderr=coordinator_output,
+  )
+  let mut worker_pid : Int? = None
+  let mut coordinator_done = false
+  let mut worker_done = false
+  defer {
+    @async.protect_from_cancel(() => {
+      if !coordinator_done {
+        ignore(@process.run("/bin/kill", ["-KILL", coordinator_pid.to_string()]))
+        ignore(@process.wait_pid(coordinator_pid))
+      }
+      match worker_pid {
+        Some(pid) if !worker_done => {
+          ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+          ignore(@process.wait_pid(pid))
+        }
+        _ => ()
+      }
+    }) catch { _ => () }
+  }
+
+  @async.with_timeout(30000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(driver_endpoint)) catch {
+        _ => @async.sleep(50)
+      } noraise {
+        connection => {
+          connection.close()
+          break
+        }
+      }
+    }
+  })
+
+  let worker_output = @process.redirect_to_file(worker_log)
+  defer worker_output.close()
+  let spawned_worker_pid = @process.spawn_orphan(
+    worker,
+    [
+      "--cluster", cluster,
+      "--coordinator", coordinator_id,
+      "--coordinator-endpoint", coordinator_endpoint,
+      "--worker", "worker-0",
+      "--incarnation", "boot-0",
+      "--storage", worker_storage,
+      "--job-config", submission,
+    ],
+    stdout=worker_output,
+    stderr=worker_output,
+  )
+  worker_pid = Some(spawned_worker_pid)
+
+  let submit = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", coordinator_id,
+      "--job-config", submission,
+      "--command", "submit",
+    ],
+  ).output(timeout_ms=30000)
+  println("submit exit=\{submit.exit_code()} stdout=\{submit.stdout()}")
+  if submit.exit_code() != 0 || !submit.stdout().contains("phase=Running") {
+    fail("submit did not enter Running")
+  }
+
+  let input = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", coordinator_id,
+      "--job-config", submission,
+      "--command", "input",
+      "--events", events,
+    ],
+  ).output(timeout_ms=30000)
+  println("input exit=\{input.exit_code()} stdout=\{input.stdout()}")
+  if input.exit_code() != 0 || !input.stdout().contains("accepted=1") {
+    fail("input was not accepted")
+  }
+
+  let signal_status = @process.run("/bin/kill", ["-TERM", coordinator_pid.to_string()])
+  println("sent SIGTERM status=\{signal_status}")
+  let coordinator_status = @process.wait_pid(coordinator_pid)
+  coordinator_done = true
+  println("coordinator wait status=\{coordinator_status} (expected -15 / shell 143)")
+  if coordinator_status != -15 {
+    fail("Coordinator was not terminated by SIGTERM")
+  }
+
+  let worker_status = @async.with_timeout(30000, () => @process.wait_pid(spawned_worker_pid)) catch {
+    _ => {
+      ignore(@process.run("/bin/kill", ["-KILL", spawned_worker_pid.to_string()]))
+      @process.wait_pid(spawned_worker_pid)
+    }
+  }
+  worker_done = true
+  println("worker wait status=\{worker_status}")
+  let coordinator_log_text = @fs.read_file(coordinator_log).text()
+  let worker_log_text = @fs.read_file(worker_log).text()
+  println("coordinator log:\n\{coordinator_log_text}")
+  println("worker log:\n\{worker_log_text}")
+  if !coordinator_log_text.contains("phase=Succeeded") {
+    fail("Coordinator did not record phase=Succeeded")
+  }
+  if worker_status != 0 || !worker_log_text.contains("live_batches=1") {
+    fail("Worker did not exit cleanly after the drained batch")
+  }
+  println("PASS: independent native SIGTERM acceptance")
+}

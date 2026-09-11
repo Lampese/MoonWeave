@@ -76,14 +76,14 @@ fn encode_cooperative_subscription(
 ) -> Bytes {
   let body = @buf.Encoder::new()
   body.write_i16(CONSUMER_PROTOCOL_SUBSCRIPTION_VERSION)
-  body.write_i16(topics.length())
+  body.write_i32(topics.length())
   for topic in topics {
     let bytes = @utf8.encode(topic)
     body.write_i16(bytes.length())
     body.write_bytes(bytes)
   }
   let user_data = encode_consumer_protocol_assignment(owned)
-  body.write_i16(user_data.length())
+  body.write_i32(user_data.length())
   body.write_bytes(user_data)
   body.to_bytes()
 }
@@ -101,14 +101,24 @@ fn decode_subscription_metadata(
       "unsupported ConsumerProtocolSubscription version \{version}",
     )
   }
-  let n = d.read_i16()
+  let n = d.read_i32()
+  if n < 0 {
+    raise ProtocolError::ProtocolError(
+      "negative ConsumerProtocolSubscription topic count",
+    )
+  }
   let topics : Array[String] = []
   for _ in 0..<n {
     let len = d.read_i16()
     topics.push(@utf8.decode_lossy(d.read_bytes(len)[:]))
   }
   let mut owned : Array[(String, Array[Int])] = []
-  let user_len = d.read_i16()
+  let user_len = d.read_i32()
+  if user_len < -1 {
+    raise ProtocolError::ProtocolError(
+      "invalid ConsumerProtocolSubscription userData length",
+    )
+  }
   if user_len > 0 {
     owned = decode_consumer_protocol_assignment(d.read_bytes(user_len))
   }
@@ -123,6 +133,10 @@ async fn Consumer::classic_loop(self : Consumer) -> Unit {
     base_ms=self.retry_backoff_ms,
     max_ms=self.retry_backoff_max_ms,
   )
+  // Classic coordinators do not push topic partition-count changes. Poll
+  // metadata periodically while heartbeating and turn a count change into a
+  // regular rejoin so newly added partitions participate in assignment.
+  let mut metadata_ticks = 0
   for ;; {
     if self.closed || !self.member_active {
       break
@@ -163,7 +177,17 @@ async fn Consumer::classic_loop(self : Consumer) -> Unit {
               timeout_ms=self.request_timeout_ms,
             )
           match code {
-            Ok(0) => continue
+            Ok(0) => {
+              metadata_ticks += 1
+              if metadata_ticks >= 2 {
+                metadata_ticks = 0
+                let changed = self.refresh_metadata() catch { _ => false }
+                if changed {
+                  break
+                }
+              }
+              continue
+            }
             Ok(27) => break // rebalance in progress: rejoin
             Ok(22) | Ok(25) => {
               // Illegal generation / unknown member: start over.
@@ -227,8 +251,26 @@ async fn Consumer::classic_join_round(self : Consumer) -> ClassicRound {
     protocols=self.classic_protocols(),
     timeout_ms=self.request_timeout_ms,
   )
+  // A broker may allocate the member id before returning a retriable
+  // coordinator/rebalance error. Keep that identity for the next attempt;
+  // repeatedly joining with an empty id would create phantom members and can
+  // prevent a group from ever reaching a complete generation.
+  if !join.member_id.is_empty() &&
+    (
+      join.error_code == 14 ||
+      join.error_code == 15 ||
+      join.error_code == 27 ||
+      join.error_code == 79
+    ) {
+    self.member_id = join.member_id
+  }
   match join.error_code {
     0 => ()
+    79 =>
+      // Kafka 4.x may require the broker-assigned member id on the first
+      // JoinGroup attempt. Preserve it and retry instead of treating the
+      // normal handshake step as a fatal membership error.
+      return ClassicRejoin
     25 => {
       // The coordinator forgot us: join fresh.
       self.member_id = ""
