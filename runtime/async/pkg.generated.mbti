@@ -237,6 +237,7 @@ pub(all) suberror OutputConsumerError {
   InvalidPartition(Int)
   InvalidEpoch(Int)
   InvalidBatchSize(Int)
+  InvalidCompactionLimit(Int)
   PathConflict
   IdentityMismatch
   MissingOutput(Int64)
@@ -965,6 +966,7 @@ pub struct TaskOutputConsumer {
   journal : Wal
   binding : OutputConsumerEntry
   operation_lock : @moonbitlang/async.Mutex
+  compaction_record_limit : Int
   mut next_sequence : Int64
 }
 pub async fn TaskOutputConsumer::ack(Self, TaskOutputRecord) -> Unit raise OutputConsumerError
@@ -972,11 +974,12 @@ pub fn TaskOutputConsumer::checkpoint_path(Self) -> String
 pub fn TaskOutputConsumer::checkpoint_stats(Self) -> WalStats
 pub fn TaskOutputConsumer::close(Self) -> Unit
 pub async fn TaskOutputConsumer::compact(Self) -> Unit raise OutputConsumerError
+pub fn TaskOutputConsumer::compaction_record_limit(Self) -> Int
 pub async fn TaskOutputConsumer::consume(Self, async (TaskOutputRecord) -> Unit, maximum_records? : Int) -> Int
 pub fn TaskOutputConsumer::consumer_id(Self) -> String
 pub fn TaskOutputConsumer::epoch(Self) -> Int
 pub fn TaskOutputConsumer::next_sequence(Self) -> Int64
-pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int, maximum_bytes? : Int64) -> Self raise OutputConsumerError
+pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int, maximum_bytes? : Int64, compaction_record_limit? : Int) -> Self raise OutputConsumerError
 pub fn TaskOutputConsumer::partition(Self) -> Int
 pub fn TaskOutputConsumer::read(Self, maximum_records? : Int) -> Array[TaskOutputRecord] raise OutputConsumerError
 pub fn TaskOutputConsumer::task_id(Self) -> String

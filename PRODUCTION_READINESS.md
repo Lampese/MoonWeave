@@ -21,7 +21,7 @@
 | 2 | Kafka 多分区 | 保留 topic/partition/offset 的准确身份；发现分区；consumer group 加入、退出、重平衡及分区扩容；各分区独立提交与恢复。持久化成功后才能提交 offset，撤销分区时禁止旧 owner 越权提交；通过真实 broker 故障与重平衡测试。 | 实现中：代码路径与单元回归已完成，真实多分区 broker/重平衡验收待执行 |
 | 3 | 状态有界化 | SourceLog、各 WAL、outbox、output log 及相关内存索引具备持续运行时的保留和压缩策略；删除必须受持久化 checkpoint、重放边界和下游 ACK 约束。队列、内存及磁盘有明确预算，超限产生背压；磁盘满或不确定写入不能误报成功；压缩和恢复不丢数据或破坏去重。算子历史和因果索引也计入内存预算，不能只压缩文件。 | 部分完成：生产入口已把预算传入 Coordinator/Job/Source/manifest WAL；Driver 有输入事件上限并在终态释放历史；成功排空后 Job plan 与 SourceLog 已完成前缀可安全压缩；Durable outbox 和 output consumer checkpoint WAL 在达到记录阈值后自动物理压缩，仍保留去重/最新 ACK 证明。持续运行中的 barrier 驱动 source/output/outbox 身份回收、算子/因果索引预算和端到端磁盘满背压验收仍待完成 |
 | 4 | 全链路 Int64 offset | 删除 Kafka offset 到 EventId/Int32 的限制；事件身份、父依赖、协议、SourceLog、checkpoint 和恢复精确保留 Int64。覆盖 2^31、2^53 附近以及 Int64 上限的边界，不截断、不经浮点数丢失精度、不发生 offset 加一回绕。 | 已完成代码与 native 验收 |
-| 5 | 生产运行入口 | 配置驱动的 Coordinator、Worker、Driver 服务；启动校验；真正提交和运行 Job；优雅 drain、停止与重启；入口使用第 1–4 项的实际运行路径，不能停留在固定 Job 示例或仅供测试的 API。 | 实现中：`cmd/coordinator` 已改为长期 Driver 服务，`cmd/worker` 从 JobSubmission JSON 启动，新增 `cmd/driver` 的 submit/input/status/drain/cancel；native build 通过；独立进程提交/重启/信号优雅停止验收仍待做 |
+| 5 | 生产运行入口 | 配置驱动的 Coordinator、Worker、Driver 服务；启动校验；真正提交和运行 Job；优雅 drain、停止与重启；入口使用第 1–4 项的实际运行路径，不能停留在固定 Job 示例或仅供测试的 API。 | 实现中：`cmd/coordinator` 已改为长期 Driver 服务，`cmd/worker` 从 JobSubmission JSON 启动，新增 `cmd/driver` 的 submit/input/status/drain/cancel；已接入 SIGTERM/SIGINT cancellation handler，handler 受保护并先持久化 Drain、等待终态后再关闭；native build 和 API/live 回归通过；独立进程信号验收仍待做 |
 | 6 | 性能和故障验收 | 在测量前记录并冻结硬件、worker 数、Kafka 分区数、算子及数据分布、事件大小、吞吐、p99、内存与磁盘上限、长稳时长和恢复目标；通过端到端性能、长稳、进程崩溃、主机故障、网络隔离、Kafka 故障及磁盘满测试，并保存可复现证据。 | 待实现 |
 
 实现顺序：4 → 2 → 3 → 1 → 5 → 6。第 6 项的规范与测试工具可提前建设，各项验收随实现推进。
@@ -56,6 +56,7 @@
 - 独立进程入口烟测：Coordinator、Worker、Driver 使用三个 native 进程完成 `submit → input(accepted=1) → drain → Succeeded`；Worker 报告 `live_batches=1`，Coordinator/Driver/Worker WAL 与 checkpoint 均落盘。随后复用同一 Coordinator/Worker 存储重启，Driver 恢复 `accepted=1` 的 `Running` 状态并再次 drain 成功；Worker 报告 `live_batches=0`，说明已持久化输入未被重复执行。该证据覆盖入口和本地重启恢复，不替代跨主机 HA、信号优雅停止和故障矩阵验收。
 - 本轮状态边界证据：生产 Coordinator 将 `--storage-budget-bytes` 传入 CoordinatorStore、JobStore、SourceLog、DriverStore、JobOutputManifest；`--driver-event-limit` 对 Driver 内存去重索引实施上限，超限拒绝新输入而不写入；终态成功后 Driver WAL 不再保留输入事件，JobStore 清除完成 delivery plan，SourceLog 写入 retention marker 并删除已完成物理前缀，恢复后保留逻辑 `next_offset`。native 全量回归为 588/588。
 - 本轮状态边界证据：Durable outbox ACK 达到 `compaction_record_limit` 后自动重写 WAL，保留 pending payload 与 ACK tombstone；TaskOutputConsumer checkpoint 达到同类阈值后仅保留 binding 和最新 ACK proof。两者均未自动释放去重身份或删除 source/output log，重启回归验证重复投递仍被识别。async 专项回归为 167/167；全量 native 回归为 590/590。
+- 本轮入口修复：`DriverCoordinator::shutdown_gracefully` 先写入 Driver `Drain` intent，执行 live source drain 并等待 `Succeeded/Failed`，`cmd/coordinator` 通过 `moonbitlang/async/signal` 注册 SIGTERM/SIGINT；`moon check --target native`、`moon build --target native cmd/coordinator` 和 `driver_coordinator_e2e_test` 通过。真实独立进程发信号的验收尚未在本环境执行。
 
 ## 配置化入口示例
 

@@ -69,6 +69,10 @@ fn worker_slots(value : String) -> Array[@flow.WorkerSlot] raise {
 /// arrive through the Driver protocol; this process contains no sample Job or
 /// sample event and can therefore be supervised as a real service.
 async fn main {
+  @signal.set_global_cancellation_signals([
+    @signal.Signal::SIGTERM,
+    @signal.Signal::SIGINT,
+  ])
   let args = @env.args()
   let cluster_id = option(args, "--cluster", "moonweave-cluster")
   let coordinator_id = option(args, "--coordinator", "coordinator-0")
@@ -118,7 +122,30 @@ async fn main {
   println(
     "coordinator data=\{coordinator.data_endpoint().to_string()} driver=\{coordinator.control_endpoint().to_string()}",
   )
-  let summary = coordinator.run()
+  let mut completed : @flow.DriverCoordinatorSummary? = None
+  try
+    @async.with_task_group <| group => {
+      let service = group.spawn() <| () => {
+        @async.protect_from_cancel <| () => { coordinator.run() }
+      }
+      @async.with_cancellation_handler(
+        handler=() => {
+          @async.protect_from_cancel <| () => {
+            coordinator.shutdown_gracefully() catch {
+              error =>
+                println("graceful shutdown failed: \{@debug.to_string(error)}")
+            }
+            completed = Some(service.wait())
+          }
+        },
+        () => completed = Some(service.wait()),
+      )
+    }
+  catch {
+    error if @async.is_cancellation_error(error) && completed is Some(_) => ()
+    error => raise error
+  }
+  let summary = completed.unwrap()
   println("phase=\{@debug.to_string(summary.status().phase())}")
   match summary.status().failure() {
     Some(reason) => println("failure=\{reason}")

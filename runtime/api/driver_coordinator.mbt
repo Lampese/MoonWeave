@@ -101,6 +101,66 @@ pub fn DriverCoordinator::close(self : DriverCoordinator) -> Unit {
 }
 
 ///|
+/// Gracefully stop a running Driver coordinator.
+///
+/// The drain intent is written before this function waits for the live
+/// execution.  This method is deliberately cancellation-protected: it is
+/// called from the SIGTERM/SIGINT cancellation handler, and an interrupted
+/// drain would otherwise leave a running job with an ambiguous shutdown
+/// outcome.  Listener/store cleanup remains owned by `run`'s structured
+/// lifetime after the durable terminal state is reached.
+pub async fn DriverCoordinator::shutdown_gracefully(
+  self : DriverCoordinator,
+) -> Unit raise ApiError {
+  try
+    @async_runtime.protect_from_cancel <| () => {
+      if self.closed {
+        return
+      }
+      if self.store.phase() == JobRunPhase::Running ||
+        self.store.phase() == JobRunPhase::Draining {
+        self.command_lock.acquire() catch {
+          error => raise driver_error("lock graceful Driver shutdown", error)
+        }
+        defer self.command_lock.release()
+        if !self.closed && self.store.phase() == JobRunPhase::Running {
+          ignore(self.store.drain())
+        }
+        if !self.closed && self.store.phase() == JobRunPhase::Draining {
+          self.ensure_live_execution().drain()
+        }
+      }
+      while self.store.phase() == JobRunPhase::Draining {
+        match self.live_task {
+          Some(task) => {
+            let result = task.try_wait() catch {
+              error =>
+                raise driver_error("wait for graceful Driver shutdown", error)
+            }
+            match result {
+              Some(value) => self.apply_live_result(value)
+              None => @async_runtime.sleep(5)
+            }
+          }
+          None => {
+            // `run` normally starts this task on its next tick. Starting the
+            // execution inline here also makes a signal arriving immediately
+            // after submission deterministic.
+            let execution = self.ensure_live_execution()
+            let result = Ok(execution.run()) catch {
+              error => Err(@debug.to_string(error))
+            }
+            self.apply_live_result(result)
+          }
+        }
+      }
+    }
+  catch {
+    error => raise driver_error("graceful Driver shutdown", error)
+  }
+}
+
+///|
 /// Called with command_lock held, including during restart initialization.
 async fn DriverCoordinator::ensure_live_execution(
   self : DriverCoordinator,

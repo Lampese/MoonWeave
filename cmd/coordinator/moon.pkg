@@ -2,6 +2,7 @@ import {
   "moonweave/moonweave/runtime/api" @flow,
   "moonbitlang/async",
   "moonbitlang/async/fs",
+  "moonbitlang/async/signal",
   "moonbitlang/core/debug",
   "moonbitlang/core/env",
   "moonbitlang/core/string",
