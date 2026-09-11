@@ -31,5 +31,6 @@ preferred_target = "native"
 description = "A causal-frontier incremental dataflow engine"
 
 import {
-  "moonbitlang/async@0.20.5",
+  "moonbitlang/async@0.21.2",
+  "daqing/moonkafka@0.2.0",
 }

@@ -2,6 +2,7 @@
 package "moonweave/moonweave/runtime/api"
 
 import {
+  "daqing/moonkafka",
   "moonbitlang/async/fs",
   "moonbitlang/async/socket",
   "moonbitlang/core/debug",
@@ -68,11 +69,13 @@ pub struct ClusterConfig {
   cluster_id : String
   coordinator_id : String
   storage_dir : String
-} derive(Eq, @debug.Debug)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 pub fn ClusterConfig::cluster_id(Self) -> String
 pub fn ClusterConfig::coordinator_id(Self) -> String
 pub fn ClusterConfig::new(String, String, String) -> Self raise ApiError
 pub fn ClusterConfig::storage_dir(Self) -> String
+pub fn ClusterConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 
 pub(all) struct ClusterRunSummary {
   plan_digest : String
@@ -161,7 +164,8 @@ pub struct CoordinatorNodeConfig {
   workers : Array[WorkerSlot]
   migration_required : Bool
   auth_token : String?
-} derive(Eq, @debug.Debug)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 pub fn CoordinatorNodeConfig::advertised_endpoint(Self) -> NodeEndpoint?
 pub fn CoordinatorNodeConfig::auth_token(Self) -> String?
 pub fn CoordinatorNodeConfig::bind(Self) -> NodeEndpoint
@@ -172,6 +176,7 @@ pub fn CoordinatorNodeConfig::new(String, String, NodeEndpoint, String, ArrayVie
 pub fn CoordinatorNodeConfig::storage_dir(Self) -> String
 pub fn CoordinatorNodeConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
 pub fn CoordinatorNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn CoordinatorNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn CoordinatorNodeConfig::with_migration_required(Self, required? : Bool) -> Self
 pub fn CoordinatorNodeConfig::workers(Self) -> ArrayView[WorkerSlot]
 
@@ -223,13 +228,16 @@ pub(all) struct DriverConfig {
   driver_id : String
   endpoint : NodeEndpoint
   incarnation : String
-} derive(Eq, @debug.Debug)
+  auth_token : String?
+} derive(Eq)
+pub fn DriverConfig::auth_token(Self) -> String?
 pub fn DriverConfig::cluster_id(Self) -> String
 pub fn DriverConfig::coordinator_id(Self) -> String
 pub fn DriverConfig::driver_id(Self) -> String
 pub fn DriverConfig::endpoint(Self) -> NodeEndpoint
 pub fn DriverConfig::incarnation(Self) -> String
 pub fn DriverConfig::new(String, String, String, NodeEndpoint) -> Self raise ApiError
+pub fn DriverConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn DriverConfig::with_incarnation(Self, String) -> Self raise ApiError
 
 pub(all) struct DriverControlConfig {
@@ -237,13 +245,16 @@ pub(all) struct DriverControlConfig {
   coordinator_id : String
   bind : NodeEndpoint
   advertised : NodeEndpoint?
-} derive(Eq, @debug.Debug)
+  auth_token : String?
+} derive(Eq)
 pub fn DriverControlConfig::advertised_endpoint(Self) -> NodeEndpoint?
+pub fn DriverControlConfig::auth_token(Self) -> String?
 pub fn DriverControlConfig::bind(Self) -> NodeEndpoint
 pub fn DriverControlConfig::cluster_id(Self) -> String
 pub fn DriverControlConfig::coordinator_id(Self) -> String
 pub fn DriverControlConfig::new(String, String, NodeEndpoint) -> Self raise ApiError
 pub fn DriverControlConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Self
+pub fn DriverControlConfig::with_auth_token(Self, String) -> Self raise ApiError
 
 pub struct DriverControlListener {
   config : DriverControlConfig
@@ -319,6 +330,7 @@ pub fn Event::id(Self) -> @causal.EventId
 pub fn Event::key(Self) -> String
 pub fn Event::keyed_sum(@causal.EventId, String, Int64) -> Self raise ApiError
 pub fn Event::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ApiError
+pub fn Event::parents(Self) -> ArrayView[@causal.EventId]
 pub fn Event::payload(Self) -> Json
 
 pub(all) enum JobCommand {
@@ -431,6 +443,139 @@ pub fn JsonLinesSource::polled_offset(Self) -> Int64
 pub async fn JsonLinesSource::rewind(Self, next_offset? : Int64) -> Unit raise ApiError
 
 type JsonLinesSourceCursor derive(ToJson, @json.FromJson)
+
+pub struct KafkaRuntimeConfig {
+  source_credential_ref : String?
+  source_sasl : @moonkafka.SaslConfig?
+  source_tls : @moonkafka.TlsClientOptions?
+  sink_credential_ref : String?
+  sink_sasl : @moonkafka.SaslConfig?
+  sink_tls : @moonkafka.TlsClientOptions?
+}
+pub fn KafkaRuntimeConfig::new() -> Self
+pub fn KafkaRuntimeConfig::with_sink_security(Self, String, @moonkafka.SaslConfig?, @moonkafka.TlsClientOptions?) -> Self raise ApiError
+pub fn KafkaRuntimeConfig::with_source_security(Self, String, @moonkafka.SaslConfig?, @moonkafka.TlsClientOptions?) -> Self raise ApiError
+
+pub(all) enum KafkaSecurityProtocol {
+  Plaintext
+  Ssl
+  SaslPlaintext
+  SaslSsl
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct KafkaSink {
+  producer : @moonkafka.Producer
+  topic : String
+  mut closed : Bool
+}
+pub fn KafkaSink::close(Self) -> Unit
+pub async fn KafkaSink::connect(group~ : @moonbitlang/async.TaskGroup[Unit], KafkaSinkConfig) -> Self raise ApiError
+pub async fn KafkaSink::consume(Self, @moonweave/moonweave/runtime/async.TaskOutputConsumer, maximum_records? : Int) -> Int raise ApiError
+pub fn KafkaSink::topic(Self) -> String
+pub async fn KafkaSink::write(Self, @moonweave/moonweave/runtime/async.TaskOutputRecord) -> Unit raise ApiError
+
+pub struct KafkaSinkConfig {
+  bootstrap_servers : Array[String]
+  topic : String
+  security_protocol : @moonkafka.SecurityProtocol
+  sasl : @moonkafka.SaslConfig?
+  tls : @moonkafka.TlsClientOptions?
+}
+pub fn KafkaSinkConfig::bootstrap_servers(Self) -> ArrayView[String]
+pub fn KafkaSinkConfig::new(Array[String], String) -> Self raise ApiError
+pub fn KafkaSinkConfig::sasl(Self) -> @moonkafka.SaslConfig?
+pub fn KafkaSinkConfig::security_protocol(Self) -> @moonkafka.SecurityProtocol
+pub fn KafkaSinkConfig::tls(Self) -> @moonkafka.TlsClientOptions?
+pub fn KafkaSinkConfig::topic(Self) -> String
+pub fn KafkaSinkConfig::with_security(Self, @moonkafka.SecurityProtocol, sasl? : @moonkafka.SaslConfig?, tls? : @moonkafka.TlsClientOptions?) -> Self
+
+pub(all) struct KafkaSinkSpec {
+  bootstrap_servers : Array[String]
+  topic : String
+  security_protocol : KafkaSecurityProtocol
+  credential_ref : String?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn KafkaSinkSpec::bootstrap_servers(Self) -> ArrayView[String]
+pub fn KafkaSinkSpec::credential_ref(Self) -> String?
+pub fn KafkaSinkSpec::new(Array[String], String) -> Self raise ApiError
+pub fn KafkaSinkSpec::security_protocol(Self) -> KafkaSecurityProtocol
+pub fn KafkaSinkSpec::topic(Self) -> String
+pub fn KafkaSinkSpec::with_credential_ref(Self, String) -> Self raise ApiError
+pub fn KafkaSinkSpec::with_security_protocol(Self, KafkaSecurityProtocol) -> Self
+
+pub struct KafkaSource {
+  consumer : @moonkafka.Consumer
+  topic : String
+  partition : Int
+  mut committed_offset : Int64
+  mut pending_next_offset : Int64?
+  mut closed : Bool
+}
+pub fn KafkaSource::close(Self) -> Unit
+pub async fn KafkaSource::commit(Self, Int64) -> Unit raise ApiError
+pub async fn KafkaSource::connect(group~ : @moonbitlang/async.TaskGroup[Unit], KafkaSourceConfig) -> Self raise ApiError
+pub fn KafkaSource::event_from_record(Self, @moonkafka.Record) -> Event raise ApiError
+pub fn KafkaSource::partition(Self) -> Int
+pub async fn KafkaSource::poll(Self, max_wait_ms? : Int) -> KafkaSourceBatch raise ApiError
+pub fn KafkaSource::position(Self) -> Int64?
+pub fn KafkaSource::topic(Self) -> String
+
+pub(all) struct KafkaSourceBatch {
+  events : Array[Event]
+  next_offset : Int64
+} derive(Eq, @debug.Debug)
+pub fn KafkaSourceBatch::events(Self) -> ArrayView[Event]
+pub fn KafkaSourceBatch::next_offset(Self) -> Int64
+
+pub struct KafkaSourceConfig {
+  bootstrap_servers : Array[String]
+  topic : String
+  group_id : String
+  partition : Int
+  start_from : @moonkafka.StartFrom
+  security_protocol : @moonkafka.SecurityProtocol
+  sasl : @moonkafka.SaslConfig?
+  tls : @moonkafka.TlsClientOptions?
+  max_poll_records : Int
+}
+pub fn KafkaSourceConfig::bootstrap_servers(Self) -> ArrayView[String]
+pub fn KafkaSourceConfig::group_id(Self) -> String
+pub fn KafkaSourceConfig::new(Array[String], String, String, Int) -> Self raise ApiError
+pub fn KafkaSourceConfig::partition(Self) -> Int
+pub fn KafkaSourceConfig::sasl(Self) -> @moonkafka.SaslConfig?
+pub fn KafkaSourceConfig::security_protocol(Self) -> @moonkafka.SecurityProtocol
+pub fn KafkaSourceConfig::tls(Self) -> @moonkafka.TlsClientOptions?
+pub fn KafkaSourceConfig::topic(Self) -> String
+pub fn KafkaSourceConfig::with_max_poll_records(Self, Int) -> Self raise ApiError
+pub fn KafkaSourceConfig::with_security(Self, @moonkafka.SecurityProtocol, sasl? : @moonkafka.SaslConfig?, tls? : @moonkafka.TlsClientOptions?) -> Self
+pub fn KafkaSourceConfig::with_start_from(Self, @moonkafka.StartFrom) -> Self
+
+pub(all) struct KafkaSourceSpec {
+  bootstrap_servers : Array[String]
+  topic : String
+  group_id : String
+  partition : Int
+  start_from : KafkaStartFrom
+  security_protocol : KafkaSecurityProtocol
+  credential_ref : String?
+  max_poll_records : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn KafkaSourceSpec::bootstrap_servers(Self) -> ArrayView[String]
+pub fn KafkaSourceSpec::credential_ref(Self) -> String?
+pub fn KafkaSourceSpec::group_id(Self) -> String
+pub fn KafkaSourceSpec::new(Array[String], String, String, Int) -> Self raise ApiError
+pub fn KafkaSourceSpec::partition(Self) -> Int
+pub fn KafkaSourceSpec::security_protocol(Self) -> KafkaSecurityProtocol
+pub fn KafkaSourceSpec::topic(Self) -> String
+pub fn KafkaSourceSpec::with_credential_ref(Self, String) -> Self raise ApiError
+pub fn KafkaSourceSpec::with_max_poll_records(Self, Int) -> Self raise ApiError
+pub fn KafkaSourceSpec::with_security_protocol(Self, KafkaSecurityProtocol) -> Self
+pub fn KafkaSourceSpec::with_start_from(Self, KafkaStartFrom) -> Self
+
+pub(all) enum KafkaStartFrom {
+  Earliest
+  Latest
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct KeyBy[T] {
   selector : (T) -> String
@@ -729,11 +874,13 @@ pub(all) enum SinkSpec {
   Discard
   Durable(String)
   JsonLines(String)
+  Kafka(KafkaSinkSpec)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SinkSpec::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn SinkSpec::discard() -> Self
 pub fn SinkSpec::durable(String) -> Self raise ApiError
 pub fn SinkSpec::json_lines(String) -> Self raise ApiError
+pub fn SinkSpec::kafka(KafkaSinkSpec) -> Self
 pub fn SinkSpec::path(Self) -> String?
 pub fn SinkSpec::requires_idempotent_consumer(Self) -> Bool
 
@@ -752,15 +899,21 @@ pub struct SourceBackedExecution {
   job_store : @moonweave/moonweave/runtime/async.JobStore
   source : @moonweave/moonweave/runtime/async.SourceBackedJob
   output_manifest : @moonweave/moonweave/runtime/async.JobOutputManifest?
+  mut kafka_source : KafkaSource?
+  mut kafka_source_started : Bool
+  mut kafka_source_stopped : Bool
+  mut kafka_stop_requested : Bool
   mut closed : Bool
 }
 
 pub(all) enum SourceSpec {
   Events
   JsonLines(String)
+  Kafka(KafkaSourceSpec)
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SourceSpec::events() -> Self
 pub fn SourceSpec::json_lines(String) -> Self raise ApiError
+pub fn SourceSpec::kafka(KafkaSourceSpec) -> Self
 pub fn SourceSpec::path(Self) -> String?
 pub fn SourceSpec::recovery_capability(Self) -> RecoveryCapability
 
@@ -801,7 +954,8 @@ pub struct WorkerNodeConfig {
   start_offset : Int64
   assignment_known : Bool
   auth_token : String?
-} derive(Eq, @debug.Debug)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 pub fn WorkerNodeConfig::auth_token(Self) -> String?
 pub fn WorkerNodeConfig::cluster_id(Self) -> String
 pub fn WorkerNodeConfig::coordinator(Self) -> NodeEndpoint
@@ -816,6 +970,7 @@ pub fn WorkerNodeConfig::start_offset(Self) -> Int64
 pub fn WorkerNodeConfig::storage_dir(Self) -> String
 pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn WorkerNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn WorkerNodeConfig::worker_id(Self) -> String
 
 pub struct WorkerNodeSetConfig {
@@ -827,7 +982,8 @@ pub struct WorkerNodeSetConfig {
   storage_dir : String
   partitions : Array[Int]?
   auth_token : String?
-} derive(Eq, @debug.Debug)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 pub fn WorkerNodeSetConfig::auth_token(Self) -> String?
 pub fn WorkerNodeSetConfig::cluster_id(Self) -> String
 pub fn WorkerNodeSetConfig::coordinator(Self) -> NodeEndpoint
@@ -837,6 +993,7 @@ pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, St
 pub fn WorkerNodeSetConfig::partitions(Self) -> ArrayView[Int]
 pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
 pub fn WorkerNodeSetConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn WorkerNodeSetConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn WorkerNodeSetConfig::with_partitions(Self, ArrayView[Int]) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::worker_id(Self) -> String
 

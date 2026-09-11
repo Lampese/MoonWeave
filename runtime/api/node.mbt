@@ -124,7 +124,8 @@ pub struct CoordinatorNodeConfig {
   workers : Array[WorkerSlot]
   migration_required : Bool
   auth_token : String?
-} derive(Debug, Eq)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 
 ///|
 pub fn CoordinatorNodeConfig::new(
@@ -161,6 +162,7 @@ pub fn CoordinatorNodeConfig::new(
     workers: copied,
     migration_required: false,
     auth_token: None,
+    kafka_runtime: None,
   }
 }
 
@@ -253,6 +255,16 @@ pub fn CoordinatorNodeConfig::auth_token(
 }
 
 ///|
+/// Supply process-local Kafka TLS/SASL handles. The handles are never included
+/// in a Job submission, checkpoint, or WAL record.
+pub fn CoordinatorNodeConfig::with_kafka_runtime(
+  self : CoordinatorNodeConfig,
+  runtime : KafkaRuntimeConfig,
+) -> CoordinatorNodeConfig {
+  { ..self, kafka_runtime: Some(runtime), }
+}
+
+///|
 /// Configuration kept by one Worker process. `partition` is a static
 /// assignment hint for this first multi-machine runner; the Coordinator still
 /// fences it with the assignment epoch during the handshake.
@@ -268,7 +280,8 @@ pub struct WorkerNodeConfig {
   start_offset : Int64
   assignment_known : Bool
   auth_token : String?
-} derive(Debug, Eq)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 
 ///|
 pub fn WorkerNodeConfig::new(
@@ -310,6 +323,7 @@ pub fn WorkerNodeConfig::new(
     start_offset: 0L,
     assignment_known: true,
     auth_token: None,
+    kafka_runtime: None,
   }
 }
 
@@ -431,6 +445,15 @@ pub fn WorkerNodeConfig::auth_token(self : WorkerNodeConfig) -> String? {
 }
 
 ///|
+/// Supply process-local Kafka TLS/SASL handles for this Worker.
+pub fn WorkerNodeConfig::with_kafka_runtime(
+  self : WorkerNodeConfig,
+  runtime : KafkaRuntimeConfig,
+) -> WorkerNodeConfig {
+  { ..self, kafka_runtime: Some(runtime), }
+}
+
+///|
 /// Identity and storage configuration for one Worker process that hosts every
 /// partition assigned to it by the compiled Job. Per-partition Task sessions
 /// are created by `run_worker_node_set`.
@@ -443,7 +466,8 @@ pub struct WorkerNodeSetConfig {
   storage_dir : String
   partitions : Array[Int]?
   auth_token : String?
-} derive(Debug, Eq)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 
 ///|
 pub fn WorkerNodeSetConfig::new(
@@ -478,6 +502,7 @@ pub fn WorkerNodeSetConfig::new(
     storage_dir,
     partitions: None,
     auth_token: None,
+    kafka_runtime: None,
   }
 }
 
@@ -530,6 +555,15 @@ pub fn WorkerNodeSetConfig::with_auth_token(
 ///|
 pub fn WorkerNodeSetConfig::auth_token(self : WorkerNodeSetConfig) -> String? {
   self.auth_token
+}
+
+///|
+/// Supply process-local Kafka TLS/SASL handles shared by this Worker's Tasks.
+pub fn WorkerNodeSetConfig::with_kafka_runtime(
+  self : WorkerNodeSetConfig,
+  runtime : KafkaRuntimeConfig,
+) -> WorkerNodeSetConfig {
+  { ..self, kafka_runtime: Some(runtime), }
 }
 
 ///|
@@ -1540,12 +1574,17 @@ pub async fn CoordinatorListener::run(
   job : CompiledJob,
   events : ArrayView[Event],
 ) -> CoordinatorNodeSummary raise ApiError {
+  defer self.server.close()
+  if job.definition.source is SourceSpec::Kafka(_) {
+    raise ApiError::Source(
+      "run_coordinator_node does not support Kafka sources; use DriverCoordinator.run",
+    )
+  }
   validate_coordinator_workers(job, self.config)
   for event in events {
     job.descriptor.validate_event(event)
   }
   let endpoint = self.endpoint()
-  defer self.server.close()
   let storage_exists = @fs.exists(self.config.storage_dir) catch {
     error =>
       raise ApiError::Cluster(
@@ -1669,7 +1708,7 @@ pub async fn CoordinatorListener::run(
   let works = build_node_works(job, events, assignments)
   let output_manifest = match job.definition.sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) =>
       Some(
         @runtime.JobOutputManifest::open(
           self.config.storage_dir + "/manifest.wal",
@@ -1767,6 +1806,11 @@ pub async fn CompiledJob::run_coordinator_node(
   config : CoordinatorNodeConfig,
   events : ArrayView[Event],
 ) -> CoordinatorNodeSummary raise ApiError {
+  if self.definition.source is SourceSpec::Kafka(_) {
+    raise ApiError::Source(
+      "run_coordinator_node does not support Kafka sources; use DriverCoordinator.run",
+    )
+  }
   let listener = CoordinatorNode::bind(config)
   listener.run(self, events)
 }
@@ -1777,6 +1821,47 @@ pub async fn CompiledJob::run_coordinator_node(
 pub async fn CompiledJob::run_worker_node(
   self : CompiledJob,
   config : WorkerNodeConfig,
+) -> WorkerNodeSummary raise ApiError {
+  guard self.definition.sink is SinkSpec::Kafka(spec) else {
+    return self.run_worker_node_with_sink(config, None)
+  }
+  let sink_config = config.kafka_runtime
+    .unwrap_or(KafkaRuntimeConfig::new())
+    .sink_config(spec)
+  let mut outcome : Result[WorkerNodeSummary, ApiError]? = None
+  (@async_runtime.with_task_group <| group => {
+    let connected : Result[KafkaSink, ApiError] = Ok(
+      KafkaSink::connect(group~, sink_config),
+    ) catch {
+      error => Err(error)
+    }
+    match connected {
+      Err(error) => outcome = Some(Err(error))
+      Ok(sink) => {
+        defer sink.close()
+        outcome = Some(
+          Ok(self.run_worker_node_with_sink(config, Some(sink))) catch {
+            error => Err(error)
+          },
+        )
+      }
+    }
+  }) catch {
+    error =>
+      raise ApiError::Sink("Kafka producer runtime: " + @debug.to_string(error))
+  }
+  match outcome {
+    Some(Ok(summary)) => summary
+    Some(Err(error)) => raise error
+    None => raise ApiError::Sink("Kafka Worker runtime did not start")
+  }
+}
+
+///|
+async fn CompiledJob::run_worker_node_with_sink(
+  self : CompiledJob,
+  config : WorkerNodeConfig,
+  kafka_sink : KafkaSink?,
 ) -> WorkerNodeSummary raise ApiError {
   let partition = if config.partition < 0 {
     let owned : Array[Int] = []
@@ -1873,6 +1958,16 @@ pub async fn CompiledJob::run_worker_node(
         output_log_path?,
         dynamic_assignment=!config.assignment_known,
         auth_token?=config.auth_token,
+        output_delivery?=match kafka_sink {
+          Some(sink) => Some(record => sink.write(record))
+          None => None
+        },
+        output_consumer_checkpoint_prefix?=kafka_sink.map(_ => {
+          config.storage_dir + "/sink-kafka-p" + partition.to_string()
+        }),
+        output_consumer_id?=kafka_sink.map(sink => {
+          self.definition.job_id + "-kafka-" + sink.topic()
+        }),
       ),
     ) catch {
       error => Err(error)
@@ -2090,6 +2185,47 @@ pub async fn CompiledJob::run_worker_node_set(
   self : CompiledJob,
   config : WorkerNodeSetConfig,
 ) -> WorkerNodeSetSummary raise ApiError {
+  guard self.definition.sink is SinkSpec::Kafka(spec) else {
+    return self.run_worker_node_set_with_sink(config, None)
+  }
+  let sink_config = config.kafka_runtime
+    .unwrap_or(KafkaRuntimeConfig::new())
+    .sink_config(spec)
+  let mut outcome : Result[WorkerNodeSetSummary, ApiError]? = None
+  (@async_runtime.with_task_group <| group => {
+    let connected : Result[KafkaSink, ApiError] = Ok(
+      KafkaSink::connect(group~, sink_config),
+    ) catch {
+      error => Err(error)
+    }
+    match connected {
+      Err(error) => outcome = Some(Err(error))
+      Ok(sink) => {
+        defer sink.close()
+        outcome = Some(
+          Ok(self.run_worker_node_set_with_sink(config, Some(sink))) catch {
+            error => Err(error)
+          },
+        )
+      }
+    }
+  }) catch {
+    error =>
+      raise ApiError::Sink("Kafka producer runtime: " + @debug.to_string(error))
+  }
+  match outcome {
+    Some(Ok(summary)) => summary
+    Some(Err(error)) => raise error
+    None => raise ApiError::Sink("Kafka Worker runtime did not start")
+  }
+}
+
+///|
+async fn CompiledJob::run_worker_node_set_with_sink(
+  self : CompiledJob,
+  config : WorkerNodeSetConfig,
+  kafka_sink : KafkaSink?,
+) -> WorkerNodeSetSummary raise ApiError {
   if !self.definition.workers.any(worker => worker == config.worker_id) {
     raise ApiError::InvalidWorkerAssignment(config.worker_id)
   }
@@ -2181,6 +2317,16 @@ pub async fn CompiledJob::run_worker_node_set(
         output_log_path?,
         dynamic_assignment=config.partitions is Some(_),
         auth_token?=config.auth_token,
+        output_delivery?=match kafka_sink {
+          Some(sink) => Some(record => sink.write(record))
+          None => None
+        },
+        output_consumer_checkpoint_prefix?=kafka_sink.map(_ => {
+          config.storage_dir + "/sink-kafka-p" + partition.to_string()
+        }),
+        output_consumer_id?=kafka_sink.map(sink => {
+          self.definition.job_id + "-kafka-" + sink.topic()
+        }),
       ),
     )
   }

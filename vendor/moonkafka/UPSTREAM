@@ -1,0 +1,11 @@
+Source: https://github.com/daqing/moonkafka
+Commit: 986994bb7bc48850e3d44e3a4c532a4c3f45ae32
+License: MIT (see LICENSE)
+
+The registry's 0.2.0 release has an invalid Kafka request-header encoding.
+This pinned source includes the upstream header fix; moon.work resolves the
+dependency here so clean builds do not depend on patched registry caches.
+
+Local fixes verified against Apache Kafka 4.0.0:
+- CreateTopics v7 TopicConfigErrorCode is tagged, not an inline field.
+- Ignore records before the requested fetch offset before applying the poll cap.

@@ -104,6 +104,37 @@ async test "driver store persists submission input lifecycle and idempotent retr
 }
 
 ///|
+async test "driver store rejects input for Kafka source jobs without journaling it" {
+  with_driver_store <| ((store, _) => {
+    let source = KafkaSourceSpec::new(
+      ["broker-a:9092"],
+      "events",
+      "moonweave-workers",
+      0,
+    )
+    let submission = JobDefinition::new(
+        "driver-kafka-source",
+        OperatorRef::reachability(),
+      )
+      .with_source(SourceSpec::kafka(source))
+      .compile()
+      .submission_with_id("driver-kafka-submission")
+    ignore(store.submit(submission))
+    let records_before = store.stats().record_count()
+    try store.input([driver_event(0)]) catch {
+      ApiError::InvalidDriverCommand(message) =>
+        assert_true(message.contains("Kafka source"))
+      _ => fail("expected Kafka source Driver input rejection")
+    } noraise {
+      _ => fail("Kafka source accepted Driver input")
+    }
+    assert_eq(store.accepted_events(), 0L)
+    assert_eq(store.inputs(), [])
+    assert_eq(store.stats().record_count(), records_before)
+  })
+}
+
+///|
 async test "driver store reopens static custom submissions with their registry" {
   let directory = @fs.tmpdir(prefix="moonweave-driver-static-custom")
   let path = directory + "/driver.wal"

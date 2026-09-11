@@ -254,7 +254,7 @@ async fn JsonLinesSource::persist_offset(
   ) catch {
     error => raise source_error("write cursor", error)
   }
-  @async_runtime.protect_from_cancel(resume_on_cancel=true, () => {
+  @async_runtime.protect_from_cancel(() => {
     @fs.rename(temporary, self.cursor_path, replace=true)
     self.offset = next_offset
     self.prefix_digest = prefix_digest

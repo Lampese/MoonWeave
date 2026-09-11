@@ -40,7 +40,31 @@ pub struct Frame {
   assignment_epoch : Int
   kind : FrameKind
   payload : String
-} derive(Debug, Eq, ToJson, FromJson)
+} derive(Eq, ToJson, FromJson)
+
+///|
+/// Hide credentials carried inside the opaque JSON payload of authentication
+/// frames when a transport frame is rendered for diagnostics.
+pub impl @debug.Debug for Frame with fn to_repr(self) {
+  let payload = match self.kind {
+    FrameKind::Hello | FrameKind::DriverSubmit => "<redacted>"
+    _ => self.payload
+  }
+  @debug.Repr::record(
+    Map([
+      ("version", Repr(self.version)),
+      ("cluster_id", Repr(self.cluster_id)),
+      ("session_id", Repr(self.session_id)),
+      ("message_id", Repr(self.message_id)),
+      ("sender_id", Repr(self.sender_id)),
+      ("worker_incarnation", Repr(self.worker_incarnation)),
+      ("message_sequence", Repr(self.message_sequence)),
+      ("assignment_epoch", Repr(self.assignment_epoch)),
+      ("kind", Repr(self.kind)),
+      ("payload", Repr(payload)),
+    ]),
+  )
+}
 
 ///|
 /// Create a validated frame before it enters an I/O adapter.

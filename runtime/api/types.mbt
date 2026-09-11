@@ -44,6 +44,7 @@ pub(all) suberror ApiError {
 pub(all) enum SourceSpec {
   Events
   JsonLines(String)
+  Kafka(KafkaSourceSpec)
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -61,10 +62,18 @@ pub fn SourceSpec::json_lines(path : String) -> SourceSpec raise ApiError {
 }
 
 ///|
+/// Read complete MoonWeave `Event` values from one explicitly assigned Kafka
+/// partition. Credentials are injected at execution time.
+pub fn SourceSpec::kafka(config : KafkaSourceSpec) -> SourceSpec {
+  SourceSpec::Kafka(config)
+}
+
+///|
 pub fn SourceSpec::path(self : SourceSpec) -> String? {
   match self {
     SourceSpec::Events => None
     SourceSpec::JsonLines(path) => Some(path)
+    SourceSpec::Kafka(_) => None
   }
 }
 
@@ -84,6 +93,7 @@ pub fn SourceSpec::recovery_capability(self : SourceSpec) -> RecoveryCapability 
   match self {
     SourceSpec::Events => RecoveryCapability::Replayable
     SourceSpec::JsonLines(_) => RecoveryCapability::Replayable
+    SourceSpec::Kafka(_) => RecoveryCapability::Replayable
   }
 }
 
@@ -105,6 +115,7 @@ pub(all) enum SinkSpec {
   Discard
   Durable(String)
   JsonLines(String)
+  Kafka(KafkaSinkSpec)
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -143,19 +154,30 @@ pub fn SinkSpec::json_lines(path : String) -> SinkSpec raise ApiError {
 }
 
 ///|
+/// Send each durable task output to a Kafka topic after the local output WAL
+/// has recorded it. The runtime credentials are supplied separately through
+/// `KafkaRuntimeConfig` and never enter this serializable Job definition.
+pub fn SinkSpec::kafka(config : KafkaSinkSpec) -> SinkSpec {
+  SinkSpec::Kafka(config)
+}
+
+///|
 pub fn SinkSpec::path(self : SinkSpec) -> String? {
   match self {
     SinkSpec::Discard => None
     SinkSpec::Durable(name) => Some(name)
     SinkSpec::JsonLines(path) => Some(path)
+    SinkSpec::Kafka(_) => None
   }
 }
 
 ///|
 pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
   match self {
-    SinkSpec::Discard | SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
-      DeliveryGuarantee::AtLeastOnce
+    SinkSpec::Discard
+    | SinkSpec::Durable(_)
+    | SinkSpec::JsonLines(_)
+    | SinkSpec::Kafka(_) => DeliveryGuarantee::AtLeastOnce
   }
 }
 
@@ -165,7 +187,7 @@ pub fn SinkSpec::delivery_guarantee(self : SinkSpec) -> DeliveryGuarantee {
 pub fn SinkSpec::requires_idempotent_consumer(self : SinkSpec) -> Bool {
   match self {
     SinkSpec::Discard => false
-    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) => true
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) => true
   }
 }
 
@@ -411,6 +433,12 @@ pub fn Event::keyed_sum(
 ///|
 pub fn Event::id(self : Event) -> @causal.EventId {
   self.record.id()
+}
+
+///|
+/// Causal parents carried by this event.
+pub fn Event::parents(self : Event) -> ArrayView[@causal.EventId] {
+  self.record.parents()
 }
 
 ///|
@@ -720,7 +748,8 @@ pub struct ClusterConfig {
   cluster_id : String
   coordinator_id : String
   storage_dir : String
-} derive(Debug, Eq)
+  kafka_runtime : KafkaRuntimeConfig?
+}
 
 ///|
 pub fn ClusterConfig::new(
@@ -734,7 +763,7 @@ pub fn ClusterConfig::new(
   if storage_dir.is_empty() {
     raise ApiError::Cluster("storage directory is required")
   }
-  { cluster_id, coordinator_id, storage_dir, }
+  { cluster_id, coordinator_id, storage_dir, kafka_runtime: None, }
 }
 
 ///|
@@ -750,6 +779,17 @@ pub fn ClusterConfig::coordinator_id(self : ClusterConfig) -> String {
 ///|
 pub fn ClusterConfig::storage_dir(self : ClusterConfig) -> String {
   self.storage_dir
+}
+
+///|
+/// Supply non-serializable Kafka TLS/SASL handles for this local execution.
+/// They are deliberately kept on the runtime configuration rather than the
+/// Job definition, submission envelope, or WAL.
+pub fn ClusterConfig::with_kafka_runtime(
+  self : ClusterConfig,
+  runtime : KafkaRuntimeConfig,
+) -> ClusterConfig {
+  { ..self, kafka_runtime: Some(runtime), }
 }
 
 ///|

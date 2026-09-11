@@ -8,7 +8,8 @@ pub(all) struct DriverConfig {
   driver_id : String
   endpoint : NodeEndpoint
   incarnation : String
-} derive(Debug, Eq)
+  auth_token : String?
+} derive(Eq)
 
 ///|
 pub fn DriverConfig::new(
@@ -32,6 +33,7 @@ pub fn DriverConfig::new(
     driver_id,
     endpoint,
     incarnation: "driver-" + driver_id,
+    auth_token: None,
   }
 }
 
@@ -69,6 +71,23 @@ pub fn DriverConfig::endpoint(self : DriverConfig) -> NodeEndpoint {
 ///|
 pub fn DriverConfig::incarnation(self : DriverConfig) -> String {
   self.incarnation
+}
+
+///|
+/// Configure the shared secret presented in the first Driver submit frame.
+pub fn DriverConfig::with_auth_token(
+  self : DriverConfig,
+  token : String,
+) -> DriverConfig raise ApiError {
+  if token.is_empty() {
+    raise ApiError::Cluster("Driver auth token must not be empty")
+  }
+  { ..self, auth_token: Some(token), }
+}
+
+///|
+pub fn DriverConfig::auth_token(self : DriverConfig) -> String? {
+  self.auth_token
 }
 
 ///|
@@ -294,6 +313,7 @@ pub async fn DriverClient::submit(
     @protocol.DriverSubmit::new(
       submission.submission_id(),
       driver_submit_payload(submission),
+      auth_token?=self.config.auth_token,
     ).to_payload() catch {
       error => raise ApiError::Cluster(@debug.to_string(error))
     },
@@ -365,7 +385,8 @@ pub(all) struct DriverControlConfig {
   coordinator_id : String
   bind : NodeEndpoint
   advertised : NodeEndpoint?
-} derive(Debug, Eq)
+  auth_token : String?
+} derive(Eq)
 
 ///|
 pub fn DriverControlConfig::new(
@@ -376,7 +397,7 @@ pub fn DriverControlConfig::new(
   if cluster_id.is_empty() || coordinator_id.is_empty() {
     raise ApiError::Cluster("cluster and coordinator ids are required")
   }
-  { cluster_id, coordinator_id, bind, advertised: None, }
+  { cluster_id, coordinator_id, bind, advertised: None, auth_token: None, }
 }
 
 ///|
@@ -409,6 +430,23 @@ pub fn DriverControlConfig::advertised_endpoint(
   self : DriverControlConfig,
 ) -> NodeEndpoint? {
   self.advertised
+}
+
+///|
+/// Require a shared secret on the first Driver submit frame.
+pub fn DriverControlConfig::with_auth_token(
+  self : DriverControlConfig,
+  token : String,
+) -> DriverControlConfig raise ApiError {
+  if token.is_empty() {
+    raise ApiError::Cluster("Driver auth token must not be empty")
+  }
+  { ..self, auth_token: Some(token), }
+}
+
+///|
+pub fn DriverControlConfig::auth_token(self : DriverControlConfig) -> String? {
+  self.auth_token
 }
 
 ///|
@@ -547,6 +585,19 @@ async fn serve_driver_connection(
       raise ApiError::Cluster(
         "validate Driver frame: " + @debug.to_string(error),
       )
+  }
+  match listener.config.auth_token {
+    None => ()
+    Some(expected) => {
+      guard inbound is @protocol.DriverInbound::Submit(submit) else {
+        raise ApiError::InvalidDriverCommand(
+          "first Driver frame must be submit",
+        )
+      }
+      if submit.auth_token() != Some(expected) {
+        raise ApiError::Cluster("Driver authentication failed")
+      }
+    }
   }
   let outbound = @protocol.FrameBuilder::new(
     cluster_id,

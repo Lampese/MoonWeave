@@ -132,6 +132,38 @@ async test "Coordinator rejects invalid peers without consuming finite Worker sl
 }
 
 ///|
+async test "finite Coordinator entry rejects Kafka sources explicitly" {
+  let root = @fs.tmpdir(prefix="moonweave-coordinator-kafka-entry")
+  defer @fs.rmdir(root, recursive=true)
+  @async_runtime.with_timeout(10000, () => {
+    let source = KafkaSourceSpec::new(["broker-a:9092"], "events", "workers", 0)
+    let job = JobDefinition::new(
+        "coordinator-kafka-entry",
+        OperatorRef::keyed_sum(),
+      )
+      .with_workers(["worker"])
+      .with_source(SourceSpec::kafka(source))
+      .compile()
+    let listener = CoordinatorNode::bind(
+      CoordinatorNodeConfig::new(
+        job.job_id(),
+        "coordinator",
+        NodeEndpoint::new("127.0.0.1", 0),
+        root,
+        [WorkerSlot::new("worker", "boot-worker")],
+      ),
+    )
+    defer listener.close()
+    try listener.run(job, []) catch {
+      ApiError::Source(message) => assert_true(message.contains("Kafka"))
+      _ => fail("expected Kafka source entry-point rejection")
+    } noraise {
+      _ => fail("expected Kafka source entry-point rejection")
+    }
+  })
+}
+
+///|
 async test "invalid and duplicate live peers leave running sessions and Job state intact" {
   let root = @fs.tmpdir(prefix="moonweave-live-admission")
   defer @fs.rmdir(root, recursive=true)

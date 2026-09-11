@@ -291,12 +291,15 @@ pub fn DriverStatus::to_payload(Self) -> String
 pub(all) struct DriverSubmit {
   submission_id : String
   job : Json
-} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+  auth_token : String?
+} derive(Eq, ToJson, @json.FromJson)
+pub fn DriverSubmit::auth_token(Self) -> String?
 pub fn DriverSubmit::from_payload(String) -> Self raise MessageError
 pub fn DriverSubmit::job(Self) -> Json
-pub fn DriverSubmit::new(String, Json) -> Self raise ProtocolError
+pub fn DriverSubmit::new(String, Json, auth_token? : String) -> Self raise ProtocolError
 pub fn DriverSubmit::submission_id(Self) -> String
 pub fn DriverSubmit::to_payload(Self) -> String
+pub impl @debug.Debug for DriverSubmit
 
 pub(all) struct EventBatch {
   partition : Int
@@ -337,7 +340,7 @@ pub struct Frame {
   assignment_epoch : Int
   kind : FrameKind
   payload : String
-} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+} derive(Eq, ToJson, @json.FromJson)
 pub fn Frame::assignment_epoch(Self) -> Int
 pub fn Frame::cluster_id(Self) -> String
 pub fn Frame::decode_payload(Bytes, maximum_frame_bytes? : Int) -> Self raise ProtocolError
@@ -351,6 +354,7 @@ pub fn Frame::sender_id(Self) -> String
 pub fn Frame::session_id(Self) -> String
 pub fn Frame::version(Self) -> Int
 pub fn Frame::worker_incarnation(Self) -> String
+pub impl @debug.Debug for Frame
 
 pub struct FrameBuilder {
   version : Int
@@ -418,7 +422,7 @@ pub(all) struct Hello {
   last_session_id : String?
   requested_partition : Int?
   auth_token : String?
-} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+} derive(Eq, ToJson, @json.FromJson)
 pub fn Hello::auth_token(Self) -> String?
 pub fn Hello::capabilities(Self) -> ArrayView[String]
 pub fn Hello::from_payload(String) -> Self raise MessageError
@@ -428,6 +432,7 @@ pub fn Hello::new(String, String, Array[String], last_session_id? : String, requ
 pub fn Hello::requested_partition(Self) -> Int?
 pub fn Hello::to_payload(Self) -> String
 pub fn Hello::worker_id(Self) -> String
+pub impl @debug.Debug for Hello
 
 pub struct Incarnation {
   value : String

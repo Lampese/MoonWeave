@@ -37,17 +37,36 @@ pub fn EventRecord::new(
 pub(all) struct DriverSubmit {
   submission_id : String
   job : Json
-} derive(Debug, Eq, ToJson, FromJson)
+  auth_token : String?
+} derive(Eq, ToJson, FromJson)
+
+///|
+/// Keep shared credentials out of diagnostics while retaining useful submit
+/// metadata for protocol debugging.
+pub impl @debug.Debug for DriverSubmit with fn to_repr(self) {
+  @debug.Repr::record(
+    Map([
+      ("submission_id", Repr(self.submission_id)),
+      ("job", Repr(self.job)),
+      ("auth_token", Repr(self.auth_token.map(_ => "<redacted>"))),
+    ]),
+  )
+}
 
 ///|
 pub fn DriverSubmit::new(
   submission_id : String,
   job : Json,
+  auth_token? : String,
 ) -> DriverSubmit raise ProtocolError {
   if submission_id.is_empty() {
     raise ProtocolError::InvalidFrameField
   }
-  { submission_id, job, }
+  match auth_token {
+    Some(token) if token.is_empty() => raise ProtocolError::InvalidFrameField
+    _ => ()
+  }
+  { submission_id, job, auth_token, }
 }
 
 ///|
@@ -61,6 +80,13 @@ pub fn DriverSubmit::job(self : DriverSubmit) -> Json {
 }
 
 ///|
+/// Optional shared-secret credential used to authenticate the Driver control
+/// connection before its session is admitted.
+pub fn DriverSubmit::auth_token(self : DriverSubmit) -> String? {
+  self.auth_token
+}
+
+///|
 pub fn DriverSubmit::to_payload(self : DriverSubmit) -> String {
   encode_payload(self)
 }
@@ -70,7 +96,11 @@ pub fn DriverSubmit::from_payload(
   text : String,
 ) -> DriverSubmit raise MessageError {
   let value : DriverSubmit = decode_payload(text)
-  DriverSubmit::new(value.submission_id, value.job) catch {
+  DriverSubmit::new(
+    value.submission_id,
+    value.job,
+    auth_token?=value.auth_token,
+  ) catch {
     error => raise MessageError::Protocol(error)
   }
 }
@@ -258,7 +288,22 @@ pub(all) struct Hello {
   last_session_id : String?
   requested_partition : Int?
   auth_token : String?
-} derive(Debug, Eq, ToJson, FromJson)
+} derive(Eq, ToJson, FromJson)
+
+///|
+/// Shared credentials are intentionally redacted from Hello diagnostics.
+pub impl @debug.Debug for Hello with fn to_repr(self) {
+  @debug.Repr::record(
+    Map([
+      ("worker_id", Repr(self.worker_id)),
+      ("incarnation", Repr(self.incarnation)),
+      ("capabilities", Repr(self.capabilities)),
+      ("last_session_id", Repr(self.last_session_id)),
+      ("requested_partition", Repr(self.requested_partition)),
+      ("auth_token", Repr(self.auth_token.map(_ => "<redacted>"))),
+    ]),
+  )
+}
 
 ///|
 pub fn Hello::new(

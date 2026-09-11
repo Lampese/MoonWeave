@@ -13,7 +13,7 @@ pub struct LocalRun {
 pub fn CompiledJob::run_local(self : CompiledJob) -> LocalRun raise ApiError {
   match self.definition.sink {
     SinkSpec::Discard => ()
-    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) =>
       raise ApiError::Cluster(
         "LocalRun has no durable sink; use run_local_cluster",
       )

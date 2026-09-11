@@ -21,24 +21,71 @@ fn cluster_event_groups(
 
 ///|
 /// Run a finite Job through real local Coordinator/Worker TCP sessions. When
-/// the Job declares a JSONL source, the supplied events are ignored and the
-/// uncommitted source prefix is processed instead.
+/// the Job declares an external source, the supplied events are ignored. A
+/// Kafka source contributes one bounded poll batch; a live runner is required
+/// for continuous Kafka consumption.
 pub async fn CompiledJob::run_local_cluster(
   self : CompiledJob,
   config : ClusterConfig,
   events : ArrayView[Event],
 ) -> ClusterRunSummary raise ApiError {
+  let mut outcome : Result[ClusterRunSummary, ApiError]? = None
+  (@async_runtime.with_task_group <| group => {
+    outcome = Some(
+      Ok(self.run_local_cluster_in_group(group, config, events)) catch {
+        error => Err(error)
+      },
+    )
+  }) catch {
+    error =>
+      raise ApiError::Cluster("local Kafka runtime: " + @debug.to_string(error))
+  }
+  match outcome {
+    Some(Ok(summary)) => summary
+    Some(Err(error)) => raise error
+    None => raise ApiError::Cluster("local cluster runtime did not start")
+  }
+}
+
+///|
+async fn CompiledJob::run_local_cluster_in_group(
+  self : CompiledJob,
+  group : @async_runtime.TaskGroup[Unit],
+  config : ClusterConfig,
+  events : ArrayView[Event],
+) -> ClusterRunSummary raise ApiError {
+  let kafka_runtime = config.kafka_runtime.unwrap_or(KafkaRuntimeConfig::new())
   let external_source : JsonLinesSource? = match self.definition.source {
     SourceSpec::Events => None
     SourceSpec::JsonLines(path) => Some(JsonLinesSource::open(path))
+    SourceSpec::Kafka(_) => None
+  }
+  let kafka_source : KafkaSource? = match self.definition.source {
+    SourceSpec::Kafka(spec) =>
+      Some(KafkaSource::connect(group~, kafka_runtime.source_config(spec)))
+    _ => None
   }
   defer (match external_source {
     None => ()
     Some(source) => source.close()
   })
-  let input_events : Array[Event] = match external_source {
-    None => events.to_owned()
-    Some(source) => {
+  defer (match kafka_source {
+    None => ()
+    Some(source) => source.close()
+  })
+  let kafka_sink : KafkaSink? = match self.definition.sink {
+    SinkSpec::Kafka(spec) =>
+      Some(KafkaSink::connect(group~, kafka_runtime.sink_config(spec)))
+    _ => None
+  }
+  defer (match kafka_sink {
+    None => ()
+    Some(sink) => sink.close()
+  })
+  let (input_events, kafka_next_offset) : (Array[Event], Int64?) = match
+    (external_source, kafka_source) {
+    (None, None) => (events.to_owned(), None)
+    (Some(source), None) => {
       let result : Array[Event] = []
       let mut finished = false
       while !finished {
@@ -52,8 +99,13 @@ pub async fn CompiledJob::run_local_cluster(
           }
         }
       }
-      result
+      (result, None)
     }
+    (None, Some(source)) => {
+      let batch = source.poll()
+      (batch.events().to_owned(), Some(batch.next_offset()))
+    }
+    _ => raise ApiError::Cluster("multiple external sources")
   }
   for event in input_events {
     self.descriptor.validate_event(event)
@@ -188,7 +240,7 @@ pub async fn CompiledJob::run_local_cluster(
   }
   let output_manifest = match self.definition.sink {
     SinkSpec::Discard => None
-    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+    SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) =>
       Some(
         @runtime.JobOutputManifest::open(
           config.storage_dir + "/manifest.wal",
@@ -212,10 +264,14 @@ pub async fn CompiledJob::run_local_cluster(
   }
   defer server.close()
   let outputs : Array[Output] = []
-  let supervisor_result : Result[@runtime.SupervisorRunSummary, String] = (@async_runtime.with_task_group <| group => {
-    let supervisor : @async_runtime.Task[
-      Result[@runtime.SupervisorRunSummary, String],
-    ] = group.spawn(allow_failure=true) <| () => {
+  let mut supervisor_summary : @runtime.SupervisorRunSummary? = None
+  let mut supervisor_failure : String? = None
+  let mut worker_failure : String? = None
+  // Keep the finite Coordinator/Worker exchange in a nested group. Any
+  // terminal session failure cancels peer sessions immediately; the captured
+  // error is returned after structured cleanup completes.
+  (@async_runtime.with_task_group <| execution_group => {
+    execution_group.spawn_bg(allow_failure=true) <| () => {
       let result : Result[@runtime.SupervisorRunSummary, String] = Ok(
         @runtime.run_durable_job_supervisor(
           server,
@@ -227,17 +283,22 @@ pub async fn CompiledJob::run_local_cluster(
       ) catch {
         error => Err(@debug.to_string(error))
       }
-      result
+      match result {
+        Ok(summary) => supervisor_summary = Some(summary)
+        Err(reason) => {
+          supervisor_failure = Some(reason)
+          execution_group.return_immediately(())
+        }
+      }
     }
-    let worker_tasks : Array[
-      @async_runtime.Task[Result[@runtime.WorkerRunSummary, String]],
-    ] = []
     for partition in 0..<self.spec.partition_count() {
       guard assignments.get(partition) is Some(assignment) else { continue }
       guard incarnations.get(assignment.worker_id()) is Some(incarnation) else {
         continue
       }
-      let connection = @socket.Tcp::connect(server.addr)
+      let connection = @socket.Tcp::connect(server.addr) catch {
+        error => raise cluster_error_at("connect local Worker", error)
+      }
       let task = descriptor.create_task(
         self.definition.job_id +
         "/p" +
@@ -262,14 +323,12 @@ pub async fn CompiledJob::run_local_cluster(
         ".wal"
       let output_log_path = match self.definition.sink {
         SinkSpec::Discard => None
-        SinkSpec::Durable(_) | SinkSpec::JsonLines(_) =>
+        SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) =>
           Some(
             config.storage_dir + "/output-p" + partition.to_string() + ".wal",
           )
       }
-      let worker_task : @async_runtime.Task[
-        Result[@runtime.WorkerRunSummary, String],
-      ] = group.spawn(allow_failure=true) <| () => {
+      execution_group.spawn_bg(allow_failure=true) <| () => {
         let handler : (@task.TaskOutput) -> Unit raise = output => {
           outputs.push(local_output(output))
         }
@@ -288,29 +347,52 @@ pub async fn CompiledJob::run_local_cluster(
             initial_credit_bytes=4L * 1024L * 1024L,
             delta_wal_path~,
             output_log_path?,
+            output_delivery?=match kafka_sink {
+              Some(sink) =>
+                Some(record => {
+                  sink.write(record)
+                  outputs.push(local_output(record.output()))
+                })
+              None => None
+            },
+            output_consumer_checkpoint_prefix?=kafka_sink.map(_ => {
+              config.storage_dir + "/sink-kafka-p" + partition.to_string()
+            }),
+            output_consumer_id?=kafka_sink.map(sink => {
+              self.definition.job_id + "-kafka-" + sink.topic()
+            }),
           ),
         ) catch {
           error => Err(@debug.to_string(error))
         }
-        result
+        match result {
+          Ok(_) => ()
+          Err(reason) => {
+            if worker_failure is None {
+              worker_failure = Some(reason)
+            }
+            execution_group.return_immediately(())
+          }
+        }
       }
-      worker_tasks.push(worker_task)
     }
-    let supervisor_outcome : Result[@runtime.SupervisorRunSummary, String] = supervisor.wait() catch {
-      error => Err(@debug.to_string(error))
-    }
-    for worker_task in worker_tasks {
-      let _worker_outcome : Result[@runtime.WorkerRunSummary, String] = worker_task.wait() catch {
-        error => Err(@debug.to_string(error))
-      }
-    }
-    supervisor_outcome
   }) catch {
-    error => Err(@debug.to_string(error))
+    error =>
+      raise ApiError::Cluster(
+        "local execution runtime: " + @debug.to_string(error),
+      )
   }
-  let summary = match supervisor_result {
-    Ok(value) => value
-    Err(reason) => raise ApiError::Cluster(reason)
+  match worker_failure {
+    Some(reason) => raise ApiError::Cluster("local Worker failed: " + reason)
+    None => ()
+  }
+  match supervisor_failure {
+    Some(reason) => raise ApiError::Cluster(reason)
+    None => ()
+  }
+  let summary = match supervisor_summary {
+    Some(value) => value
+    None => raise ApiError::Cluster("local supervisor did not finish")
   }
   match self.definition.sink {
     SinkSpec::JsonLines(path) => {
@@ -364,9 +446,12 @@ pub async fn CompiledJob::run_local_cluster(
     }
     _ => ()
   }
-  match external_source {
-    None => ()
-    Some(source) => source.commit(source.polled_offset())
+  if summary.failed_workers() == 0 {
+    match (external_source, kafka_source, kafka_next_offset) {
+      (Some(source), _, _) => source.commit(source.polled_offset())
+      (_, Some(source), Some(next_offset)) => source.commit(next_offset)
+      _ => ()
+    }
   }
   outputs.sort()
   {

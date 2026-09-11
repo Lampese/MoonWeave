@@ -1,4 +1,9 @@
 ///|
+fn output_consumer_checkpoint_path(prefix : String, epoch : Int) -> String {
+  prefix + "-e" + epoch.to_string() + ".wal"
+}
+
+///|
 /// Run a built-in Task through the durable Worker transport. The transport
 /// remains responsible for WAL/ACK/frontier metadata; the Task owns operator
 /// state and receives both primary and exchange inputs in one causal domain.
@@ -21,6 +26,9 @@ pub async fn run_worker_task(
   output_log_path? : String,
   dynamic_assignment? : Bool = false,
   auth_token? : String,
+  output_delivery? : async (TaskOutputRecord) -> Unit,
+  output_consumer_checkpoint_prefix? : String,
+  output_consumer_id? : String,
 ) -> WorkerRunSummary raise FrameIoError {
   let canonical_wal_path = wal_path
   if !dynamic_assignment {
@@ -34,10 +42,17 @@ pub async fn run_worker_task(
     Some(owner) => owner.close()
   })
   let mut output_log : TaskOutputLog? = None
-  defer (match output_log {
-    None => ()
-    Some(log) => log.close()
-  })
+  let mut output_consumer : TaskOutputConsumer? = None
+  defer {
+    match output_consumer {
+      None => ()
+      Some(consumer) => consumer.close()
+    }
+    match output_log {
+      None => ()
+      Some(log) => log.close()
+    }
+  }
   let pending_outputs : Array[(Int64, @task.TaskOutput)] = []
   let mut next_output_sequence = task.progress().emitted_outputs().to_int64()
   let emit = (outputs : ArrayView[@task.TaskOutput]) => {
@@ -56,7 +71,7 @@ pub async fn run_worker_task(
   let output_barrier : async () -> Unit raise FrameIoError = () => {
     match output_log {
       None => ()
-      Some(log) =>
+      Some(log) => {
         if !pending_outputs.is_empty() {
           let first_sequence = pending_outputs[0].0
           let outputs = pending_outputs.map(pair => pair.1)
@@ -70,12 +85,31 @@ pub async fn run_worker_task(
             error => raise FrameIoError::OutputLog(error)
           }
           for pair in pending_outputs {
-            output_handler(pair.1) catch {
-              error => raise FrameIoError::Handler(@debug.to_string(error))
+            match output_delivery {
+              None =>
+                output_handler(pair.1) catch {
+                  error => raise FrameIoError::Handler(@debug.to_string(error))
+                }
+              Some(_) => ()
             }
           }
           pending_outputs.clear()
         }
+        match output_delivery {
+          None => ()
+          Some(handler) => {
+            guard output_consumer is Some(consumer) else {
+              raise FrameIoError::Handler("output delivery consumer is missing")
+            }
+            let mut delivered = 1
+            while delivered > 0 {
+              delivered = consumer.consume(handler, maximum_records=128) catch {
+                error => raise FrameIoError::Handler(@debug.to_string(error))
+              }
+            }
+          }
+        }
+      }
     }
   }
   let output_summary : () -> (String, Int64, String, String) raise FrameIoError = () => {
@@ -224,6 +258,40 @@ pub async fn run_worker_task(
                 }
               },
             )
+        }
+        match output_delivery {
+          None => ()
+          Some(_) => {
+            guard output_log is Some(log) else {
+              raise FrameIoError::Handler(
+                "output delivery requires an output log",
+              )
+            }
+            guard output_consumer_checkpoint_prefix is Some(checkpoint_prefix) else {
+              raise FrameIoError::Handler(
+                "output delivery requires a consumer checkpoint",
+              )
+            }
+            let checkpoint_path = output_consumer_checkpoint_path(
+              checkpoint_prefix,
+              assignment.epoch(),
+            )
+            let consumer_id = output_consumer_id.unwrap_or(
+              task.task_id() + "-output",
+            )
+            output_consumer = Some(
+              TaskOutputConsumer::open(
+                log,
+                checkpoint_path,
+                consumer_id,
+                task.task_id(),
+                assignment.partition(),
+                assignment.epoch(),
+              ) catch {
+                error => raise FrameIoError::Handler(@debug.to_string(error))
+              },
+            )
+          }
         }
         (
           resolved.wal_path,

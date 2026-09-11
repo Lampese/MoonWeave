@@ -423,7 +423,7 @@ pub async fn Wal::append(self : Wal, payload : Bytes) -> Int64 raise WalError {
   defer self.release_write()
   self.check_writable()
   let offset = self.write_offset
-  @async.protect_from_cancel(resume_on_cancel=true, () => {
+  @async.protect_from_cancel(() => {
     self.file.write(record)
     self.file.sync()
     self.write_offset += record.length().to_int64()
@@ -472,7 +472,7 @@ pub async fn Wal::rewrite(
   }
   // Keep the original handle usable on rename failure. Shield the rename and
   // handle handoff together so cancellation cannot leave writes on the old file.
-  @async.protect_from_cancel(resume_on_cancel=true, () => {
+  @async.protect_from_cancel(() => {
     @fs.rename(temporary, self.path, replace=true)
     let previous = self.file
     self.file = replacement

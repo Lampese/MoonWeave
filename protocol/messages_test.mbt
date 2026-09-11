@@ -28,6 +28,47 @@ test "hello and welcome payloads round trip" {
 }
 
 ///|
+test "driver submit preserves its optional authentication token" {
+  let submit = @protocol.DriverSubmit::new(
+    "submission-1",
+    Json::object({ "job": Json::string("demo") }),
+    auth_token="shared-secret",
+  )
+  let decoded = @protocol.DriverSubmit::from_payload(submit.to_payload())
+  assert_eq(decoded, submit)
+  assert_eq(decoded.auth_token(), Some("shared-secret"))
+  try
+    @protocol.DriverSubmit::new("submission-1", Json::null(), auth_token="")
+  catch {
+    @protocol.ProtocolError::InvalidFrameField => ()
+    _ => fail("expected empty Driver token to be rejected")
+  } noraise {
+    _ => fail("expected empty Driver token to be rejected")
+  }
+}
+
+///|
+test "protocol diagnostics redact authentication tokens" {
+  let submit = @protocol.DriverSubmit::new(
+    "submission-1",
+    Json::null(),
+    auth_token="shared-secret",
+  )
+  let hello = @protocol.Hello::new(
+    "worker-a",
+    "boot-1",
+    [],
+    auth_token="worker-secret",
+  )
+  let submit_debug = @debug.to_string(submit)
+  let hello_debug = @debug.to_string(hello)
+  assert_true(!submit_debug.contains("shared-secret"))
+  assert_true(submit_debug.contains("<redacted>"))
+  assert_true(!hello_debug.contains("worker-secret"))
+  assert_true(hello_debug.contains("<redacted>"))
+}
+
+///|
 test "hello carries an optional partition hint for multi-session workers" {
   let hello = @protocol.Hello::new(
     "worker-a",

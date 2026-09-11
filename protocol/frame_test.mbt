@@ -66,3 +66,22 @@ test "frame rejects unsupported protocol version" {
     _ => fail("expected unsupported protocol version")
   }
 }
+
+///|
+test "authentication frame diagnostics redact opaque payloads" {
+  let frame = @protocol.Frame::new(
+    1,
+    "cluster-a",
+    "session-a",
+    "message-1",
+    "driver-a",
+    "driver-driver-a",
+    0L,
+    0,
+    @protocol.FrameKind::DriverSubmit,
+    "{\"auth_token\":\"frame-secret\"}",
+  )
+  let rendered = @debug.to_string(frame)
+  assert_true(!rendered.contains("frame-secret"))
+  assert_true(rendered.contains("<redacted>"))
+}

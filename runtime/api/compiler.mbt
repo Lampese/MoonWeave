@@ -18,6 +18,7 @@ fn validate_sink(sink : SinkSpec) -> Unit raise ApiError {
     SinkSpec::JsonLines(path) if path.is_empty() =>
       raise ApiError::Sink("sink path is required")
     SinkSpec::JsonLines(_) => ()
+    SinkSpec::Kafka(spec) => spec.validate()
   }
 }
 
@@ -28,6 +29,7 @@ fn validate_source(source : SourceSpec) -> Unit raise ApiError {
     SourceSpec::JsonLines(path) if path.is_empty() =>
       raise ApiError::Source("source path is required")
     SourceSpec::JsonLines(_) => ()
+    SourceSpec::Kafka(spec) => spec.validate()
   }
 }
 

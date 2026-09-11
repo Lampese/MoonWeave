@@ -109,6 +109,11 @@ fn DriverStore::validate_input(
   guard self.compiled is Some(compiled) else {
     raise ApiError::UnknownSubmission("input before submit")
   }
+  if compiled.definition.source is SourceSpec::Kafka(_) {
+    raise ApiError::InvalidDriverCommand(
+      "Kafka source Jobs do not accept Driver input",
+    )
+  }
   if self.phase != JobRunPhase::Running {
     raise ApiError::InvalidJobPhase(
       expected=JobRunPhase::Running,

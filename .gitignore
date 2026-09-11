@@ -3,6 +3,7 @@ _build/
 target/
 target
 .mooncakes/
+.repos/
 .moonagent/
 
 # Keep documentation local until it is ready for publication.
