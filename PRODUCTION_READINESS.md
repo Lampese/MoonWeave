@@ -22,7 +22,7 @@
 | 3 | 状态有界化 | SourceLog、各 WAL、outbox、output log 及相关内存索引具备持续运行时的保留和压缩策略；删除必须受持久化 checkpoint、重放边界和下游 ACK 约束。队列、内存及磁盘有明确预算，超限产生背压；磁盘满或不确定写入不能误报成功；压缩和恢复不丢数据或破坏去重。算子历史和因果索引也计入内存预算，不能只压缩文件。 | 已完成本轮验收：预算覆盖 Coordinator/Job/Driver/Source/manifest、Worker 主/Delta/output/consumer WAL、因果索引和算子状态；超限在 WAL、SourceLog、Worker admission 处 fail-closed，拒绝前不推进 cursor/ACK。终态顺序为 Worker sink 写入并 ACK → output WAL retention marker → Coordinator manifest consumer/retention proof → SourceLog compaction；任一证明缺失都保留数据。Durable outbox 的 ACK identity 只有显式 retention barrier 才释放；远端 Kafka/JSONL sink 通过 DrainAck 传递 consumer ACK 和 output retention proof。 |
 | 4 | 全链路 Int64 offset | 删除 Kafka offset 到 EventId/Int32 的限制；事件身份、父依赖、协议、SourceLog、checkpoint 和恢复精确保留 Int64。覆盖 2^31、2^53 附近以及 Int64 上限的边界，不截断、不经浮点数丢失精度、不发生 offset 加一回绕。 | 已完成代码与 native 验收 |
 | 5 | 生产运行入口 | 配置驱动的 Coordinator、Worker、Driver 服务；启动校验；真正提交和运行 Job；优雅 drain、停止与重启；入口使用第 1–4 项的实际运行路径，不能停留在固定 Job 示例或仅供测试的 API。 | 已完成本轮验收：`cmd/coordinator`、`cmd/worker`、`cmd/driver` 均配置驱动；支持 submit/input/status/drain/cancel、SIGTERM/SIGINT 的受保护 durable drain、重启恢复、Worker 中断重启、未知命令和错误 endpoint/config fail-closed。入口故障矩阵与独立 native SIGTERM 证据已并入总验收脚本。 |
-| 6 | 性能和故障验收 | 在测量前记录并冻结硬件、worker 数、Kafka 分区数、算子及数据分布、事件大小、吞吐、p99、内存与磁盘上限、长稳时长和恢复目标；通过端到端性能、长稳、进程崩溃、主机故障、网络隔离、Kafka 故障及磁盘满测试，并保存可复现证据。 | 已完成本轮冻结参数与验收：10 CPU、约 7.8 GiB 内存、1 Coordinator/1 Worker/1 Kafka broker；reachability builtin:v1、单 key、JSON source/target、1-event latency 与 1-event/50ms steady pacing；最近一次 latency 64 次 p99=14ms，10 秒长稳 172 个端到端事件、吞吐 17.191 events/s，阈值为 p99 <= 1000ms、长稳 >= 50 events、吞吐 >= 10 events/s。HA、Worker/Coordinator 进程中断、SIGTERM drain、不可达端点、4096-byte budget 拒写、真实 Kafka 多分区/重平衡/扩容/broker 重启均通过；confirmed data loss=0、reference output mismatches=0。命令：`moon run scripts/production_acceptance.mbtx /tmp/kafka_2.13-4.0.0`。 |
+| 6 | 性能和故障验收 | 在测量前记录并冻结硬件、worker 数、Kafka 分区数、算子及数据分布、事件大小、吞吐、p99、内存与磁盘上限、长稳时长和恢复目标；通过端到端性能、长稳、进程崩溃、主机故障、网络隔离、Kafka 故障及磁盘满测试，并保存可复现证据。 | 已完成本轮冻结参数与验收：10 CPU、约 7.8 GiB 内存、1 Coordinator/1 Worker/1 Kafka broker；reachability builtin:v1、单 key、JSON source/target、1-event latency 与 1-event/50ms steady pacing；最近一次 latency 64 次 p99=3ms，10 秒长稳 171 个端到端事件、吞吐 17.033 events/s，阈值为 p99 <= 1000ms、长稳 >= 50 events、吞吐 >= 10 events/s。HA、Worker/Coordinator 进程中断、SIGTERM drain、不可达端点、4096-byte budget 拒写、真实 Kafka 多分区/重平衡/扩容/broker 重启均通过；confirmed data loss=0、reference output mismatches=0。命令：`moon run scripts/production_acceptance.mbtx /tmp/kafka_2.13-4.0.0`。 |
 
 实现顺序：4 → 2 → 3 → 1 → 5 → 6。第 6 项的规范与测试工具可提前建设，各项验收随实现推进。
 
@@ -38,8 +38,8 @@
 | CPU、内存、磁盘类型及带宽、网络、各节点部署方式 | Linux aarch64 container；10 vCPU；内存 7.8 GiB；overlay 磁盘 485 GB（验收时使用 9.8 GB、可用 450 GB，3%）；loopback TCP；单机功能/性能 fixture，HA 使用三个独立 native 进程和独立 WAL |
 | Coordinator / Worker / Kafka broker 数、Kafka 分区数 | 性能矩阵：1 / 1 / 1；Kafka 故障矩阵使用真实 Kafka 4.0.0、source 3 分区、group topic 2→4 分区；HA 使用 3 个 Coordinator 进程 |
 | 算子、key 数量与倾斜、因果依赖、事件大小 | reachability builtin:v1；单 `account` key；无父依赖；JSON `source`/`target` payload |
-| 持续吞吐、峰值吞吐及持续时间 | 冻结持续目标 >= 10 events/s，steady 10s；本次端到端 steady 结果 17.191 events/s；latency input 结果仅作峰值入口观测，不作为端到端容量承诺 |
-| 端到端 p99 上限及测量区间 | input round-trip p99 <= 1000ms；64 次单事件请求；本次 p99=14ms |
+| 持续吞吐、峰值吞吐及持续时间 | 冻结持续目标 >= 10 events/s，steady 10s；本次端到端 steady 结果 17.033 events/s；latency input 结果仅作峰值入口观测，不作为端到端容量承诺 |
+| 端到端 p99 上限及测量区间 | input round-trip p99 <= 1000ms；64 次单事件请求；本次 p99=3ms |
 | 每角色内存、磁盘及保留预算 | 每 Coordinator/Worker WAL budget 268435456 bytes；Driver event limit 200000；capacity fault fixture 使用 4096 bytes 并要求 fail-closed |
 | 长稳时长、积压恢复与故障恢复用时上限 | steady 10s；drain/recovery command timeout 30s；Kafka broker restart reconnect timeout 60s；HA lease 400ms，故障后多数派 term 2 选主通过 |
 | 已确认数据丢失数 | 必须为 0 |
@@ -58,7 +58,7 @@
 - 本轮状态边界证据：Durable outbox ACK 达到 `compaction_record_limit` 后自动重写 WAL，保留 pending payload 与 ACK tombstone；TaskOutputConsumer checkpoint 达到同类阈值后仅保留 binding 和最新 ACK proof。Worker terminal barrier 在下游写入成功且 consumer 追平后物理压缩 output WAL，DrainAck 携带 consumer/retention proof；Coordinator manifest 只在完整分区均有 proof 时允许 SourceLog compaction。远端 JSONL sink live 回归验证了 sink 写入、output WAL retention marker、manifest barrier 与 source prefix compaction 的顺序；lagging consumer 单测验证 fail-closed。
 - 本轮入口修复：`DriverCoordinator::shutdown_gracefully` 先写入 Driver `Drain` intent，执行 live source drain 并等待 `Succeeded/Failed`，`cmd/coordinator` 通过 `moonbitlang/async/signal` 注册 SIGTERM/SIGINT；`moon check --target native`、入口构建、API/live 回归和独立进程 SIGTERM 验收通过。总验收中的入口矩阵覆盖负预算、错误 endpoint/config、Worker kill/restart、Driver CLI 中断、Coordinator restart、未知命令；SIGTERM 脚本使用三个 native 进程，Coordinator 状态 `-15`、Worker 退出 0 且持久化批次完成。
 - 本轮 Coordinator HA 证据：`runtime/async/coordinator_ha_process.mbt` 的 term/lease、prepare/commit ack、fencing 和四类状态 bundle 均使用当前 schema version 1；`moon run scripts/coordinator_ha_acceptance.mbtx` 通过三个独立 native 进程验证初始 quorum、Job/Driver/Source/Coordinator snapshots 的同索引复制、heartbeat 隔离选主、少数派拒写、旧主终止、节点追赶和恢复多数派写入。验收输出目录中的 `replicas/node-*.state.json` 保存了四类状态证据。
-- 本轮性能与故障证据：`scripts/production_acceptance.mbtx` 冻结硬件/拓扑/负载/阈值，并将 HA、latency、steady、入口故障矩阵、SIGTERM、网络不可达、4096-byte capacity refusal 和真实 Kafka 4.0.0 多分区/consumer-group/broker restart 输出写入同一 evidence 文件。最近一次证据：`/tmp/moonweave-production-acceptance-.53688.44021deb/production-evidence.txt`；全流程命令：`moon run scripts/production_acceptance.mbtx /tmp/kafka_2.13-4.0.0`。
+- 本轮性能与故障证据：`scripts/production_acceptance.mbtx` 冻结硬件/拓扑/负载/阈值，并将 HA、latency、steady、入口故障矩阵、SIGTERM、网络不可达、4096-byte capacity refusal 和真实 Kafka 4.0.0 多分区/consumer-group/broker restart 输出写入同一 evidence 文件。最近一次证据：`/tmp/moonweave-production-acceptance-.55332.8430be0/production-evidence.txt`；全流程命令：`moon run scripts/production_acceptance.mbtx /tmp/kafka_2.13-4.0.0`。
 
 ## 配置化入口示例
 
