@@ -873,6 +873,31 @@ pub fn IngressRouter::durable_outbox(
 }
 
 ///|
+/// Cross the terminal source retention barrier and then release acknowledged
+/// Delta identities. Source compaction is deliberately first: a retransmit is
+/// only safe to treat as new after the source no longer retains its origin.
+pub async fn IngressRouter::compact_completed(
+  self : IngressRouter,
+) -> Unit raise SourceLogError {
+  for partition in 0..<self.plan.partition_count() {
+    let retain_from = self.source.next_offset(partition).unwrap_or(0L)
+    let barrier = self.source.retention_barrier(partition, retain_from)
+    self.source.compact(barrier)
+  }
+  for outbox in self.durable_outboxes.values() {
+    let ids = outbox.acked_delta_ids()
+    if !ids.is_empty() {
+      outbox.retire_acked(ids[:]) catch {
+        error => raise SourceLogError::DurableOutbox(error)
+      }
+      outbox.compact() catch {
+        error => raise SourceLogError::DurableOutbox(error)
+      }
+    }
+  }
+}
+
+///|
 /// Persist and enqueue every derived DeltaBatch. Route endpoints are checked
 /// before the source WAL append. If a queue closes during the async append,
 /// the durable source remains authoritative and a retry rebuilds identical

@@ -291,7 +291,7 @@ pub async fn DriverCoordinator::bind(CoordinatorNodeConfig, DriverControlConfig,
 pub fn DriverCoordinator::close(Self) -> Unit
 pub fn DriverCoordinator::control_endpoint(Self) -> NodeEndpoint raise ApiError
 pub fn DriverCoordinator::data_endpoint(Self) -> NodeEndpoint raise ApiError
-pub async fn DriverCoordinator::run(Self) -> DriverCoordinatorSummary raise ApiError
+pub async fn DriverCoordinator::run(Self, keep_terminal? : Bool) -> DriverCoordinatorSummary raise ApiError
 pub async fn DriverCoordinator::shutdown_gracefully(Self) -> Unit raise ApiError
 
 pub(all) struct DriverCoordinatorSummary {

@@ -462,3 +462,67 @@ async test "ingress dispatch can enqueue into a durable exchange outbox" {
   assert_eq(restored.try_pop().unwrap().delta_id(), queued.delta_id())
   restored.close()
 }
+
+///|
+async test "completed source barrier retires acknowledged durable deltas" {
+  let directory = @fs.tmpdir(prefix="moonweave-ingress-retention")
+  let source_path = directory + "/source.wal"
+  let outbox_path = directory + "/exchange.wal"
+  defer {
+    @fs.remove(source_path) catch {
+      _ => ()
+    }
+    @fs.remove(source_path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(source_path + ".repair") catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path) catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path + ".lock") catch {
+      _ => ()
+    }
+    @fs.remove(outbox_path + ".repair") catch {
+      _ => ()
+    }
+    @fs.rmdir(directory) catch {
+      _ => ()
+    }
+  }
+  let plan = @plan.JobSpec::new(
+    "retention-ingress",
+    "reachability",
+    2,
+    ["worker-a", "worker-b"],
+    [@plan.ExchangeRoute::new(0, 1)],
+  )
+  let control = @control.CoordinatorState::new("cluster-a", "coordinator")
+  ignore(
+    control.register_worker("worker-a", @protocol.Incarnation::new("boot-a"), []),
+  )
+  ignore(
+    control.register_worker("worker-b", @protocol.Incarnation::new("boot-b"), []),
+  )
+  for partition_plan in plan.plan_partitions() {
+    ignore(
+      control.assign(partition_plan.partition(), partition_plan.worker_id()),
+    )
+  }
+  let router = IngressRouter::open(plan, control, source_path)
+  let outbox = DurableExchangeOutbox::open(outbox_path, 4)
+  router.register_durable_outbox(1, outbox)
+  let dispatch = router.dispatch_and_enqueue(
+    source_event("retention-ingress", 0, key_for_partition(plan, 0), "B"),
+  )
+  let queued = outbox.try_pop().unwrap()
+  assert_eq(queued.delta_id(), dispatch.deltas()[0].delta_id())
+  outbox.ack(queued.delta_id())
+  router.compact_completed()
+  assert_eq(outbox.acked_count(), 0)
+  assert_eq(outbox.acked_delta_ids(), [])
+  assert_eq(outbox.pending_count(), 0)
+  outbox.close()
+  router.close()
+}

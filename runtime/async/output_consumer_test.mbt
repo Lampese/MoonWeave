@@ -56,6 +56,33 @@ async test "output consumer replays only unacknowledged results after restart" {
 }
 
 ///|
+async test "terminal output ACK creates a physical retention barrier" {
+  with_output_consumer_directory <| directory => {
+    let output_path = directory + "/outputs.wal"
+    let log = TaskOutputLog::open(output_path)
+    defer log.close()
+    let task_id = "terminal-output/p0/e0"
+    log.append(task_id, 0, 0, 0L, [consumer_output("B"), consumer_output("C")])
+    let consumer = TaskOutputConsumer::open(
+      log,
+      directory + "/consumer.wal",
+      "sink",
+      task_id,
+      0,
+      0,
+    )
+    defer consumer.close()
+    consumer.ack(consumer.read()[0])
+    consumer.ack(consumer.read()[0])
+    let barrier = consumer.retention_barrier()
+    assert_eq(barrier.retain_from(), 2L)
+    log.compact(barrier)
+    assert_eq(log.records_for(task_id), [])
+    assert_eq(log.retained_from(task_id), 2L)
+  }
+}
+
+///|
 async test "output consumer rejects skips, foreign records, and altered records" {
   with_output_consumer_directory <| directory => {
     let log = TaskOutputLog::open(directory + "/outputs.wal")

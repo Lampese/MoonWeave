@@ -1143,6 +1143,27 @@ pub fn JobOutputManifest::is_fully_consumed(self : JobOutputManifest) -> Bool {
 }
 
 ///|
+/// A remote Worker may compact its output WAL only after it has durably
+/// acknowledged every record. The Coordinator can therefore release its
+/// source prefix only when the terminal manifest carries that same proof for
+/// every non-empty partition. This deliberately does not require a query
+/// certificate: result certification is a separate concern from storage
+/// retention, while the consumer ACK and Worker retention marker are the
+/// required deletion dependencies.
+pub fn JobOutputManifest::is_retention_safe(self : JobOutputManifest) -> Bool {
+  if !self.is_complete() || !self.is_fully_consumed() {
+    return false
+  }
+  for partition in self.partitions.values() {
+    if partition.output_count > 0L &&
+      partition.retained_from != Some(partition.output_count) {
+      return false
+    }
+  }
+  true
+}
+
+///|
 fn JobOutputManifest::partition_fully_consumed(
   self : JobOutputManifest,
   partition : JobOutputPartitionSummary,
@@ -1355,7 +1376,18 @@ pub async fn JobOutputManifest::record_partition_summary(
   task_state_digest : String,
   complete : Bool,
   applied_offset? : Int64 = -1L,
+  consumer_id? : String,
+  acked_sequence? : Int64,
+  retained_from? : Int64,
 ) -> Unit raise JobOutputManifestError {
+  match (consumer_id, acked_sequence, retained_from) {
+    (Some(id), Some(acked), Some(retained)) if id.is_empty() ||
+      acked < -1L ||
+      retained < 0L => raise JobOutputManifestError::RetentionNotSafe(partition)
+    (Some(_), Some(_), Some(_)) => ()
+    (None, None, None) => ()
+    _ => raise JobOutputManifestError::RetentionNotSafe(partition)
+  }
   let value = JobOutputPartitionSummary::{
     partition,
     task_id,
@@ -1368,7 +1400,7 @@ pub async fn JobOutputManifest::record_partition_summary(
     task_state_digest,
     applied_offset,
     complete,
-    retained_from: None,
+    retained_from,
   }
   validate_partition_summary(value, self.partition_count)
   self.write_lock.acquire() catch {
@@ -1385,6 +1417,26 @@ pub async fn JobOutputManifest::record_partition_summary(
     ),
     partition: Some(value),
   })
+  match (consumer_id, acked_sequence) {
+    (Some(id), Some(acked)) =>
+      self.append_entry(JobOutputManifestEntry::{
+        ..empty_manifest_entry(
+          self.job_id,
+          self.operator_id,
+          self.partition_count,
+          "consumer",
+        ),
+        consumer: Some(JobOutputConsumerSummary::{
+          consumer_id: id,
+          task_id,
+          partition,
+          epoch,
+          checkpoint_path: "worker-remote://" + worker_id + "/" + task_id,
+          acked_sequence: acked,
+        }),
+      })
+    _ => ()
+  }
 }
 
 ///|

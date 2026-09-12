@@ -72,6 +72,28 @@ pub fn TaskOutputRetentionBarrier::output_digest(
 }
 
 ///|
+/// Construct a retention barrier from a fully observed output prefix. The
+/// caller must still prove terminal state and downstream acknowledgement.
+pub fn TaskOutputRetentionBarrier::new(
+  task_id : String,
+  partition : Int,
+  epoch : Int,
+  retain_from : Int64,
+  output_count : Int64,
+  output_digest : String,
+) -> TaskOutputRetentionBarrier raise OutputLogError {
+  if task_id.is_empty() ||
+    partition < 0 ||
+    epoch < 0 ||
+    retain_from < 0L ||
+    output_count < retain_from ||
+    output_digest.is_empty() {
+    raise OutputLogError::Malformed
+  }
+  { task_id, partition, epoch, retain_from, output_count, output_digest, }
+}
+
+///|
 /// One durable Task output. Sequence numbers are allocated by the Task
 /// adapter, while the output log makes `(task_id, sequence)` idempotent.
 pub(all) struct TaskOutputRecord {

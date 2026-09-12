@@ -172,6 +172,18 @@ pub fn DurableExchangeOutbox::acked_count(self : DurableExchangeOutbox) -> Int {
 }
 
 ///|
+/// Return acknowledged identities covered by the current upstream barrier.
+/// The caller must establish that the corresponding source prefix is retired
+/// before passing these IDs to `retire_acked`.
+pub fn DurableExchangeOutbox::acked_delta_ids(
+  self : DurableExchangeOutbox,
+) -> Array[String] {
+  let ids = self.acked.to_array()
+  ids.sort()
+  ids
+}
+
+///|
 pub fn DurableExchangeOutbox::pending(
   self : DurableExchangeOutbox,
 ) -> Array[@protocol.DeltaBatch] {

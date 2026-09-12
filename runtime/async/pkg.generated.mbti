@@ -183,6 +183,7 @@ pub(all) suberror FrameIoError {
   DeltaMismatch
   DrainMismatch
   PendingEvents(Int)
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   Reconciliation(ReconciliationError)
   JobOutputManifest(JobOutputManifestError)
   Handler(String)
@@ -574,6 +575,7 @@ pub struct DurableExchangeOutbox {
 }
 pub async fn DurableExchangeOutbox::ack(Self, String) -> Unit raise DurableOutboxError
 pub fn DurableExchangeOutbox::acked_count(Self) -> Int
+pub fn DurableExchangeOutbox::acked_delta_ids(Self) -> Array[String]
 pub fn DurableExchangeOutbox::capacity(Self) -> Int
 pub fn DurableExchangeOutbox::close(Self) -> Unit
 pub async fn DurableExchangeOutbox::compact(Self) -> Unit raise DurableOutboxError
@@ -635,6 +637,7 @@ pub struct IngressRouter {
   durable_outboxes : Map[Int, DurableExchangeOutbox]
 }
 pub fn IngressRouter::close(Self) -> Unit
+pub async fn IngressRouter::compact_completed(Self) -> Unit raise SourceLogError
 pub async fn IngressRouter::dispatch(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
 pub async fn IngressRouter::dispatch_and_enqueue(Self, @protocol.EventRecord) -> IngressDispatch raise SourceLogError
 pub fn IngressRouter::durable_outbox(Self, Int) -> DurableExchangeOutbox?
@@ -708,6 +711,7 @@ pub fn JobOutputManifest::final_digest(Self) -> String
 pub fn JobOutputManifest::frontier_digest(Self) -> String
 pub fn JobOutputManifest::is_complete(Self) -> Bool
 pub fn JobOutputManifest::is_fully_consumed(Self) -> Bool
+pub fn JobOutputManifest::is_retention_safe(Self) -> Bool
 pub fn JobOutputManifest::job_id(Self) -> String
 pub async fn JobOutputManifest::open(String, String, String, Int, maximum_bytes? : Int64) -> Self raise JobOutputManifestError
 pub async fn JobOutputManifest::open_for_job(String, JobStore, maximum_bytes? : Int64) -> Self raise JobOutputManifestError
@@ -721,7 +725,7 @@ pub async fn JobOutputManifest::publish_certificate(Self, JobOutputCertificate) 
 pub async fn JobOutputManifest::publish_verified_certificate(Self, String, JobOutputQuery, ArrayView[JobOutputTaskProof]) -> JobOutputCertificate raise JobOutputManifestError
 pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, String, Bool) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
-pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, String, Bool, applied_offset? : Int64, consumer_id? : String, acked_sequence? : Int64, retained_from? : Int64) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::seal_partition_for_retention(Self, Int, TaskOutputLog) -> TaskOutputRetentionBarrier raise JobOutputManifestError
 pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
 pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
@@ -1052,6 +1056,7 @@ pub fn TaskOutputConsumer::next_sequence(Self) -> Int64
 pub async fn TaskOutputConsumer::open(TaskOutputLog, String, String, String, Int, Int, maximum_bytes? : Int64, compaction_record_limit? : Int) -> Self raise OutputConsumerError
 pub fn TaskOutputConsumer::partition(Self) -> Int
 pub fn TaskOutputConsumer::read(Self, maximum_records? : Int) -> Array[TaskOutputRecord] raise OutputConsumerError
+pub fn TaskOutputConsumer::retention_barrier(Self) -> TaskOutputRetentionBarrier raise OutputConsumerError
 pub fn TaskOutputConsumer::task_id(Self) -> String
 
 pub struct TaskOutputLog {
@@ -1102,6 +1107,7 @@ pub struct TaskOutputRetentionBarrier {
   output_digest : String
 } derive(Eq, @debug.Debug)
 pub fn TaskOutputRetentionBarrier::epoch(Self) -> Int
+pub fn TaskOutputRetentionBarrier::new(String, Int, Int, Int64, Int64, String) -> Self raise OutputLogError
 pub fn TaskOutputRetentionBarrier::output_count(Self) -> Int64
 pub fn TaskOutputRetentionBarrier::output_digest(Self) -> String
 pub fn TaskOutputRetentionBarrier::partition(Self) -> Int

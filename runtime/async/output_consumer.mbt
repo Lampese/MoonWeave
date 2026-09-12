@@ -157,6 +157,31 @@ pub fn TaskOutputConsumer::next_sequence(self : TaskOutputConsumer) -> Int64 {
 }
 
 ///|
+/// Produce the downstream ACK barrier for a terminal Task. The output log
+/// must be caught up exactly; an unacknowledged suffix makes retention unsafe.
+pub fn TaskOutputConsumer::retention_barrier(
+  self : TaskOutputConsumer,
+) -> TaskOutputRetentionBarrier raise OutputConsumerError {
+  self.check_open()
+  let output_count = self.log.next_sequence(self.binding.task_id)
+  if self.next_sequence != output_count {
+    raise OutputConsumerError::Source(
+      OutputLogError::RetentionConflict(self.binding.task_id),
+    )
+  }
+  TaskOutputRetentionBarrier::new(
+    self.binding.task_id,
+    self.binding.partition,
+    self.binding.epoch,
+    self.next_sequence,
+    output_count,
+    self.log.output_digest(self.binding.task_id),
+  ) catch {
+    error => raise OutputConsumerError::Source(error)
+  }
+}
+
+///|
 fn TaskOutputConsumer::check_open(
   self : TaskOutputConsumer,
 ) -> Unit raise OutputConsumerError {

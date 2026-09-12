@@ -74,18 +74,6 @@ async fn write_evidence(root : String, text : String) -> Unit {
 }
 
 ///|
-async fn wait_for_text(path : String, needle : String) -> Unit {
-  @async.with_timeout(30000, () => {
-    for ;; {
-      if @fs.exists(path) && @fs.read_file(path).text().contains(needle) {
-        break
-      }
-      @async.sleep(50)
-    }
-  })
-}
-
-///|
 async fn main {
   let args = @env.args()
   let kafka = if args.length() > 1 {
@@ -124,8 +112,14 @@ async fn main {
     ],
   ).run(timeout_ms=180000)
 
-  println("[1/6] coordinator process crash and HA recovery")
-  @shell.Cmd("moon", ["run", "scripts/coordinator_ha_acceptance.mbtx"]).run(timeout_ms=180000)
+  println("[1/8] coordinator process crash and HA recovery")
+  let coordinator_ha = @shell.Cmd(
+    "moon",
+    ["run", "scripts/coordinator_ha_acceptance.mbtx"],
+  ).output(timeout_ms=180000)
+  if coordinator_ha.exit_code() != 0 {
+    fail("Coordinator HA acceptance failed: " + coordinator_ha.stdout())
+  }
 
   let coordinator = @fs.realpath(
     "_build/native/debug/build/moonweave/moonweave/cmd/coordinator/coordinator.exe",
@@ -198,7 +192,7 @@ async fn main {
   }
   wait_for_tcp(driver_endpoint)
 
-  println("[2/6] end-to-end latency and steady-state throughput")
+  println("[2/8] end-to-end latency and steady-state throughput")
   let latency = require_output(
     @shell.Cmd(
       performance,
@@ -254,22 +248,21 @@ async fn main {
   if drain.exit_code() != 0 {
     fail("performance cluster drain failed: " + drain.stdout())
   }
-  wait_for_text(root + "/coordinator.log", "phase=Succeeded")
+  // `drain` waits for the durable Driver state to reach a terminal phase.
+  // A production Coordinator remains available for terminal status queries
+  // until it receives SIGTERM, so its normal stdout has no terminal-exit line
+  // to wait for here. The Driver response is the authoritative proof; the
+  // explicit stop below exercises service shutdown separately.
+  if !drain.stdout().contains("phase=Succeeded") {
+    fail("performance cluster drain did not return Succeeded: " + drain.stdout())
+  }
   let disk = @shell.Cmd("df", ["-B1", root]).output()
-  write_evidence(
-    root,
-    evidence_header +
-    "latency_result=\n" + latency +
-    "steady_result=\n" + steady +
-    "disk_after=\n" + disk.stdout() +
-    "confirmed_data_loss=0\nreference_output_mismatches=0\n",
-  )
   let coordinator_status = stop_pid(coordinator_pid, "-TERM")
   let worker_status = stop_pid(worker_pid, "-TERM")
   cluster_stopped = true
   println("PASS: graceful service drain coordinator_status=" + coordinator_status.to_string() + " worker_status=" + worker_status.to_string())
 
-  println("[3/6] network unavailability fails closed")
+  println("[3/8] network unavailability fails closed")
   let unavailable_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
   let unavailable_endpoint = "127.0.0.1:" + unavailable_listener.addr.port().to_string()
   unavailable_listener.close()
@@ -288,7 +281,7 @@ async fn main {
   }
   println("PASS: unavailable endpoint rejected with exit=" + unavailable.exit_code().to_string())
 
-  println("[4/6] storage capacity refusal")
+  println("[4/8] storage capacity refusal")
   let tiny_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
   let tiny_port = tiny_listener.addr.port()
   let tiny_driver_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
@@ -343,9 +336,50 @@ async fn main {
   ignore(stop_pid(tiny_pid, "-KILL"))
   tiny_done = true
 
-  println("[5/6] Kafka broker restart and offset recovery")
-  @shell.Cmd("moon", ["run", "scripts/kafka_integration.mbtx", kafka]).run(timeout_ms=300000)
+  println("[5/8] native entrypoint fault matrix")
+  let entrypoint_faults = @shell.Cmd(
+    "moon",
+    ["run", "scripts/entrypoint_fault_acceptance.mbtx"],
+  ).output(timeout_ms=300000)
+  if entrypoint_faults.exit_code() != 0 {
+    fail("entrypoint fault matrix failed: " + entrypoint_faults.stdout())
+  }
+  println("PASS: native entrypoint fault matrix")
+
+  println("[6/8] independent native SIGTERM drain")
+  let signal_acceptance = @shell.Cmd(
+    "moon",
+    ["run", "scripts/signal_acceptance.mbtx"],
+  ).output(timeout_ms=300000)
+  if signal_acceptance.exit_code() != 0 {
+    fail("SIGTERM acceptance failed: " + signal_acceptance.stdout())
+  }
+  println("PASS: independent native SIGTERM drain")
+
+  println("[7/8] Kafka broker restart and offset recovery")
+  let kafka_acceptance = @shell.Cmd(
+    "moon",
+    ["run", "scripts/kafka_integration.mbtx", kafka],
+  ).output(timeout_ms=300000)
+  if kafka_acceptance.exit_code() != 0 {
+    fail("Kafka integration failed: " + kafka_acceptance.stdout())
+  }
   println("PASS: Kafka failure and restart recovery")
-  println("[6/6] evidence")
+  write_evidence(
+    root,
+    evidence_header +
+    "coordinator_ha_acceptance=\n" + coordinator_ha.stdout() +
+    "latency_result=\n" + latency +
+    "steady_result=\n" + steady +
+    "drain_result=\n" + drain.stdout() +
+    "disk_after=\n" + disk.stdout() +
+    "entrypoint_fault_acceptance=\n" + entrypoint_faults.stdout() +
+    "signal_acceptance=\n" + signal_acceptance.stdout() +
+    "kafka_acceptance=\n" + kafka_acceptance.stdout() +
+    "coordinator_sigterm_status=" + coordinator_status.to_string() + "\n" +
+    "worker_sigterm_status=" + worker_status.to_string() + "\n" +
+    "confirmed_data_loss=0\nreference_output_mismatches=0\n",
+  )
+  println("[8/8] evidence")
   println("PASS: production performance and fault acceptance; evidence=" + root + "/production-evidence.txt")
 }

@@ -347,6 +347,7 @@ async fn DriverCoordinator::tick(
 /// ingress; success is recorded only after every Worker acknowledges its cut.
 pub async fn DriverCoordinator::run(
   self : DriverCoordinator,
+  keep_terminal? : Bool = false,
 ) -> DriverCoordinatorSummary raise ApiError {
   if self.closed {
     raise ApiError::DriverClosed
@@ -368,7 +369,11 @@ pub async fn DriverCoordinator::run(
     }
     for ;; {
       if self.closed {
-        raise ApiError::DriverClosed
+        if keep_terminal {
+          break
+        } else {
+          raise ApiError::DriverClosed
+        }
       }
       self.tick(group) catch {
         error => {
@@ -380,7 +385,7 @@ pub async fn DriverCoordinator::run(
       }
       match self.store.phase() {
         JobRunPhase::Cancelled | JobRunPhase::Failed | JobRunPhase::Succeeded =>
-          if self.control_listener.active_requests == 0 {
+          if !keep_terminal && self.control_listener.active_requests == 0 {
             break
           }
         _ => ()

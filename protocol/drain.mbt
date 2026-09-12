@@ -48,6 +48,9 @@ pub(all) struct DrainAck {
   output_count : Int64?
   output_digest : String?
   task_state_digest : String?
+  output_consumer_id : String?
+  output_acked_sequence : Int64?
+  output_retained_from : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -63,6 +66,9 @@ pub fn DrainAck::new(
   output_count? : Int64,
   output_digest? : String,
   task_state_digest? : String,
+  output_consumer_id? : String,
+  output_acked_sequence? : Int64,
+  output_retained_from? : Int64,
 ) -> DrainAck raise ProtocolError {
   if request_id.is_empty() ||
     partition < 0 ||
@@ -88,11 +94,35 @@ pub fn DrainAck::new(
     ) {
     raise ProtocolError::InvalidFrameField
   }
+  if (
+      output_consumer_id is Some(_) ||
+      output_acked_sequence is Some(_) ||
+      output_retained_from is Some(_)
+    ) &&
+    (
+      output_consumer_id is None ||
+      output_acked_sequence is None ||
+      output_retained_from is None
+    ) {
+    raise ProtocolError::InvalidFrameField
+  }
   match (task_id, output_count, output_digest, task_state_digest) {
     (Some(id), Some(count), Some(digest), Some(state_digest)) if id.is_empty() ||
       count < 0L ||
       digest.is_empty() ||
       state_digest.is_empty() => raise ProtocolError::InvalidFrameField
+    _ => ()
+  }
+  match
+    (
+      output_consumer_id, output_acked_sequence, output_retained_from, output_count,
+    ) {
+    (Some(id), Some(acked), Some(retained), Some(count)) if id.is_empty() ||
+      acked < -1L ||
+      retained < 0L ||
+      retained > count ||
+      retained != count => raise ProtocolError::InvalidFrameField
+    (Some(_), Some(_), Some(_), None) => raise ProtocolError::InvalidFrameField
     _ => ()
   }
   {
@@ -107,6 +137,9 @@ pub fn DrainAck::new(
     output_count,
     output_digest,
     task_state_digest,
+    output_consumer_id,
+    output_acked_sequence,
+    output_retained_from,
   }
 }
 
@@ -131,6 +164,21 @@ pub fn DrainAck::task_state_digest(self : DrainAck) -> String? {
 }
 
 ///|
+pub fn DrainAck::output_consumer_id(self : DrainAck) -> String? {
+  self.output_consumer_id
+}
+
+///|
+pub fn DrainAck::output_acked_sequence(self : DrainAck) -> Int64? {
+  self.output_acked_sequence
+}
+
+///|
+pub fn DrainAck::output_retained_from(self : DrainAck) -> Int64? {
+  self.output_retained_from
+}
+
+///|
 pub fn DrainAck::to_payload(self : DrainAck) -> String {
   encode_payload(self)
 }
@@ -150,6 +198,9 @@ pub fn DrainAck::from_payload(text : String) -> DrainAck raise MessageError {
     output_count?=value.output_count,
     output_digest?=value.output_digest,
     task_state_digest?=value.task_state_digest,
+    output_consumer_id?=value.output_consumer_id,
+    output_acked_sequence?=value.output_acked_sequence,
+    output_retained_from?=value.output_retained_from,
   ) catch {
     error => raise protocol_error(error)
   }
