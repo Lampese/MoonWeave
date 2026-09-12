@@ -1,0 +1,200 @@
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/core/encoding/utf8",
+}
+
+///|
+async fn wait_for_file(path : String) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        break
+      }
+      @async.sleep(25)
+    }
+  })
+}
+
+///|
+async fn wait_for_text(path : String, needle : String) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        if @fs.read_file(path).text().contains(needle) {
+          break
+        }
+      }
+      @async.sleep(25)
+    }
+  })
+}
+
+///|
+async fn require_text(path : String, needle : String, label : String) -> Unit raise {
+  let text = @fs.read_file(path).text()
+  if !text.contains(needle) {
+    fail("HA acceptance missing " + label + ": " + needle + " in " + text)
+  }
+}
+
+///|
+async fn write_request(
+  root : String,
+  id : String,
+  kind : String,
+  worker_id : String,
+  incarnation : String,
+  partition : Int,
+) -> Unit {
+  @fs.write_file(
+    root + "/request.json",
+    @utf8.encode(
+      "{\"version\":1,\"id\":\"" + id +
+      "\",\"kind\":\"" + kind +
+      "\",\"worker_id\":\"" + worker_id +
+      "\",\"incarnation\":\"" + incarnation +
+      "\",\"partition\":" + partition.to_string() + "}",
+    ),
+    create_mode=@fs.CreateOrTruncate,
+    sync=@fs.Full,
+  )
+}
+
+///|
+async fn stop_process(pid : Int) -> Int {
+  ignore(@process.run("/bin/kill", ["-TERM", pid.to_string()]))
+  @async.with_timeout(10000, () => @process.wait_pid(pid)) catch {
+    _ => {
+      ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+      @process.wait_pid(pid)
+    }
+  }
+}
+
+///|
+// Run from the repository root:
+// moon run scripts/coordinator_ha_acceptance.mbtx
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-coordinator-ha-acceptance-")
+  println("Coordinator HA acceptance state: " + root)
+  @shell.Cmd(
+    "moon",
+    ["build", "--target", "native", "cmd/coordinator_ha_fixture"],
+  ).run(timeout_ms=120000)
+  let executable = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/coordinator_ha_fixture/coordinator_ha_fixture.exe",
+  )
+  let node0_log = @process.redirect_to_file(root + "/node-0.log")
+  let node1_log = @process.redirect_to_file(root + "/node-1.log")
+  let node2_log = @process.redirect_to_file(root + "/node-2.log")
+  let args0 = ["--root", root, "--node", "node-0", "--nodes", "node-0,node-1,node-2"]
+  let args1 = ["--root", root, "--node", "node-1", "--nodes", "node-0,node-1,node-2"]
+  let args2 = ["--root", root, "--node", "node-2", "--nodes", "node-0,node-1,node-2"]
+  let mut node0_pid = @process.spawn_orphan(executable, args0, stdout=node0_log, stderr=node0_log)
+  let node1_pid = @process.spawn_orphan(executable, args1, stdout=node1_log, stderr=node1_log)
+  let node2_pid = @process.spawn_orphan(executable, args2, stdout=node2_log, stderr=node2_log)
+  let mut node0_live = true
+  let mut node1_live = true
+  let mut node2_live = true
+  defer {
+    @async.protect_from_cancel(() => {
+      @fs.write_file(root + "/stop", "\n") catch { _ => () }
+      if node0_live {
+        ignore(@process.run("/bin/kill", ["-KILL", node0_pid.to_string()]))
+        ignore(@process.wait_pid(node0_pid))
+      }
+      if node1_live {
+        ignore(@process.run("/bin/kill", ["-KILL", node1_pid.to_string()]))
+        ignore(@process.wait_pid(node1_pid))
+      }
+      if node2_live {
+        ignore(@process.run("/bin/kill", ["-KILL", node2_pid.to_string()]))
+        ignore(@process.wait_pid(node2_pid))
+      }
+      node0_log.close()
+      node1_log.close()
+      node2_log.close()
+    }) catch { _ => () }
+  }
+  wait_for_file(root + "/heartbeats/node-0.json")
+  wait_for_file(root + "/heartbeats/node-1.json")
+  wait_for_file(root + "/heartbeats/node-2.json")
+  wait_for_text(root + "/term.json", "\"leader\":\"node-0\"")
+  require_text(root + "/term.json", "\"term\":\"1\"", "initial term")
+  println("PASS: three independent processes elected node-0 at term 1")
+
+  write_request(root, "register-1", "register", "worker-a", "boot-a", 0)
+  wait_for_file(root + "/responses/register-1.json")
+  require_text(root + "/responses/register-1.json", "\"ok\":true", "initial quorum commit")
+  wait_for_text(root + "/state/node-0.txt", "workers=1")
+  wait_for_text(root + "/state/node-1.txt", "workers=1")
+  wait_for_text(root + "/state/node-2.txt", "workers=1")
+  wait_for_file(root + "/replicas/node-0.state.json")
+  wait_for_file(root + "/replicas/node-1.state.json")
+  wait_for_file(root + "/replicas/node-2.state.json")
+  require_text(root + "/replicas/node-0.state.json", "\"accepted_events\":\"1\"", "DriverStore snapshot")
+  require_text(root + "/replicas/node-0.state.json", "\"event_count\":\"1\"", "SourceLog snapshot")
+  require_text(root + "/replicas/node-1.state.json", "\"job_id\":\"ha-state-job\"", "JobStore snapshot")
+  require_text(root + "/replicas/node-2.state.json", "\"worker-a\"", "replicated state bundle")
+  println("PASS: committed worker registration replicated to all three WALs")
+
+  // Freeze the leader to model a process/heartbeat partition. It cannot
+  // renew its lease or observe the new term while node-1 takes over.
+  ignore(@process.run("/bin/kill", ["-STOP", node0_pid.to_string()]))
+  wait_for_text(root + "/term.json", "\"leader\":\"node-1\"")
+  require_text(root + "/term.json", "\"term\":\"2\"", "isolated leader term")
+  println("PASS: heartbeat isolation triggered a fenced term 2 leader")
+  let old_leader_status = stop_process(node0_pid)
+  node0_live = false
+  assert_true(old_leader_status != 0)
+  println("PASS: isolated leader was terminated and node-1 retained term 2")
+
+  write_request(root, "assign-1", "assign", "worker-a", "boot-a", 0)
+  wait_for_file(root + "/responses/assign-1.json")
+  require_text(root + "/responses/assign-1.json", "\"ok\":true", "post-failover commit")
+  wait_for_text(root + "/state/node-1.txt", "assignments=1")
+  wait_for_text(root + "/state/node-2.txt", "assignments=1")
+  println("PASS: new leader committed and follower applied after failover")
+
+  let follower_status = stop_process(node2_pid)
+  node2_live = false
+  assert_true(follower_status != 0)
+  write_request(root, "assign-no-quorum", "assign", "worker-a", "boot-a", 1)
+  wait_for_file(root + "/responses/assign-no-quorum.json")
+  require_text(root + "/responses/assign-no-quorum.json", "\"ok\":false", "minority write rejection")
+  require_text(root + "/responses/assign-no-quorum.json", "NoQuorum", "minority write error")
+  println("PASS: one live node refused to confirm a new write without quorum")
+
+  let restarted_log = @process.redirect_to_file(root + "/node-0-restarted.log")
+  node0_pid = @process.spawn_orphan(executable, args0, stdout=restarted_log, stderr=restarted_log)
+  node0_live = true
+  wait_for_text(root + "/state/node-0.txt", "assignments=1")
+  write_request(root, "assign-2", "assign", "worker-a", "boot-a", 2)
+  wait_for_file(root + "/responses/assign-2.json")
+  require_text(root + "/responses/assign-2.json", "\"ok\":true", "restored quorum commit")
+  wait_for_text(root + "/state/node-0.txt", "assignments=2")
+  wait_for_text(root + "/state/node-1.txt", "assignments=2")
+  require_text(root + "/replicas/node-0.state.json", "\"accepted_events\":\"1\"", "restarted DriverStore snapshot")
+  require_text(root + "/replicas/node-0.state.json", "\"event_count\":\"1\"", "restarted SourceLog snapshot")
+  println("PASS: restarted replica caught up and restored quorum writes")
+
+  @fs.write_file(root + "/stop", "\n")
+  let status0 = @async.with_timeout(10000, () => @process.wait_pid(node0_pid)) catch {
+    _ => stop_process(node0_pid)
+  }
+  node0_live = false
+  let status1 = @async.with_timeout(10000, () => @process.wait_pid(node1_pid)) catch {
+    _ => stop_process(node1_pid)
+  }
+  node1_live = false
+  assert_true(status0 == 0)
+  assert_true(status1 == 0)
+  restarted_log.close()
+  node0_log.close()
+  node1_log.close()
+  node2_log.close()
+  println("PASS: Coordinator HA cross-process acceptance")
+}

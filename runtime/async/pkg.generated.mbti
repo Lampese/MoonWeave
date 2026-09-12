@@ -113,6 +113,23 @@ pub(all) suberror CoordinatorHaError {
   Store(CoordinatorStoreError)
 } derive(Eq, @debug.Debug)
 
+pub(all) suberror CoordinatorHaNodeError {
+  InvalidCluster
+  InvalidNode
+  InvalidReplicaCount(Int)
+  DuplicateNode(String)
+  InvalidLease(Int64)
+  Io(String)
+  Malformed
+  Store(CoordinatorStoreError)
+  Closed
+  NotLeader(expected~ : String, actual~ : String)
+  StaleTerm(expected~ : Int64, actual~ : Int64)
+  NoQuorum(required~ : Int, available~ : Int)
+  CommandMissing(Int64)
+  CommandGap(expected~ : Int64, actual~ : Int64)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror CoordinatorStoreError {
   EmptyPath
   InvalidJournalOffset(Int64)
@@ -417,6 +434,59 @@ pub async fn CoordinatorHa::recover_replica(Self, Int, maximum_bytes? : Int64) -
 pub async fn CoordinatorHa::register_worker(Self, String, @protocol.Incarnation, ArrayView[String]) -> @control.RegisterStatus raise CoordinatorHaError
 pub fn CoordinatorHa::snapshot(Self) -> @control.CoordinatorSnapshot raise CoordinatorHaError
 pub fn CoordinatorHa::statuses(Self) -> Array[CoordinatorReplicaStatus]
+
+type CoordinatorHaAck derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type CoordinatorHaCommand derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type CoordinatorHaHeartbeat derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct CoordinatorHaNode {
+  config : CoordinatorHaNodeConfig
+  store : CoordinatorStore
+  mut term : Int64
+  mut applied_index : Int64
+  mut state_bundle : CoordinatorHaStateBundle?
+  mut closed : Bool
+}
+pub async fn CoordinatorHaNode::assign(Self, Int, String, start_offset? : Int64) -> @control.PartitionAssignment raise CoordinatorHaNodeError
+pub fn CoordinatorHaNode::close(Self) -> Unit
+pub async fn CoordinatorHaNode::is_leader(Self) -> Bool raise CoordinatorHaNodeError
+pub async fn CoordinatorHaNode::leader_id(Self) -> String raise CoordinatorHaNodeError
+pub fn CoordinatorHaNode::node_id(Self) -> String
+pub async fn CoordinatorHaNode::open(CoordinatorHaNodeConfig) -> Self raise CoordinatorHaNodeError
+pub async fn CoordinatorHaNode::propose_snapshot(Self, @control.CoordinatorSnapshot, state? : CoordinatorHaStateBundle?) -> Unit raise CoordinatorHaNodeError
+pub async fn CoordinatorHaNode::propose_state(Self, CoordinatorHaStateBundle) -> Unit raise CoordinatorHaNodeError
+pub async fn CoordinatorHaNode::register_worker(Self, String, @protocol.Incarnation, ArrayView[String]) -> @control.RegisterStatus raise CoordinatorHaNodeError
+pub fn CoordinatorHaNode::snapshot(Self) -> @control.CoordinatorSnapshot
+pub fn CoordinatorHaNode::term(Self) -> Int64
+pub async fn CoordinatorHaNode::tick(Self) -> Unit raise CoordinatorHaNodeError
+
+pub(all) struct CoordinatorHaNodeConfig {
+  cluster_id : String
+  coordinator_id : String
+  node_id : String
+  node_ids : Array[String]
+  root : String
+  lease_ms : Int64
+  maximum_bytes : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn CoordinatorHaNodeConfig::cluster_id(Self) -> String
+pub fn CoordinatorHaNodeConfig::coordinator_id(Self) -> String
+pub fn CoordinatorHaNodeConfig::lease_ms(Self) -> Int64
+pub fn CoordinatorHaNodeConfig::new(String, String, String, ArrayView[String], String, lease_ms? : Int64, maximum_bytes? : Int64) -> Self raise CoordinatorHaNodeError
+pub fn CoordinatorHaNodeConfig::node_id(Self) -> String
+pub fn CoordinatorHaNodeConfig::node_ids(Self) -> ArrayView[String]
+pub fn CoordinatorHaNodeConfig::root(Self) -> String
+
+pub(all) struct CoordinatorHaStateBundle {
+  coordinator : Json
+  job : Json
+  driver : Json
+  source : Json
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type CoordinatorHaTerm derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type CoordinatorJournalEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
