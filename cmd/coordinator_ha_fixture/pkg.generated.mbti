@@ -1,0 +1,21 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonweave/moonweave/cmd/coordinator_ha_fixture"
+
+import {
+  "moonbitlang/core/json",
+}
+
+// Values
+
+// Errors
+
+// Types and methods
+type FixtureState
+
+type HaRequest derive(ToJson, @json.FromJson)
+
+type HaResponse derive(ToJson, @json.FromJson)
+
+// Type aliases
+
+// Traits
