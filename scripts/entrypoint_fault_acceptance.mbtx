@@ -1,0 +1,332 @@
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+}
+
+///|
+async fn wait_for_tcp(endpoint : String) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(50)
+      } noraise {
+        connection => {
+          connection.close()
+          break
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn stop_pid(pid : Int, signal : String) -> Int {
+  ignore(@process.run("/bin/kill", [signal, pid.to_string()]))
+  @async.with_timeout(15000, () => @process.wait_pid(pid)) catch {
+    _ => {
+      ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+      @process.wait_pid(pid)
+    }
+  }
+}
+
+///|
+fn expect_failure(output : @shell.Output, label : String) -> Unit raise {
+  if output.exit_code() == 0 {
+    fail(label + " unexpectedly succeeded: " + output.stdout())
+  }
+  println("PASS: " + label + " exit=" + output.exit_code().to_string())
+}
+
+///|
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-entrypoint-faults-")
+  let submission = @fs.realpath("cmd/driver_fixture/process-submission.json")
+  let events = @fs.realpath("cmd/driver_fixture/process-events.json")
+  let coordinator = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/coordinator/coordinator.exe",
+  )
+  let worker = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/worker/worker.exe",
+  )
+  let driver = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/driver/driver.exe",
+  )
+  let bad_submission = root + "/malformed-submission.json"
+  @fs.write_file(bad_submission, "{not-json")
+
+  println("Entrypoint fault matrix state: " + root)
+  @shell.Cmd(
+    "moon",
+    ["build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver"],
+  ).run(timeout_ms=180000)
+
+  let invalid_coordinator = @shell.Cmd(
+    coordinator,
+    [
+      "--cluster", "invalid-config",
+      "--coordinator", "coordinator-0",
+      "--bind", "127.0.0.1:1",
+      "--advertise", "127.0.0.1:1",
+      "--driver-bind", "127.0.0.1:2",
+      "--driver-advertise", "127.0.0.1:2",
+      "--storage", root + "/invalid",
+      "--storage-budget-bytes", "-1",
+      "--workers", "worker-0@boot-0",
+    ],
+  ).output(timeout_ms=5000)
+  expect_failure(invalid_coordinator, "negative Coordinator storage budget rejected")
+
+  let malformed_worker = @shell.Cmd(
+    worker,
+    [
+      "--cluster", "invalid-config",
+      "--coordinator", "coordinator-0",
+      "--coordinator-endpoint", "bad-endpoint",
+      "--worker", "worker-0",
+      "--incarnation", "boot-0",
+      "--storage", root + "/worker-invalid",
+      "--job-config", bad_submission,
+    ],
+  ).output(timeout_ms=5000)
+  expect_failure(malformed_worker, "malformed Worker endpoint/config rejected")
+
+  let missing_driver_endpoint = @shell.Cmd(
+    driver,
+    [
+      "--cluster", "invalid-config",
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "status",
+    ],
+  ).output(timeout_ms=5000)
+  expect_failure(missing_driver_endpoint, "missing Driver endpoint rejected")
+
+  let coordinator_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let driver_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let coordinator_endpoint = "127.0.0.1:" + coordinator_listener.addr.port().to_string()
+  let driver_endpoint = "127.0.0.1:" + driver_listener.addr.port().to_string()
+  coordinator_listener.close()
+  driver_listener.close()
+  let cluster = "entrypoint-fault-cluster"
+  let coordinator_storage = root + "/coordinator"
+  let worker_storage = root + "/worker"
+  let coordinator_log = @process.redirect_to_file(root + "/coordinator.log")
+  let coordinator_pid = @process.spawn_orphan(
+    coordinator,
+    [
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--bind", coordinator_endpoint,
+      "--advertise", coordinator_endpoint,
+      "--driver-bind", driver_endpoint,
+      "--driver-advertise", driver_endpoint,
+      "--storage", coordinator_storage,
+      "--workers", "worker-0@boot-0",
+    ],
+    stdout=coordinator_log,
+    stderr=coordinator_log,
+  )
+  let mut coordinator_live = true
+  let mut worker_live = false
+  let mut worker_pid : Int? = None
+  defer {
+    @async.protect_from_cancel(() => {
+      if worker_live {
+        match worker_pid {
+          Some(pid) => ignore(stop_pid(pid, "-KILL"))
+          None => ()
+        }
+      }
+      if coordinator_live {
+        ignore(stop_pid(coordinator_pid, "-KILL"))
+      }
+      coordinator_log.close()
+    }) catch { _ => () }
+  }
+  wait_for_tcp(driver_endpoint)
+
+  // Start and intentionally interrupt a Worker before any input is accepted;
+  // the same durable directory is then reused by the replacement process.
+  let first_worker_output = @process.redirect_to_file(root + "/worker-first.log")
+  let first_worker_pid = @process.spawn_orphan(
+    worker,
+    [
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--coordinator-endpoint", coordinator_endpoint,
+      "--worker", "worker-0",
+      "--incarnation", "boot-0",
+      "--storage", worker_storage,
+      "--job-config", submission,
+    ],
+    stdout=first_worker_output,
+    stderr=first_worker_output,
+  )
+  @async.sleep(250)
+  let first_worker_status = stop_pid(first_worker_pid, "-KILL")
+  first_worker_output.close()
+  println("PASS: Worker interruption exit=" + first_worker_status.to_string())
+
+  let replacement_output = @process.redirect_to_file(root + "/worker-replacement.log")
+  let replacement_pid = @process.spawn_orphan(
+    worker,
+    [
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--coordinator-endpoint", coordinator_endpoint,
+      "--worker", "worker-0",
+      "--incarnation", "boot-0",
+      "--storage", worker_storage,
+      "--job-config", submission,
+    ],
+    stdout=replacement_output,
+    stderr=replacement_output,
+  )
+  worker_pid = Some(replacement_pid)
+  worker_live = true
+
+  let submit = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "submit",
+    ],
+  ).output(timeout_ms=30000)
+  if submit.exit_code() != 0 || !submit.stdout().contains("phase=Running") {
+    fail("replacement Worker cluster did not submit: " + submit.stdout())
+  }
+  println("PASS: replacement Worker accepted durable cluster submission")
+
+  // Interrupt a Driver CLI while its endpoint is connected but silent, then
+  // prove a fresh CLI still reads durable status from the Coordinator.
+  let silent_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let silent_endpoint = "127.0.0.1:" + silent_listener.addr.port().to_string()
+  let interrupted_driver = @process.spawn_orphan(
+    driver,
+    [
+      "--endpoint", silent_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "status",
+    ],
+  )
+  let (silent_connection, _) = silent_listener.accept()
+  @async.sleep(100)
+  let interrupted_driver_status = stop_pid(interrupted_driver, "-KILL")
+  silent_connection.close()
+  silent_listener.close()
+  println("PASS: interrupted Driver CLI exit=" + interrupted_driver_status.to_string())
+
+  let input = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "input",
+      "--events", events,
+    ],
+  ).output(timeout_ms=30000)
+  if input.exit_code() != 0 || !input.stdout().contains("accepted=1") {
+    fail("replacement Worker input failed: " + input.stdout())
+  }
+  let drain = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "drain",
+    ],
+  ).output(timeout_ms=30000)
+  if drain.exit_code() != 0 || !drain.stdout().contains("phase=Succeeded") {
+    fail("replacement Worker drain failed: " + drain.stdout())
+  }
+  println("PASS: Worker restart path completed drain")
+
+  // A terminal Coordinator is allowed to exit after its durable Succeeded
+  // state is written. The drain response and coordinator log are the first
+  // terminal evidence; status is checked again after a durable restart below.
+  println("PASS: terminal drain response recorded before Coordinator restart")
+
+  let coordinator_stop_status = stop_pid(coordinator_pid, "-TERM")
+  coordinator_live = false
+  worker_live = false
+  let worker_stop_status = stop_pid(replacement_pid, "-TERM")
+  println("PASS: terminal process shutdown coordinator=" +
+    coordinator_stop_status.to_string() + " worker=" + worker_stop_status.to_string())
+
+  let restarted_log = @process.redirect_to_file(root + "/coordinator-restarted.log")
+  let restarted_pid = @process.spawn_orphan(
+    coordinator,
+    [
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--bind", coordinator_endpoint,
+      "--advertise", coordinator_endpoint,
+      "--driver-bind", driver_endpoint,
+      "--driver-advertise", driver_endpoint,
+      "--storage", coordinator_storage,
+      "--workers", "worker-0@boot-0",
+    ],
+    stdout=restarted_log,
+    stderr=restarted_log,
+  )
+  wait_for_tcp(driver_endpoint)
+  let restarted_status = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "status",
+    ],
+  ).output(timeout_ms=30000)
+  if restarted_status.exit_code() != 0 || !restarted_status.stdout().contains("phase=Succeeded") {
+    fail("Coordinator restart did not restore durable Succeeded status")
+  }
+  println("PASS: Coordinator restart restored durable status")
+
+  let unknown = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "unknown",
+    ],
+  ).output(timeout_ms=30000)
+  expect_failure(unknown, "unknown Driver command rejected")
+
+  let after_unknown = @shell.Cmd(
+    driver,
+    [
+      "--endpoint", driver_endpoint,
+      "--cluster", cluster,
+      "--coordinator", "coordinator-0",
+      "--job-config", submission,
+      "--command", "status",
+    ],
+  ).output(timeout_ms=30000)
+  if after_unknown.exit_code() != 0 || !after_unknown.stdout().contains("phase=Succeeded") {
+    fail("unknown Driver command changed durable terminal state")
+  }
+  println("PASS: unknown command left durable terminal state unchanged")
+
+  ignore(stop_pid(restarted_pid, "-TERM"))
+  restarted_log.close()
+  println("PASS: complete native entrypoint fault matrix; evidence=" + root)
+}

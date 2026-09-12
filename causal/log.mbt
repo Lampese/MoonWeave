@@ -61,6 +61,14 @@ pub fn[T] CausalLog::pending_count(self : CausalLog[T]) -> Int {
 }
 
 ///|
+/// Count all retained causal events, including descendants waiting for a
+/// missing parent. Runtime memory budgets use this total rather than only the
+/// admitted frontier.
+pub fn[T] CausalLog::state_count(self : CausalLog[T]) -> Int {
+  self.admitted.length() + self.pending.length()
+}
+
+///|
 pub fn[T] CausalLog::contains(self : CausalLog[T], id : EventId) -> Bool {
   self.admitted.contains(id)
 }

@@ -245,6 +245,13 @@ fn SourceBackedExecution::event_count(self : SourceBackedExecution) -> Int {
 async fn SourceBackedExecution::compact_completed_source(
   self : SourceBackedExecution,
 ) -> Unit raise ApiError {
+  // Source retention is downstream-dependent. A remote output Worker must
+  // first report both a caught-up consumer and its physical output retention
+  // marker; otherwise keep the source prefix for recovery and retry later.
+  match self.output_manifest {
+    Some(manifest) if !manifest.is_retention_safe() => return
+    _ => ()
+  }
   self.source.compact_completed_source() catch {
     error => raise live_execution_error("compact completed source", error)
   }

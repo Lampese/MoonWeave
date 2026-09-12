@@ -112,3 +112,14 @@ test "pending events are bounded" {
     _ => fail("expected pending limit error")
   }
 }
+
+///|
+test "causal state count includes pending descendants" {
+  let log : @causal.CausalLog[String] = @causal.CausalLog::new()
+  let root = event("budget-root", 0, [], "root")
+  let child = event("budget-child", 0, [root.id()], "child")
+  ignore(log.submit(child))
+  assert_eq(log.state_count(), 1)
+  ignore(log.submit(root))
+  assert_eq(log.state_count(), 2)
+}

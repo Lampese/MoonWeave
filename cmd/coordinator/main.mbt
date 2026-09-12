@@ -126,7 +126,9 @@ async fn main {
   try
     @async.with_task_group <| group => {
       let service = group.spawn() <| () => {
-        @async.protect_from_cancel <| () => { coordinator.run() }
+        @async.protect_from_cancel <| () => {
+          coordinator.run(keep_terminal=true)
+        }
       }
       @async.with_cancellation_handler(
         handler=() => {
@@ -135,6 +137,9 @@ async fn main {
               error =>
                 println("graceful shutdown failed: \{@debug.to_string(error)}")
             }
+            // The production service stays available for terminal status
+            // queries until its supervisor explicitly delivers SIGTERM.
+            coordinator.close()
             completed = Some(service.wait())
           }
         },

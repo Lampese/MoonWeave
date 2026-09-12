@@ -451,6 +451,13 @@ pub fn Task::state_event_count(self : Task) -> Int {
 }
 
 ///|
+/// Return the configured in-memory state budget. Zero means unlimited for the
+/// pure Task API; production adapters normally supply a finite Job default.
+pub fn Task::max_state_events(self : Task) -> Int {
+  self.max_state_events
+}
+
+///|
 fn Task::check_state_limit(self : Task) -> Unit raise TaskError {
   let actual = self.state_memory_count()
   if self.max_state_events > 0 && actual > self.max_state_events {
@@ -464,7 +471,7 @@ fn Task::check_state_limit(self : Task) -> Unit raise TaskError {
 /// aggregation (historical updates), and custom operators (emitted JSON).
 /// This is deliberately conservative: rejecting a candidate before commit is
 /// preferable to allowing a production process to grow without a bound.
-fn Task::state_memory_count(self : Task) -> Int {
+pub fn Task::state_memory_count(self : Task) -> Int {
   match self.operator {
     OperatorKind::KeyedSum => {
       let engine = self.aggregation.unwrap()
@@ -699,6 +706,7 @@ pub fn Task::restore(
     let restored_outputs = candidate.apply_input(TaskInput::new(event))
     ignore(restored_outputs)
   }
+  candidate.check_state_limit()
   candidate.refresh_frontier()
   if candidate.frontier.digest() != snapshot.frontier_digest() {
     raise TaskError::InvalidTransition
@@ -980,6 +988,18 @@ pub fn Task::process_batch(
 }
 
 ///|
+/// Validate a primary batch transactionally without changing this Task. The
+/// Worker adapter uses this before persisting a transport WAL.
+pub fn Task::validate_batch(
+  self : Task,
+  batch : @protocol.EventBatch,
+) -> Int raise TaskError {
+  let candidate = self.copy()
+  ignore(candidate.process_batch(batch))
+  candidate.state_memory_count()
+}
+
+///|
 /// Apply an inbound exchange batch to the same operator state without
 /// advancing the target partition's primary source offset.
 pub fn Task::process_delta(
@@ -1014,6 +1034,17 @@ pub fn Task::process_delta(
   outputs.sort()
   self.commit(candidate)
   outputs
+}
+
+///|
+/// Validate an exchange batch transactionally without changing this Task.
+pub fn Task::validate_delta(
+  self : Task,
+  delta : @protocol.DeltaBatch,
+) -> Int raise TaskError {
+  let candidate = self.copy()
+  ignore(candidate.process_delta(delta))
+  candidate.state_memory_count()
 }
 
 ///|

@@ -106,6 +106,69 @@ async test "remote inputs compute before drain and retries do not add totals twi
 }
 
 ///|
+async test "remote JSONL sink reports retention proof before source compaction" {
+  let root = @fs.tmpdir(prefix="moonweave-driver-live-jsonl")
+  defer @fs.rmdir(root, recursive=true)
+  @async_runtime.with_timeout(10000, () => {
+    let sink_path = root + "/outputs.jsonl"
+    let job = JobDefinition::new("live-jsonl", OperatorRef::reachability())
+      .with_workers(["worker"])
+      .with_sink(SinkSpec::json_lines(sink_path))
+      .compile()
+    let coordinator = bind_live_driver(root, job.job_id())
+    @async_runtime.with_task_group <| group => {
+      let runner = group.spawn() <| () => { coordinator.run() }
+      let worker = group.spawn() <| () => {
+        job.run_worker_node(
+          WorkerNodeConfig::new_auto(
+            job.job_id(),
+            "coordinator",
+            coordinator.data_endpoint(),
+            "worker",
+            "boot-worker",
+            root + "/worker",
+          ),
+        )
+      }
+      let handle = job
+        .submission_with_id("live-jsonl-submit")
+        .run_remote(
+          DriverConfig::new(
+            job.job_id(),
+            "coordinator",
+            "driver",
+            coordinator.control_endpoint(),
+          ),
+        )
+      defer handle.close()
+      let event = Event::new(
+        @causal.EventId::new("live-jsonl-event", 0),
+        [],
+        "account",
+        Json::object({
+          "source": Json::string("A"),
+          "target": Json::string("B"),
+        }),
+      )
+      assert_eq(handle.input([event]).accepted_events(), 1L)
+      assert_eq(handle.drain().phase(), JobRunPhase::Succeeded)
+      assert_true(@fs.read_file(sink_path).text().contains("A"))
+      assert_true(@fs.read_file(sink_path).text().contains("B"))
+      let source = @runtime.SourceLog::open(root + "/source.wal")
+      assert_eq(source.event_count(), 0)
+      assert_eq(source.next_offset(0), Some(1L))
+      source.close()
+      let output = @runtime.TaskOutputLog::open(root + "/worker/output-p0.wal")
+      assert_eq(output.records().length(), 0)
+      assert_eq(output.retained_from("live-jsonl/dynamic/worker"), 1L)
+      output.close()
+      assert_eq(runner.wait().status().phase(), JobRunPhase::Succeeded)
+      assert_eq(worker.wait().live_batches(), 1)
+    }
+  })
+}
+
+///|
 async test "Driver cancellation interrupts drain while no Worker has connected" {
   let root = @fs.tmpdir(prefix="moonweave-driver-cancel")
   defer @fs.rmdir(root, recursive=true)

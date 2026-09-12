@@ -1884,44 +1884,99 @@ pub async fn CompiledJob::run_coordinator_node(
 }
 
 ///|
+/// A Worker-side external sink is opened once per process and shared by its
+/// partition sessions. Both connectors acknowledge only after their durable
+/// write succeeds, so the same output-consumer retention proof applies to
+/// Kafka and JSONL.
+priv enum WorkerOutputSink {
+  Kafka(KafkaSink)
+  JsonLines(@runtime.JsonLinesSink)
+}
+
+///|
+async fn WorkerOutputSink::write(
+  self : WorkerOutputSink,
+  record : @runtime.TaskOutputRecord,
+) -> Unit raise ApiError {
+  match self {
+    WorkerOutputSink::Kafka(sink) => sink.write(record)
+    WorkerOutputSink::JsonLines(sink) =>
+      sink.write(record) catch {
+        error => raise ApiError::Sink(@debug.to_string(error))
+      }
+  }
+}
+
+///|
+fn WorkerOutputSink::consumer_id(
+  self : WorkerOutputSink,
+  job_id : String,
+) -> String {
+  match self {
+    WorkerOutputSink::Kafka(sink) => job_id + "-kafka-" + sink.topic()
+    WorkerOutputSink::JsonLines(_) => job_id + "-json-lines"
+  }
+}
+
+///|
 /// Run one Worker process against a remote Coordinator. The operator is a
 /// registered implementation already compiled into this Worker binary.
 pub async fn CompiledJob::run_worker_node(
   self : CompiledJob,
   config : WorkerNodeConfig,
 ) -> WorkerNodeSummary raise ApiError {
-  guard self.definition.sink is SinkSpec::Kafka(spec) else {
-    return self.run_worker_node_with_sink(config, None)
-  }
-  let sink_config = config.kafka_runtime
-    .unwrap_or(KafkaRuntimeConfig::new())
-    .sink_config(spec)
-  let mut outcome : Result[WorkerNodeSummary, ApiError]? = None
-  (@async_runtime.with_task_group <| group => {
-    let connected : Result[KafkaSink, ApiError] = Ok(
-      KafkaSink::connect(group~, sink_config),
-    ) catch {
-      error => Err(error)
-    }
-    match connected {
-      Err(error) => outcome = Some(Err(error))
-      Ok(sink) => {
-        defer sink.close()
-        outcome = Some(
-          Ok(self.run_worker_node_with_sink(config, Some(sink))) catch {
-            error => Err(error)
-          },
-        )
+  match self.definition.sink {
+    SinkSpec::Kafka(spec) => {
+      let sink_config = config.kafka_runtime
+        .unwrap_or(KafkaRuntimeConfig::new())
+        .sink_config(spec)
+      let mut outcome : Result[WorkerNodeSummary, ApiError]? = None
+      (@async_runtime.with_task_group <| group => {
+        let connected : Result[KafkaSink, ApiError] = Ok(
+          KafkaSink::connect(group~, sink_config),
+        ) catch {
+          error => Err(error)
+        }
+        match connected {
+          Err(error) => outcome = Some(Err(error))
+          Ok(sink) => {
+            defer sink.close()
+            outcome = Some(
+              Ok(
+                self.run_worker_node_with_sink(
+                  config,
+                  Some(WorkerOutputSink::Kafka(sink)),
+                ),
+              ) catch {
+                error => Err(error)
+              },
+            )
+          }
+        }
+      }) catch {
+        error =>
+          raise ApiError::Sink(
+            "Kafka producer runtime: " + @debug.to_string(error),
+          )
+      }
+      match outcome {
+        Some(Ok(summary)) => summary
+        Some(Err(error)) => raise error
+        None => raise ApiError::Sink("Kafka Worker runtime did not start")
       }
     }
-  }) catch {
-    error =>
-      raise ApiError::Sink("Kafka producer runtime: " + @debug.to_string(error))
-  }
-  match outcome {
-    Some(Ok(summary)) => summary
-    Some(Err(error)) => raise error
-    None => raise ApiError::Sink("Kafka Worker runtime did not start")
+    SinkSpec::JsonLines(path) => {
+      let sink = @runtime.JsonLinesSink::open(path) catch {
+        error => raise ApiError::Sink(@debug.to_string(error))
+      }
+      defer sink.close()
+      self.run_worker_node_with_sink(
+        config,
+        Some(WorkerOutputSink::JsonLines(sink)),
+      )
+    }
+    SinkSpec::Discard | SinkSpec::Durable(_) =>
+      self.run_worker_node_with_sink(config, None)
   }
 }
 
@@ -1929,7 +1984,7 @@ pub async fn CompiledJob::run_worker_node(
 async fn CompiledJob::run_worker_node_with_sink(
   self : CompiledJob,
   config : WorkerNodeConfig,
-  kafka_sink : KafkaSink?,
+  output_sink : WorkerOutputSink?,
 ) -> WorkerNodeSummary raise ApiError {
   let partition = if config.partition < 0 {
     let owned : Array[Int] = []
@@ -2027,15 +2082,15 @@ async fn CompiledJob::run_worker_node_with_sink(
         storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=!config.assignment_known,
         auth_token?=config.auth_token,
-        output_delivery?=match kafka_sink {
+        output_delivery?=match output_sink {
           Some(sink) => Some(record => sink.write(record))
           None => None
         },
-        output_consumer_checkpoint_prefix?=kafka_sink.map(_ => {
-          config.storage_dir + "/sink-kafka-p" + partition.to_string()
+        output_consumer_checkpoint_prefix?=output_sink.map(_ => {
+          config.storage_dir + "/sink-p" + partition.to_string()
         }),
-        output_consumer_id?=kafka_sink.map(sink => {
-          self.definition.job_id + "-kafka-" + sink.topic()
+        output_consumer_id?=output_sink.map(sink => {
+          sink.consumer_id(self.definition.job_id)
         }),
       ),
     ) catch {
@@ -2254,38 +2309,58 @@ pub async fn CompiledJob::run_worker_node_set(
   self : CompiledJob,
   config : WorkerNodeSetConfig,
 ) -> WorkerNodeSetSummary raise ApiError {
-  guard self.definition.sink is SinkSpec::Kafka(spec) else {
-    return self.run_worker_node_set_with_sink(config, None)
-  }
-  let sink_config = config.kafka_runtime
-    .unwrap_or(KafkaRuntimeConfig::new())
-    .sink_config(spec)
-  let mut outcome : Result[WorkerNodeSetSummary, ApiError]? = None
-  (@async_runtime.with_task_group <| group => {
-    let connected : Result[KafkaSink, ApiError] = Ok(
-      KafkaSink::connect(group~, sink_config),
-    ) catch {
-      error => Err(error)
-    }
-    match connected {
-      Err(error) => outcome = Some(Err(error))
-      Ok(sink) => {
-        defer sink.close()
-        outcome = Some(
-          Ok(self.run_worker_node_set_with_sink(config, Some(sink))) catch {
-            error => Err(error)
-          },
-        )
+  match self.definition.sink {
+    SinkSpec::Kafka(spec) => {
+      let sink_config = config.kafka_runtime
+        .unwrap_or(KafkaRuntimeConfig::new())
+        .sink_config(spec)
+      let mut outcome : Result[WorkerNodeSetSummary, ApiError]? = None
+      (@async_runtime.with_task_group <| group => {
+        let connected : Result[KafkaSink, ApiError] = Ok(
+          KafkaSink::connect(group~, sink_config),
+        ) catch {
+          error => Err(error)
+        }
+        match connected {
+          Err(error) => outcome = Some(Err(error))
+          Ok(sink) => {
+            defer sink.close()
+            outcome = Some(
+              Ok(
+                self.run_worker_node_set_with_sink(
+                  config,
+                  Some(WorkerOutputSink::Kafka(sink)),
+                ),
+              ) catch {
+                error => Err(error)
+              },
+            )
+          }
+        }
+      }) catch {
+        error =>
+          raise ApiError::Sink(
+            "Kafka producer runtime: " + @debug.to_string(error),
+          )
+      }
+      match outcome {
+        Some(Ok(summary)) => summary
+        Some(Err(error)) => raise error
+        None => raise ApiError::Sink("Kafka Worker runtime did not start")
       }
     }
-  }) catch {
-    error =>
-      raise ApiError::Sink("Kafka producer runtime: " + @debug.to_string(error))
-  }
-  match outcome {
-    Some(Ok(summary)) => summary
-    Some(Err(error)) => raise error
-    None => raise ApiError::Sink("Kafka Worker runtime did not start")
+    SinkSpec::JsonLines(path) => {
+      let sink = @runtime.JsonLinesSink::open(path) catch {
+        error => raise ApiError::Sink(@debug.to_string(error))
+      }
+      defer sink.close()
+      self.run_worker_node_set_with_sink(
+        config,
+        Some(WorkerOutputSink::JsonLines(sink)),
+      )
+    }
+    SinkSpec::Discard | SinkSpec::Durable(_) =>
+      self.run_worker_node_set_with_sink(config, None)
   }
 }
 
@@ -2293,7 +2368,7 @@ pub async fn CompiledJob::run_worker_node_set(
 async fn CompiledJob::run_worker_node_set_with_sink(
   self : CompiledJob,
   config : WorkerNodeSetConfig,
-  kafka_sink : KafkaSink?,
+  output_sink : WorkerOutputSink?,
 ) -> WorkerNodeSetSummary raise ApiError {
   if !self.definition.workers.any(worker => worker == config.worker_id) {
     raise ApiError::InvalidWorkerAssignment(config.worker_id)
@@ -2387,15 +2462,15 @@ async fn CompiledJob::run_worker_node_set_with_sink(
         storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=config.partitions is Some(_),
         auth_token?=config.auth_token,
-        output_delivery?=match kafka_sink {
+        output_delivery?=match output_sink {
           Some(sink) => Some(record => sink.write(record))
           None => None
         },
-        output_consumer_checkpoint_prefix?=kafka_sink.map(_ => {
-          config.storage_dir + "/sink-kafka-p" + partition.to_string()
+        output_consumer_checkpoint_prefix?=output_sink.map(_ => {
+          config.storage_dir + "/sink-p" + partition.to_string()
         }),
-        output_consumer_id?=kafka_sink.map(sink => {
-          self.definition.job_id + "-kafka-" + sink.topic()
+        output_consumer_id?=output_sink.map(sink => {
+          sink.consumer_id(self.definition.job_id)
         }),
       ),
     )

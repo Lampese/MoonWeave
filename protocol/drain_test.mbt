@@ -154,3 +154,47 @@ test "drain acknowledgement optionally carries a durable Task output summary" {
     _ => fail("partial output summary accepted")
   }
 }
+
+///|
+test "drain acknowledgement carries the output consumer retention proof" {
+  let ack = @protocol.DrainAck::new(
+    "drain-retention",
+    2,
+    3,
+    1L,
+    1L,
+    0,
+    "frontier",
+    task_id="task/p2/e3",
+    output_count=4L,
+    output_digest="manifest-output",
+    task_state_digest="manifest-state",
+    output_consumer_id="sink-1",
+    output_acked_sequence=3L,
+    output_retained_from=4L,
+  )
+  assert_eq(@protocol.DrainAck::from_payload(ack.to_payload()), ack)
+  assert_eq(ack.output_consumer_id(), Some("sink-1"))
+  assert_eq(ack.output_acked_sequence(), Some(3L))
+  assert_eq(ack.output_retained_from(), Some(4L))
+  try
+    @protocol.DrainAck::new(
+      "partial-retention",
+      2,
+      3,
+      1L,
+      1L,
+      0,
+      "frontier",
+      task_id="task/p2/e3",
+      output_count=4L,
+      output_digest="manifest-output",
+      task_state_digest="manifest-state",
+      output_consumer_id="sink-1",
+    )
+  catch {
+    _ => ()
+  } noraise {
+    _ => fail("partial output retention proof accepted")
+  }
+}

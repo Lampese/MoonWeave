@@ -118,6 +118,7 @@ pub fn Task::fail(Self) -> Unit
 pub fn Task::from_assignment(String, String, OperatorKind, @protocol.AssignmentSpec) -> Self raise TaskError
 pub fn Task::from_spec(TaskSpec) -> Self raise TaskError
 pub fn Task::frontier(Self) -> @causal.Frontier
+pub fn Task::max_state_events(Self) -> Int
 pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
 pub fn Task::new_custom(String, String, CustomOperator, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
 pub fn Task::offset(Self) -> Int64
@@ -136,9 +137,12 @@ pub fn Task::snapshot(Self) -> TaskSnapshot raise TaskError
 pub fn Task::start(Self) -> Unit raise TaskError
 pub fn Task::start_offset(Self) -> Int64
 pub fn Task::state_event_count(Self) -> Int
+pub fn Task::state_memory_count(Self) -> Int
 pub fn Task::stop(Self) -> Unit raise TaskError
 pub fn Task::task_id(Self) -> String
 pub fn Task::validate_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
+pub fn Task::validate_batch(Self, @protocol.EventBatch) -> Int raise TaskError
+pub fn Task::validate_delta(Self, @protocol.DeltaBatch) -> Int raise TaskError
 
 pub(all) struct TaskDispatch {
   task_id : String

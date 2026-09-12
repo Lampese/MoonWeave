@@ -213,6 +213,9 @@ async fn wait_job_drain(
               task_state_digest,
               true,
               applied_offset=ack.applied_offset,
+              consumer_id?=ack.output_consumer_id,
+              acked_sequence?=ack.output_acked_sequence,
+              retained_from?=ack.output_retained_from,
             ) catch {
               error => raise FrameIoError::JobOutputManifest(error)
             }

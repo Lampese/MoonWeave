@@ -44,6 +44,7 @@ pub async fn run_worker_task(
   })
   let mut output_log : TaskOutputLog? = None
   let mut output_consumer : TaskOutputConsumer? = None
+  let mut output_retention_barrier : TaskOutputRetentionBarrier? = None
   defer {
     match output_consumer {
       None => ()
@@ -113,7 +114,15 @@ pub async fn run_worker_task(
       }
     }
   }
-  let output_summary : () -> (String, Int64, String, String) raise FrameIoError = () => {
+  let output_summary : () -> (
+    String,
+    Int64,
+    String,
+    String,
+    String?,
+    Int64?,
+    Int64?,
+  ) raise FrameIoError = () => {
     match output_log {
       None =>
         raise FrameIoError::Handler("output summary requires an output log")
@@ -121,13 +130,41 @@ pub async fn run_worker_task(
         let snapshot = task.snapshot() catch {
           error => raise FrameIoError::Task(error)
         }
+        let consumer_proof = match (output_consumer, output_retention_barrier) {
+          (Some(consumer), Some(barrier)) =>
+            Some(
+              (
+                consumer.consumer_id(),
+                consumer.next_sequence() - 1L,
+                barrier.retain_from(),
+              ),
+            )
+          _ => None
+        }
         (
           task.task_id(),
           log.next_sequence(task.task_id()),
           log.output_digest(task.task_id()),
           task_snapshot_digest(snapshot),
+          consumer_proof.map(value => value.0),
+          consumer_proof.map(value => value.1),
+          consumer_proof.map(value => value.2),
         )
       }
+    }
+  }
+  let terminal_barrier : async () -> Unit raise FrameIoError = () => {
+    match (output_log, output_consumer) {
+      (Some(log), Some(consumer)) => {
+        let barrier = consumer.retention_barrier() catch {
+          error => raise FrameIoError::Handler(@debug.to_string(error))
+        }
+        log.compact(barrier) catch {
+          error => raise FrameIoError::OutputLog(error)
+        }
+        output_retention_barrier = Some(barrier)
+      }
+      _ => ()
     }
   }
   let primary_handler : (@protocol.EventBatch) -> Unit raise = batch => {
@@ -186,6 +223,7 @@ pub async fn run_worker_task(
       initial_credit_events~,
       initial_credit_bytes~,
       heartbeat_interval_ms~,
+      storage_budget_bytes?,
       delta_handler~,
       delta_wal_path?,
       assignment_validator=assignment => {
@@ -317,6 +355,19 @@ pub async fn run_worker_task(
       output_summary?=match output_log_path {
         None => None
         Some(_) => Some(output_summary)
+      },
+      terminal_barrier~,
+      causal_state_limit=task.max_state_events(),
+      operator_state_count=() => task.state_memory_count(),
+      primary_admission_validator=batch => {
+        task.validate_batch(batch) catch {
+          error => raise FrameIoError::Task(error)
+        }
+      },
+      delta_admission_validator=delta => {
+        task.validate_delta(delta) catch {
+          error => raise FrameIoError::Task(error)
+        }
       },
     ),
   ) catch {

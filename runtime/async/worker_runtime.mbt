@@ -87,6 +87,22 @@ fn admit_causal_delta(
 }
 
 ///|
+/// Bound the Worker-local causal index before it becomes durable. Pending
+/// descendants are state too, so they count against the same Job budget.
+fn check_causal_state_limit(
+  log : @causal.CausalLog[Json],
+  limit : Int,
+  operator_count? : Int = 0,
+) -> Unit raise FrameIoError {
+  if limit > 0 {
+    let actual = log.state_count() + operator_count
+    if actual > limit {
+      raise FrameIoError::StateLimitExceeded(limit~, actual~)
+    }
+  }
+}
+
+///|
 /// Raw read used only inside `with_timeout_opt`. It deliberately leaves async
 /// cancellation and lower-level errors open so the timeout combinator can
 /// distinguish its own deadline from a peer closing the socket.
@@ -520,10 +536,23 @@ async fn run_worker_impl(
   state_schema? : String = "moonweave:transport:v1",
   assignment_setup? : () -> Unit raise FrameIoError,
   drain_handler? : () -> Unit raise FrameIoError,
-  output_summary? : () -> (String, Int64, String, String) raise FrameIoError,
+  output_summary? : () -> (
+    String,
+    Int64,
+    String,
+    String,
+    String?,
+    Int64?,
+    Int64?,
+  ) raise FrameIoError,
+  terminal_barrier? : async () -> Unit raise FrameIoError,
   auth_token? : String,
   storage_prepare? : async (@protocol.Assignment) -> (String, String?, String?) raise FrameIoError,
   storage_budget_bytes? : Int64,
+  causal_state_limit? : Int = 0,
+  primary_admission_validator? : (@protocol.EventBatch) -> Int raise FrameIoError,
+  delta_admission_validator? : (@protocol.DeltaBatch) -> Int raise FrameIoError,
+  operator_state_count? : () -> Int,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -613,6 +642,7 @@ async fn run_worker_impl(
   for record in delta_records {
     admit_causal_delta(causal_log, record.delta)
   }
+  check_causal_state_limit(causal_log, causal_state_limit)
   let recovered_frontier_digest = frontier_digest(causal_log.frontier())
   match checkpoint {
     None => ()
@@ -664,6 +694,14 @@ async fn run_worker_impl(
         )
     }
   }
+  check_causal_state_limit(
+    causal_log,
+    causal_state_limit,
+    operator_count=match operator_state_count {
+      None => 0
+      Some(count) => count()
+    },
+  )
   match output_barrier {
     None => ()
     Some(barrier) => barrier()
@@ -804,6 +842,43 @@ async fn run_worker_impl(
     let duplicate = duplicate_by_id ||
       duplicate_by_range ||
       duplicate_by_delta_wal
+    // Reject a new batch before WorkerSession advances its receive cursor. A
+    // budget refusal must be fully fail-closed: no WAL append, ACK, or cursor
+    // movement is allowed for the refused input.
+    if !duplicate {
+      match batch {
+        Some(batch_value) => {
+          let candidate = causal_log.copy()
+          admit_causal_batch(candidate, batch_value)
+          let operator_count = match primary_admission_validator {
+            None => 0
+            Some(validate) => validate(batch_value)
+          }
+          check_causal_state_limit(
+            candidate,
+            causal_state_limit,
+            operator_count~,
+          )
+        }
+        None => ()
+      }
+      match delta {
+        Some(delta_value) => {
+          let candidate = causal_log.copy()
+          admit_causal_delta(candidate, delta_value)
+          let operator_count = match delta_admission_validator {
+            None => 0
+            Some(validate) => validate(delta_value)
+          }
+          check_causal_state_limit(
+            candidate,
+            causal_state_limit,
+            operator_count~,
+          )
+        }
+        None => ()
+      }
+    }
     session.accept_frame(frame) catch {
       error => raise FrameIoError::Session(error)
     }
@@ -843,8 +918,6 @@ async fn run_worker_impl(
             )
           }
         } else {
-          let candidate = causal_log.copy()
-          admit_causal_batch(candidate, batch_value)
           let persisted_bytes = @utf8.encode(frame.payload())
           ignore(
             wal.append(persisted_bytes) catch {
@@ -934,8 +1007,6 @@ async fn run_worker_impl(
         if !duplicate {
           match delta_wal {
             Some(wal) => {
-              let candidate = causal_log.copy()
-              admit_causal_delta(candidate, delta_value)
               let record = DeltaWalRecord::{
                 delta_id: delta_value.delta_id(),
                 delta: delta_value,
@@ -1016,6 +1087,10 @@ async fn run_worker_impl(
             None => ()
             Some(finish) => finish()
           }
+          match terminal_barrier {
+            None => ()
+            Some(barrier) => barrier()
+          }
         }
         let ack = match output_summary {
           None =>
@@ -1031,7 +1106,15 @@ async fn run_worker_impl(
               error => raise FrameIoError::Protocol(error)
             }
           Some(make_summary) => {
-            let (task_id, output_count, output_digest, task_state_digest) = make_summary()
+            let (
+              task_id,
+              output_count,
+              output_digest,
+              task_state_digest,
+              output_consumer_id,
+              output_acked_sequence,
+              output_retained_from,
+            ) = make_summary()
             @protocol.DrainAck::new(
               frame.message_id(),
               assignment.partition(),
@@ -1044,6 +1127,9 @@ async fn run_worker_impl(
               output_count~,
               output_digest~,
               task_state_digest~,
+              output_consumer_id?,
+              output_acked_sequence?,
+              output_retained_from?,
             ) catch {
               error => raise FrameIoError::Protocol(error)
             }

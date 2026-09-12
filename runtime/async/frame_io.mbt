@@ -26,6 +26,7 @@ pub(all) suberror FrameIoError {
   DeltaMismatch
   DrainMismatch
   PendingEvents(Int)
+  StateLimitExceeded(limit~ : Int, actual~ : Int)
   Reconciliation(ReconciliationError)
   JobOutputManifest(JobOutputManifestError)
   Handler(String)

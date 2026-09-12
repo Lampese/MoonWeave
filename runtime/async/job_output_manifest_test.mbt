@@ -278,6 +278,60 @@ async test "job output retention waits for every registered consumer" {
 }
 
 ///|
+async test "remote Worker retention proof gates Coordinator source reclamation" {
+  with_job_output_paths <| directory => {
+    let manifest = JobOutputManifest::open(
+      directory + "/job-output.wal",
+      "remote-retention",
+      "reachability",
+      1,
+    )
+    defer manifest.close()
+    manifest.record_partition_summary(
+      0,
+      "remote-retention/p0/e0",
+      "worker-a",
+      0,
+      1L,
+      "manifest-output",
+      "frontier",
+      "state",
+      true,
+      applied_offset=0L,
+      consumer_id="worker-a-kafka-output",
+      acked_sequence=0L,
+      retained_from=1L,
+    )
+    assert_true(manifest.is_complete())
+    assert_true(manifest.is_fully_consumed())
+    assert_true(manifest.is_retention_safe())
+    let lagging = JobOutputManifest::open(
+      directory + "/lagging.wal",
+      "remote-retention-lagging",
+      "reachability",
+      1,
+    )
+    defer lagging.close()
+    lagging.record_partition_summary(
+      0,
+      "remote-retention-lagging/p0/e0",
+      "worker-a",
+      0,
+      1L,
+      "manifest-output",
+      "frontier",
+      "state",
+      true,
+      applied_offset=0L,
+      consumer_id="worker-a-kafka-output",
+      acked_sequence=-1L,
+      retained_from=0L,
+    )
+    assert_false(lagging.is_retention_safe())
+  }
+}
+
+///|
 async test "job output manifest fails closed on identity, cursor, and certificate conflicts" {
   with_job_output_paths <| directory => {
     let log = TaskOutputLog::open(directory + "/task.wal")
