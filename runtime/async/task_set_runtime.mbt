@@ -20,6 +20,7 @@ pub struct WorkerTaskWork {
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
   auth_token : String?
+  job_id : String?
   output_delivery : (async (TaskOutputRecord) -> Unit)?
   output_consumer_checkpoint_prefix : String?
   output_consumer_id : String?
@@ -45,6 +46,7 @@ pub fn WorkerTaskWork::new(
   initial_credit_bytes? : Int64 = 4L * 1024L * 1024L,
   heartbeat_interval_ms? : Int = 0,
   auth_token? : String,
+  job_id? : String,
   output_delivery? : async (TaskOutputRecord) -> Unit,
   output_consumer_checkpoint_prefix? : String,
   output_consumer_id? : String,
@@ -68,6 +70,7 @@ pub fn WorkerTaskWork::new(
     initial_credit_bytes,
     heartbeat_interval_ms,
     auth_token,
+    job_id,
     output_delivery,
     output_consumer_checkpoint_prefix,
     output_consumer_id,
@@ -240,6 +243,7 @@ pub async fn run_worker_task_set(
             output_log_path?=work.output_log_path,
             dynamic_assignment=work.dynamic_assignment,
             auth_token?=work.auth_token,
+            job_id?=work.job_id,
             output_delivery?=work.output_delivery,
             output_consumer_checkpoint_prefix?=work.output_consumer_checkpoint_prefix,
             output_consumer_id?=work.output_consumer_id,

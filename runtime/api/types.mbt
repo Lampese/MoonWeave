@@ -20,6 +20,9 @@ pub(all) suberror ApiError {
   InvalidEvent(String)
   EmptyKey
   InvalidWindowSize(Int)
+  InvalidEventTimeWindow(size_ms~ : Int64, allowed_lateness_ms~ : Int64)
+  InvalidJoinWindow(before_ms~ : Int64, after_ms~ : Int64)
+  InvalidEventTimestamp(Int64)
   InvalidStateLimit(Int)
   InvalidEndpoint(String)
   InvalidPort(Int)
@@ -34,6 +37,8 @@ pub(all) suberror ApiError {
   TaskFailed(String)
   Source(String)
   Sink(String)
+  KafkaUnavailable(String)
+  WorkerMigrationUnavailable(String)
   Closed
   Cluster(String)
   Plan(@plan.PlanError)
@@ -46,6 +51,7 @@ pub(all) enum SourceSpec {
   Events
   JsonLines(String)
   Kafka(KafkaSourceSpec)
+  Inputs(Array[NamedSource])
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -77,6 +83,7 @@ pub fn SourceSpec::path(self : SourceSpec) -> String? {
     SourceSpec::Events => None
     SourceSpec::JsonLines(path) => Some(path)
     SourceSpec::Kafka(_) => None
+    SourceSpec::Inputs(_) => None
   }
 }
 
@@ -97,6 +104,7 @@ pub fn SourceSpec::recovery_capability(self : SourceSpec) -> RecoveryCapability 
     SourceSpec::Events => RecoveryCapability::Replayable
     SourceSpec::JsonLines(_) => RecoveryCapability::Replayable
     SourceSpec::Kafka(_) => RecoveryCapability::Replayable
+    SourceSpec::Inputs(_) => RecoveryCapability::Replayable
   }
 }
 
@@ -229,6 +237,7 @@ pub struct JobDefinition {
   job_id : String
   operator : OperatorRef
   partition_count : Int
+  parallelism : Int?
   workers : Array[String]
   routes : Array[@plan.ExchangeRoute]
   source : SourceSpec
@@ -236,6 +245,12 @@ pub struct JobDefinition {
   sink : SinkSpec
   artifact : OperatorArtifact?
   max_state_events : Int?
+  event_time_config : @task.TaskEventTimeConfig?
+  watermark_idle_timeout_ms : Int64?
+  graph : GraphDefinition?
+  graph_input : @task.TaskGraphConfig?
+  transform : Array[GraphTransform]?
+  graph_watermarks : Array[String]?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -250,6 +265,7 @@ pub fn JobDefinition::new(
     job_id,
     operator,
     partition_count: 1,
+    parallelism: None,
     workers: ["local"],
     routes: [],
     source: SourceSpec::Events,
@@ -257,6 +273,12 @@ pub fn JobDefinition::new(
     sink: SinkSpec::Discard,
     artifact: None,
     max_state_events: None,
+    event_time_config: None,
+    watermark_idle_timeout_ms: None,
+    graph: None,
+    graph_input: None,
+    transform: None,
+    graph_watermarks: None,
   }
 }
 
@@ -282,6 +304,25 @@ pub fn JobDefinition::with_partition_count(
     raise ApiError::InvalidPartitionCount(partition_count)
   }
   { ..self, partition_count, }
+}
+
+///|
+/// Fixed partitions are key shards and checkpoint units. Parallelism is the
+/// number of independently scheduled execution slots, each owning one or more
+/// shards. It can change online up to the configured partition count.
+pub fn JobDefinition::with_parallelism(
+  self : JobDefinition,
+  parallelism : Int,
+) -> JobDefinition raise ApiError {
+  if parallelism <= 0 || parallelism > self.partition_count {
+    raise ApiError::InvalidPartitionCount(parallelism)
+  }
+  { ..self, parallelism: Some(parallelism), }
+}
+
+///|
+pub fn JobDefinition::parallelism(self : JobDefinition) -> Int {
+  self.parallelism.unwrap_or(self.partition_count)
 }
 
 ///|
@@ -400,6 +441,21 @@ pub fn JobDefinition::max_state_events(self : JobDefinition) -> Int? {
 }
 
 ///|
+pub fn JobDefinition::with_event_time(
+  self : JobDefinition,
+  config : @task.TaskEventTimeConfig,
+) -> JobDefinition {
+  { ..self, event_time_config: Some(config), }
+}
+
+///|
+pub fn JobDefinition::event_time_config(
+  self : JobDefinition,
+) -> @task.TaskEventTimeConfig? {
+  self.event_time_config
+}
+
+///|
 /// A user-facing causal input. The protocol EventRecord remains an internal
 /// representation of the local/cluster runner.
 pub struct Event {
@@ -496,10 +552,24 @@ pub fn JobSubmission::job(self : JobSubmission) -> ClusterSubmission {
 ///|
 /// Commands share one schema between a local handle and a future remote
 /// Driver/Coordinator control session.
+pub(all) struct RescaleRequest {
+  workers : Array[String]
+  parallelism : Int?
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
 pub(all) enum JobCommand {
   Submit(JobSubmission)
   Input(Array[Event])
   Status
+  /// Stop admitting new input while preserving the running execution.
+  Pause
+  /// Re-open input admission after a durable pause.
+  Resume
+  /// Rebalance partitions across the supplied, statically registered workers.
+  Rescale(RescaleRequest)
+  /// Replace a paused Job with a state-schema-compatible submission.
+  Update(JobSubmission)
   Drain
   Cancel
 } derive(Debug, Eq, ToJson, FromJson)
@@ -517,6 +587,29 @@ pub fn JobCommand::input(events : ArrayView[Event]) -> JobCommand {
 ///|
 pub fn JobCommand::status() -> JobCommand {
   JobCommand::Status
+}
+
+///|
+pub fn JobCommand::pause() -> JobCommand {
+  JobCommand::Pause
+}
+
+///|
+pub fn JobCommand::resume() -> JobCommand {
+  JobCommand::Resume
+}
+
+///|
+pub fn JobCommand::rescale(
+  workers : ArrayView[String],
+  parallelism? : Int,
+) -> JobCommand {
+  JobCommand::Rescale({ workers: workers.to_owned(), parallelism, })
+}
+
+///|
+pub fn JobCommand::update(submission : JobSubmission) -> JobCommand {
+  JobCommand::Update(submission)
 }
 
 ///|
@@ -539,6 +632,8 @@ pub(all) struct JobRunStatus {
   accepted_events : Int64
   failure : String?
   idempotent_sink_required : Bool
+  paused : Bool
+  parallelism : Int
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -550,6 +645,8 @@ pub fn JobRunStatus::new(
   accepted_events : Int64,
   failure : String?,
   idempotent_sink_required? : Bool = true,
+  paused? : Bool = false,
+  parallelism? : Int = 1,
 ) -> JobRunStatus {
   {
     submission_id,
@@ -559,6 +656,8 @@ pub fn JobRunStatus::new(
     accepted_events,
     failure,
     idempotent_sink_required,
+    paused,
+    parallelism,
   }
 }
 
@@ -580,6 +679,16 @@ pub fn JobRunStatus::plan_digest(self : JobRunStatus) -> String {
 ///|
 pub fn JobRunStatus::phase(self : JobRunStatus) -> JobRunPhase {
   self.phase
+}
+
+///|
+pub fn JobRunStatus::is_paused(self : JobRunStatus) -> Bool {
+  self.paused
+}
+
+///|
+pub fn JobRunStatus::parallelism(self : JobRunStatus) -> Int {
+  self.parallelism
 }
 
 ///|
@@ -615,6 +724,7 @@ pub fn JobRunStatus::idempotent_sink_required(self : JobRunStatus) -> Bool {
 /// User-facing built-in outputs. The operator-specific payload types remain
 /// typed, but Task/transport types do not leak through this API.
 pub(all) enum Output {
+  WindowedSum(@task.WindowedSum)
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
@@ -624,6 +734,10 @@ pub(all) enum Output {
 ///|
 pub impl Compare for Output with fn compare(self, other) {
   match (self, other) {
+    (Output::WindowedSum(left), Output::WindowedSum(right)) =>
+      left.compare(right)
+    (Output::WindowedSum(_), _) => -1
+    (_, Output::WindowedSum(_)) => 1
     (Output::KeyedSum(left), Output::KeyedSum(right)) =>
       Compare::compare(left, right)
     (Output::Reachable(left), Output::Reachable(right)) =>
@@ -659,7 +773,7 @@ pub fn Output::security_alert(value : @security.SecurityAlert) -> Output {
 ///|
 pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
   match self {
-    Output::KeyedSum(_) | Output::Custom(_) => None
+    Output::WindowedSum(_) | Output::KeyedSum(_) | Output::Custom(_) => None
     Output::Reachable(value) => Some(value)
     Output::SecurityAlert(_) => None
   }
@@ -668,7 +782,7 @@ pub fn Output::as_reachable(self : Output) -> @reachability.Reachable? {
 ///|
 pub fn Output::as_security_alert(self : Output) -> @security.SecurityAlert? {
   match self {
-    Output::KeyedSum(_) | Output::Custom(_) => None
+    Output::WindowedSum(_) | Output::KeyedSum(_) | Output::Custom(_) => None
     Output::Reachable(_) => None
     Output::SecurityAlert(value) => Some(value)
   }
@@ -678,7 +792,10 @@ pub fn Output::as_security_alert(self : Output) -> @security.SecurityAlert? {
 pub fn Output::as_keyed_sum(self : Output) -> @aggregation.KeyedSum? {
   match self {
     Output::KeyedSum(value) => Some(value)
-    Output::Reachable(_) | Output::SecurityAlert(_) | Output::Custom(_) => None
+    Output::WindowedSum(_)
+    | Output::Reachable(_)
+    | Output::SecurityAlert(_)
+    | Output::Custom(_) => None
   }
 }
 

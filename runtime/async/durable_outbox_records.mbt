@@ -72,6 +72,8 @@ fn copy_durable_delta(delta : @protocol.DeltaBatch) -> @protocol.DeltaBatch {
       parents: event.parents().to_owned(),
       key: event.key(),
       payload: outbox_copy_json(event.payload()),
+      event_time: event.event_time(),
+      input_id: event.input_id(),
     }),
   }
 }

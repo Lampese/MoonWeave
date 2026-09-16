@@ -126,6 +126,8 @@ pub struct CoordinatorNodeConfig {
   migration_required : Bool
   auth_token : String?
   kafka_runtime : KafkaRuntimeConfig?
+  network_ha : @runtime.NetworkHaConfig?
+  migration_rpc : (async (NodeMigrationIntent, @runtime.WorkerMigration?) -> @runtime.WorkerMigration? raise ApiError)?
 }
 
 ///|
@@ -165,6 +167,8 @@ pub fn CoordinatorNodeConfig::new(
     migration_required: false,
     auth_token: None,
     kafka_runtime: None,
+    network_ha: None,
+    migration_rpc: None,
   }
 }
 
@@ -287,6 +291,25 @@ pub fn CoordinatorNodeConfig::with_kafka_runtime(
 }
 
 ///|
+/// Configure a network quorum for this Coordinator service. Each peer must
+/// use an independent storage directory; commands are accepted only by the
+/// elected majority leader.
+pub fn CoordinatorNodeConfig::with_network_ha(
+  self : CoordinatorNodeConfig,
+  config : @runtime.NetworkHaConfig,
+) -> CoordinatorNodeConfig {
+  { ..self, network_ha: Some(config), }
+}
+
+///|
+/// Return the optional network quorum configuration.
+pub fn CoordinatorNodeConfig::network_ha(
+  self : CoordinatorNodeConfig,
+) -> @runtime.NetworkHaConfig? {
+  self.network_ha
+}
+
+///|
 /// Configuration kept by one Worker process. `partition` is a static
 /// assignment hint for this first multi-machine runner; the Coordinator still
 /// fences it with the assignment epoch during the handshake.
@@ -294,6 +317,7 @@ pub struct WorkerNodeConfig {
   cluster_id : String
   coordinator_id : String
   coordinator : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   worker_id : String
   incarnation : String
   storage_dir : String
@@ -338,6 +362,7 @@ pub fn WorkerNodeConfig::new(
     cluster_id,
     coordinator_id,
     coordinator,
+    coordinator_endpoints: [coordinator],
     worker_id,
     incarnation,
     storage_dir,
@@ -422,6 +447,69 @@ pub fn WorkerNodeConfig::coordinator(self : WorkerNodeConfig) -> NodeEndpoint {
 }
 
 ///|
+/// Configure Coordinator endpoints used by a Worker when the current leader
+/// is unavailable. The first reachable endpoint is used for each retry.
+pub fn WorkerNodeConfig::with_coordinator_endpoints(
+  self : WorkerNodeConfig,
+  endpoints : ArrayView[NodeEndpoint],
+) -> WorkerNodeConfig raise ApiError {
+  if endpoints.is_empty() || endpoints.any(endpoint => endpoint.port() == 0) {
+    raise ApiError::InvalidEndpoint(
+      "Coordinator endpoint list is empty or invalid",
+    )
+  }
+  {
+    ..self,
+    coordinator: endpoints[0],
+    coordinator_endpoints: endpoints.to_owned(),
+  }
+}
+
+///|
+pub fn WorkerNodeConfig::coordinator_endpoints(
+  self : WorkerNodeConfig,
+) -> ArrayView[NodeEndpoint] {
+  self.coordinator_endpoints[:]
+}
+
+///|
+async fn connect_worker_coordinator(
+  config : WorkerNodeConfig,
+  start : Int,
+) -> @socket.Tcp raise ApiError {
+  connect_worker_endpoint_list(config.coordinator_endpoints[:], start)
+}
+
+///|
+async fn connect_worker_endpoint_list(
+  endpoints : ArrayView[NodeEndpoint],
+  start : Int,
+) -> @socket.Tcp raise ApiError {
+  let mut last_error = "no Coordinator endpoint"
+  for offset in 0..<endpoints.length() {
+    let index = (start + offset) % endpoints.length()
+    let endpoint = endpoints[index]
+    let connection = try
+      @async_runtime.with_timeout_opt(2000, () => {
+        @socket.Tcp::connect_to_host(endpoint.host(), port=endpoint.port())
+      })
+    catch {
+      error => {
+        last_error = @debug.to_string(error)
+        None
+      }
+    } noraise {
+      value => value
+    }
+    match connection {
+      Some(value) => return value
+      None => ()
+    }
+  }
+  raise ApiError::Cluster("connect Coordinator: " + last_error)
+}
+
+///|
 pub fn WorkerNodeConfig::worker_id(self : WorkerNodeConfig) -> String {
   self.worker_id
 }
@@ -501,6 +589,7 @@ pub struct WorkerNodeSetConfig {
   cluster_id : String
   coordinator_id : String
   coordinator : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   worker_id : String
   incarnation : String
   storage_dir : String
@@ -538,6 +627,7 @@ pub fn WorkerNodeSetConfig::new(
     cluster_id,
     coordinator_id,
     coordinator,
+    coordinator_endpoints: [coordinator],
     worker_id,
     incarnation,
     storage_dir,
@@ -546,6 +636,30 @@ pub fn WorkerNodeSetConfig::new(
     auth_token: None,
     kafka_runtime: None,
   }
+}
+
+///|
+pub fn WorkerNodeSetConfig::with_coordinator_endpoints(
+  self : WorkerNodeSetConfig,
+  endpoints : ArrayView[NodeEndpoint],
+) -> WorkerNodeSetConfig raise ApiError {
+  if endpoints.is_empty() || endpoints.any(endpoint => endpoint.port() == 0) {
+    raise ApiError::InvalidEndpoint(
+      "Coordinator endpoint list is empty or invalid",
+    )
+  }
+  {
+    ..self,
+    coordinator: endpoints[0],
+    coordinator_endpoints: endpoints.to_owned(),
+  }
+}
+
+///|
+pub fn WorkerNodeSetConfig::coordinator_endpoints(
+  self : WorkerNodeSetConfig,
+) -> ArrayView[NodeEndpoint] {
+  self.coordinator_endpoints[:]
 }
 
 ///|
@@ -890,9 +1004,9 @@ fn validate_coordinator_workers(
   expected.sort()
   let actual = config.workers.map(worker => worker.worker_id())
   actual.sort()
-  if expected != actual {
+  if expected.any(worker => !actual.contains(worker)) {
     raise ApiError::InvalidWorkerAssignment(
-      "Coordinator workers do not match the compiled Job workers",
+      "Coordinator is missing a compiled Job worker",
     )
   }
 }
@@ -1029,7 +1143,7 @@ fn failed_worker_partitions(
 /// reconciliation WAL protects the two control stores; this WAL protects the
 /// bundle/pointer side of the same operation so a Coordinator restart can
 /// resume it before accepting Worker sessions.
-priv struct NodeMigrationIntent {
+struct NodeMigrationIntent {
   version : Int
   phase : String
   transaction_id : String
@@ -1047,7 +1161,8 @@ priv struct NodeMigrationIntent {
   source_storage_dir : String
   target_storage_dir : String
   bundle_path : String
-} derive(ToJson, FromJson)
+  online : Bool?
+} derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 priv struct NodeMigrationIntentEntry {
@@ -1058,7 +1173,7 @@ priv struct NodeMigrationIntentEntry {
 } derive(ToJson, FromJson)
 
 ///|
-priv struct NodeMigrationLog {
+struct NodeMigrationLog {
   wal : @runtime.Wal
   pending : Map[String, NodeMigrationIntent]
 }
@@ -1280,11 +1395,13 @@ fn node_migration_intent(
 ) -> NodeMigrationIntent raise ApiError {
   let source_dir = match source.storage_dir() {
     Some(value) => value
+    None if config.migration_rpc is Some(_) => "worker-local"
     None =>
       raise ApiError::Cluster("Worker migration source storage is missing")
   }
   let target_dir = match target.storage_dir() {
     Some(value) => value
+    None if config.migration_rpc is Some(_) => "worker-local"
     None =>
       raise ApiError::Cluster("Worker migration target storage is missing")
   }
@@ -1315,6 +1432,7 @@ fn node_migration_intent(
     "/migration-p" +
     partition.to_string() +
     ".json",
+    online: None,
   }
 }
 
@@ -1337,7 +1455,8 @@ fn node_migration_matches(
   left.target_epoch == right.target_epoch &&
   left.source_storage_dir == right.source_storage_dir &&
   left.target_storage_dir == right.target_storage_dir &&
-  left.bundle_path == right.bundle_path
+  left.bundle_path == right.bundle_path &&
+  left.online == right.online
 }
 
 ///|
@@ -1366,6 +1485,14 @@ async fn resume_pending_node_migrations(
   if pending.is_empty() {
     return
   }
+  for intent in pending {
+    if intent.online == Some(true) {
+      resume_online_migration(
+        coordinator, job_store, job, config, assignments, log, intent,
+      )
+    }
+  }
+  let pending = pending.filter(intent => intent.online != Some(true))
   for intent in pending {
     guard node_migration_slot(config, intent.source_worker_id) is Some(source) &&
       node_migration_slot(config, intent.target_worker_id) is Some(target) else {
@@ -1640,14 +1767,14 @@ pub async fn CoordinatorListener::run(
   events : ArrayView[Event],
 ) -> CoordinatorNodeSummary raise ApiError {
   defer self.server.close()
-  if job.definition.source is SourceSpec::Kafka(_) {
+  if job.definition.source.has_kafka() {
     raise ApiError::Source(
       "run_coordinator_node does not support Kafka sources; use DriverCoordinator.run",
     )
   }
   validate_coordinator_workers(job, self.config)
   for event in events {
-    job.descriptor.validate_event(event)
+    job.validate_event(event)
   }
   let endpoint = self.endpoint()
   let storage_exists = @fs.exists(self.config.storage_dir) catch {
@@ -1874,7 +2001,10 @@ pub async fn CompiledJob::run_coordinator_node(
   config : CoordinatorNodeConfig,
   events : ArrayView[Event],
 ) -> CoordinatorNodeSummary raise ApiError {
-  if self.definition.source is SourceSpec::Kafka(_) {
+  if self.is_graph() {
+    raise ApiError::Cluster("graph jobs require CoordinatorService")
+  }
+  if self.definition.source.has_kafka() {
     raise ApiError::Source(
       "run_coordinator_node does not support Kafka sources; use DriverCoordinator.run",
     )
@@ -1891,6 +2021,7 @@ pub async fn CompiledJob::run_coordinator_node(
 priv enum WorkerOutputSink {
   Kafka(KafkaSink)
   JsonLines(@runtime.JsonLinesSink)
+  Graph(GraphOutputSink)
 }
 
 ///|
@@ -1899,6 +2030,7 @@ async fn WorkerOutputSink::write(
   record : @runtime.TaskOutputRecord,
 ) -> Unit raise ApiError {
   match self {
+    WorkerOutputSink::Graph(sink) => sink.write(record)
     WorkerOutputSink::Kafka(sink) => sink.write(record)
     WorkerOutputSink::JsonLines(sink) =>
       sink.write(record) catch {
@@ -1913,6 +2045,7 @@ fn WorkerOutputSink::consumer_id(
   job_id : String,
 ) -> String {
   match self {
+    WorkerOutputSink::Graph(_) => job_id + "-graph"
     WorkerOutputSink::Kafka(sink) => job_id + "-kafka-" + sink.topic()
     WorkerOutputSink::JsonLines(_) => job_id + "-json-lines"
   }
@@ -1924,7 +2057,11 @@ fn WorkerOutputSink::consumer_id(
 pub async fn CompiledJob::run_worker_node(
   self : CompiledJob,
   config : WorkerNodeConfig,
+  execution_lane? : @runtime.ExecutionLane,
 ) -> WorkerNodeSummary raise ApiError {
+  if self.is_graph() {
+    raise ApiError::Cluster("graph jobs require run_graph_worker")
+  }
   match self.definition.sink {
     SinkSpec::Kafka(spec) => {
       let sink_config = config.kafka_runtime
@@ -1946,6 +2083,7 @@ pub async fn CompiledJob::run_worker_node(
                 self.run_worker_node_with_sink(
                   config,
                   Some(WorkerOutputSink::Kafka(sink)),
+                  execution_lane?,
                 ),
               ) catch {
                 error => Err(error)
@@ -1973,10 +2111,11 @@ pub async fn CompiledJob::run_worker_node(
       self.run_worker_node_with_sink(
         config,
         Some(WorkerOutputSink::JsonLines(sink)),
+        execution_lane?,
       )
     }
     SinkSpec::Discard | SinkSpec::Durable(_) =>
-      self.run_worker_node_with_sink(config, None)
+      self.run_worker_node_with_sink(config, None, execution_lane?)
   }
 }
 
@@ -1985,6 +2124,7 @@ async fn CompiledJob::run_worker_node_with_sink(
   self : CompiledJob,
   config : WorkerNodeConfig,
   output_sink : WorkerOutputSink?,
+  execution_lane? : @runtime.ExecutionLane,
 ) -> WorkerNodeSummary raise ApiError {
   let partition = if config.partition < 0 {
     let owned : Array[Int] = []
@@ -2008,9 +2148,10 @@ async fn CompiledJob::run_worker_node_with_sink(
   if partition < 0 || partition >= self.spec.partition_count() {
     raise ApiError::InvalidWorkerAssignment(config.partition.to_string())
   }
-  if !self.definition.workers.any(worker => worker == config.worker_id) {
-    raise ApiError::InvalidWorkerAssignment(config.worker_id)
-  }
+  // The compiled definition names the initial ownership topology. A
+  // Coordinator may later move a partition to any registered Worker slot;
+  // the Coordinator handshake and lease epoch remain the authority for that
+  // target, so a replacement Worker need not be listed in the initial plan.
   let storage_exists = @fs.exists(config.storage_dir) catch {
     error =>
       raise ApiError::Cluster(
@@ -2040,15 +2181,7 @@ async fn CompiledJob::run_worker_node_with_sink(
   let output_log_path = paths.output_log_path()
   let mut migration_retries = 0
   for ;; {
-    let connection = @socket.Tcp::connect_to_host(
-      config.coordinator.host,
-      port=config.coordinator.port,
-    ) catch {
-      error =>
-        raise ApiError::Cluster(
-          "connect Coordinator: " + @debug.to_string(error),
-        )
-    }
+    let connection = connect_worker_coordinator(config, migration_retries)
     let task_id = @runtime.migrated_task_id(wal_path) catch {
       error =>
         raise ApiError::Cluster(
@@ -2056,7 +2189,7 @@ async fn CompiledJob::run_worker_node_with_sink(
         )
     }
     let task_id = task_id.unwrap_or(
-      self.definition.job_id + "/dynamic/" + config.worker_id,
+      self.definition.job_id + "/p" + partition.to_string() + "/e0",
     )
     let task = self.descriptor.create_task(
       task_id,
@@ -2064,6 +2197,8 @@ async fn CompiledJob::run_worker_node_with_sink(
       config.epoch,
       config.start_offset,
       self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
+      event_time_config?=self.definition.event_time_config,
+      graph_input?=self.definition.graph_input,
     )
     let outcome : Result[@runtime.WorkerRunSummary, @runtime.FrameIoError] = Ok(
       @runtime.run_worker_task(
@@ -2082,6 +2217,8 @@ async fn CompiledJob::run_worker_node_with_sink(
         storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=!config.assignment_known,
         auth_token?=config.auth_token,
+        job_id=self.job_id(),
+        execution_lane?,
         output_delivery?=match output_sink {
           Some(sink) => Some(record => sink.write(record))
           None => None
@@ -2120,8 +2257,21 @@ async fn CompiledJob::run_worker_node_with_sink(
           error => raise ApiError::Cluster(@debug.to_string(error))
         }
       }
-      Err(error) =>
-        raise ApiError::Cluster("run Worker task: " + @debug.to_string(error))
+      Err(error) => {
+        let reconnectable = match error {
+          @runtime.FrameIoError::Io(_) | @runtime.FrameIoError::Session(_) =>
+            true
+          _ => false
+        }
+        if reconnectable && migration_retries < 300 {
+          migration_retries += 1
+          @async_runtime.sleep(25) catch {
+            error => raise ApiError::Cluster(@debug.to_string(error))
+          }
+        } else {
+          raise ApiError::Cluster("run Worker task: " + @debug.to_string(error))
+        }
+      }
     }
   }
 }
@@ -2172,6 +2322,7 @@ pub async fn CompiledJob::capture_worker_migration(
         "capture Worker migration: " + @debug.to_string(error),
       )
   }
+  self.validate_migration_state(bundle)
   bundle.save(bundle_path) catch {
     error =>
       raise ApiError::Cluster(
@@ -2200,6 +2351,7 @@ pub async fn CompiledJob::install_worker_migration(
       )
   }
   let identity = bundle.identity()
+  self.validate_migration_state(bundle)
   if identity.job_id() != self.definition.job_id ||
     identity.cluster_id() != config.cluster_id ||
     identity.coordinator_id() != config.coordinator_id ||
@@ -2234,6 +2386,26 @@ pub async fn CompiledJob::install_worker_migration(
       raise ApiError::Cluster(
         "install Worker migration: " + @debug.to_string(error),
       )
+  }
+}
+
+///|
+fn CompiledJob::validate_migration_state(
+  self : CompiledJob,
+  bundle : @runtime.WorkerMigration,
+) -> Unit raise ApiError {
+  let snapshot = bundle.task_snapshot()
+  let task = self.descriptor.create_task(
+    snapshot.task_id(),
+    snapshot.partition(),
+    snapshot.epoch(),
+    bundle.identity().start_offset(),
+    self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
+    event_time_config?=self.definition.event_time_config,
+    graph_input?=self.definition.graph_input,
+  )
+  task.restore(snapshot) catch {
+    error => raise driver_error("validate migration operator state", error)
   }
 }
 
@@ -2309,6 +2481,9 @@ pub async fn CompiledJob::run_worker_node_set(
   self : CompiledJob,
   config : WorkerNodeSetConfig,
 ) -> WorkerNodeSetSummary raise ApiError {
+  if self.is_graph() {
+    raise ApiError::Cluster("graph jobs require run_graph_worker")
+  }
   match self.definition.sink {
     SinkSpec::Kafka(spec) => {
       let sink_config = config.kafka_runtime
@@ -2410,15 +2585,10 @@ async fn CompiledJob::run_worker_node_set_with_sink(
   }
   let works : Array[@runtime.WorkerTaskWork] = []
   for partition in partitions {
-    let connection = @socket.Tcp::connect_to_host(
-      config.coordinator.host(),
-      port=config.coordinator.port(),
-    ) catch {
-      error =>
-        raise ApiError::Cluster(
-          "connect Coordinator: " + @debug.to_string(error),
-        )
-    }
+    let connection = connect_worker_endpoint_list(
+      config.coordinator_endpoints[:],
+      0,
+    )
     let paths = worker_node_storage_paths(
       config.storage_dir,
       partition,
@@ -2439,6 +2609,8 @@ async fn CompiledJob::run_worker_node_set_with_sink(
       0,
       0L,
       self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
+      event_time_config?=self.definition.event_time_config,
+      graph_input?=self.definition.graph_input,
     )
     let output_log_path = paths.output_log_path()
     works.push(
@@ -2462,6 +2634,7 @@ async fn CompiledJob::run_worker_node_set_with_sink(
         storage_budget_bytes=config.storage_budget_bytes,
         dynamic_assignment=config.partitions is Some(_),
         auth_token?=config.auth_token,
+        job_id=self.job_id(),
         output_delivery?=match output_sink {
           Some(sink) => Some(record => sink.write(record))
           None => None

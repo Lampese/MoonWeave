@@ -9,4 +9,5 @@ pub(all) suberror CausalError {
   IdentityConflict(EventId)
   InvalidPendingLimit(Int)
   PendingLimitExceeded(limit~ : Int)
+  InvalidRetirement(String)
 } derive(Debug, Eq)

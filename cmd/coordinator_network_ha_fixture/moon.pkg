@@ -1,0 +1,12 @@
+import {
+  "moonweave/moonweave/runtime/async" @runtime,
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/core/string",
+}
+
+pkgtype(kind: "executable")
+
+supported_targets = "native"

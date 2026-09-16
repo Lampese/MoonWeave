@@ -11,6 +11,11 @@ pub struct LocalRun {
 /// across local Tasks and one-hop replication along declared exchange routes.
 /// This synchronous mode is in-memory; it does not provide a durable sink.
 pub fn CompiledJob::run_local(self : CompiledJob) -> LocalRun raise ApiError {
+  if self.is_graph() {
+    raise ApiError::Cluster(
+      "distributed graphs use CoordinatorService and run_graph_worker",
+    )
+  }
   match self.definition.sink {
     SinkSpec::Discard => ()
     SinkSpec::Durable(_) | SinkSpec::JsonLines(_) | SinkSpec::Kafka(_) =>
@@ -28,6 +33,8 @@ pub fn CompiledJob::run_local(self : CompiledJob) -> LocalRun raise ApiError {
       0,
       0L,
       self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
+      event_time_config?=self.definition.event_time_config,
+      graph_input?=self.definition.graph_input,
     )
     task_set.add(task) catch {
       error => raise ApiError::TaskFailed(@debug.to_string(error))
@@ -94,6 +101,7 @@ pub fn LocalRun::progresses(self : LocalRun) -> Array[LocalProgress] {
 ///|
 fn local_output(output : @task.TaskOutput) -> Output {
   match output {
+    @task.TaskOutput::WindowedSum(value) => Output::WindowedSum(value)
     @task.TaskOutput::KeyedSum(value) => Output::KeyedSum(value)
     @task.TaskOutput::Reachable(value) => Output::Reachable(value)
     @task.TaskOutput::SecurityAlert(value) => Output::SecurityAlert(value)
@@ -115,7 +123,7 @@ pub fn LocalRun::submit(
     return []
   }
   for event in events {
-    self.compiled.descriptor.validate_event(event)
+    self.compiled.validate_event(event)
   }
   let grouped : Map[Int, Array[Event]] = Map([])
   for event in events {
@@ -166,18 +174,32 @@ pub fn LocalRun::submit(
 }
 
 ///|
-/// Stop the local run after draining the causal pending set.
-pub fn LocalRun::close(self : LocalRun) -> Unit raise ApiError {
+/// Finish the input and return the final window/join results before stopping.
+pub fn LocalRun::drain(self : LocalRun) -> Array[Output] raise ApiError {
   if self.closed {
-    return
+    return []
   }
-  self.task_set.drain() catch {
+  let dispatches = self.task_set.drain_at(9223372036854775807L) catch {
     error => raise ApiError::TaskFailed(@debug.to_string(error))
   }
   self.task_set.stop() catch {
     error => raise ApiError::TaskFailed(@debug.to_string(error))
   }
   self.closed = true
+  let result : Array[Output] = []
+  for dispatch in dispatches {
+    for output in dispatch.outputs() {
+      result.push(local_output(output))
+    }
+  }
+  result
+}
+
+///|
+/// Close the local runner, discarding final outputs. Use `drain` to collect
+/// final event-time windows and join results.
+pub fn LocalRun::close(self : LocalRun) -> Unit raise ApiError {
+  ignore(self.drain())
 }
 
 ///|

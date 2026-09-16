@@ -40,6 +40,9 @@ pub(all) suberror ApiError {
   InvalidEvent(String)
   EmptyKey
   InvalidWindowSize(Int)
+  InvalidEventTimeWindow(size_ms~ : Int64, allowed_lateness_ms~ : Int64)
+  InvalidJoinWindow(before_ms~ : Int64, after_ms~ : Int64)
+  InvalidEventTimestamp(Int64)
   InvalidStateLimit(Int)
   InvalidEndpoint(String)
   InvalidPort(Int)
@@ -54,6 +57,8 @@ pub(all) suberror ApiError {
   TaskFailed(String)
   Source(String)
   Sink(String)
+  KafkaUnavailable(String)
+  WorkerMigrationUnavailable(String)
   Closed
   Cluster(String)
   Plan(@plan.PlanError)
@@ -112,12 +117,14 @@ pub struct CompiledJob {
   spec : @plan.JobSpec
   descriptor : OperatorDescriptor
   plan_digest : String
+  graph_stages : Array[(String, CompiledJob)]
 }
 pub async fn CompiledJob::capture_worker_migration(Self, WorkerNodeConfig, String, String, Int, String) -> Unit raise ApiError
 pub fn CompiledJob::connector_contract(Self) -> ConnectorContract
 pub fn CompiledJob::definition(Self) -> JobDefinition
 pub fn CompiledJob::delivery_guarantee(Self) -> DeliveryGuarantee
 pub async fn CompiledJob::install_worker_migration(Self, WorkerNodeConfig, String) -> Unit raise ApiError
+pub fn CompiledJob::is_graph(Self) -> Bool
 pub fn CompiledJob::job_id(Self) -> String
 pub fn CompiledJob::operator(Self) -> OperatorRef
 pub fn CompiledJob::operator_descriptor(Self) -> OperatorDescriptor
@@ -128,10 +135,12 @@ pub fn CompiledJob::plan_digest(Self) -> String
 pub async fn CompiledJob::recover_worker_migration(Self, WorkerNodeConfig, @moonweave/moonweave/runtime/async.CoordinatorStore, @moonweave/moonweave/runtime/async.JobStore, String, reconcile_path? : String) -> Unit raise ApiError
 pub fn CompiledJob::recovery_capability(Self) -> RecoveryCapability
 pub async fn CompiledJob::run_coordinator_node(Self, CoordinatorNodeConfig, ArrayView[Event]) -> CoordinatorNodeSummary raise ApiError
+pub async fn CompiledJob::run_graph_worker(Self, WorkerNodeConfig, NodeEndpoint) -> WorkerNodeSetSummary raise ApiError
 pub fn CompiledJob::run_local(Self) -> LocalRun raise ApiError
 pub async fn CompiledJob::run_local_cluster(Self, ClusterConfig, ArrayView[Event]) -> ClusterRunSummary raise ApiError
-pub async fn CompiledJob::run_worker_node(Self, WorkerNodeConfig) -> WorkerNodeSummary raise ApiError
+pub async fn CompiledJob::run_worker_node(Self, WorkerNodeConfig, execution_lane? : @moonweave/moonweave/runtime/async.ExecutionLane) -> WorkerNodeSummary raise ApiError
 pub async fn CompiledJob::run_worker_node_set(Self, WorkerNodeSetConfig) -> WorkerNodeSetSummary raise ApiError
+pub async fn CompiledJob::run_worker_service(Self, WorkerNodeConfig) -> WorkerNodeSetSummary raise ApiError
 pub fn CompiledJob::sink(Self) -> SinkSpec
 pub fn CompiledJob::state_schema(Self) -> String
 pub fn CompiledJob::submission(Self) -> ClusterSubmission
@@ -171,6 +180,8 @@ pub struct CoordinatorNodeConfig {
   migration_required : Bool
   auth_token : String?
   kafka_runtime : KafkaRuntimeConfig?
+  network_ha : @moonweave/moonweave/runtime/async.NetworkHaConfig?
+  migration_rpc : (async (NodeMigrationIntent, @moonweave/moonweave/runtime/async.WorkerMigration?) -> @moonweave/moonweave/runtime/async.WorkerMigration? raise ApiError)?
 }
 pub fn CoordinatorNodeConfig::advertised_endpoint(Self) -> NodeEndpoint?
 pub fn CoordinatorNodeConfig::auth_token(Self) -> String?
@@ -178,6 +189,7 @@ pub fn CoordinatorNodeConfig::bind(Self) -> NodeEndpoint
 pub fn CoordinatorNodeConfig::cluster_id(Self) -> String
 pub fn CoordinatorNodeConfig::coordinator_id(Self) -> String
 pub fn CoordinatorNodeConfig::migration_required(Self) -> Bool
+pub fn CoordinatorNodeConfig::network_ha(Self) -> @moonweave/moonweave/runtime/async.NetworkHaConfig?
 pub fn CoordinatorNodeConfig::new(String, String, NodeEndpoint, String, ArrayView[WorkerSlot]) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::storage_budget_bytes(Self) -> Int64
 pub fn CoordinatorNodeConfig::storage_dir(Self) -> String
@@ -185,6 +197,7 @@ pub fn CoordinatorNodeConfig::with_advertised_endpoint(Self, NodeEndpoint) -> Se
 pub fn CoordinatorNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn CoordinatorNodeConfig::with_migration_required(Self, required? : Bool) -> Self
+pub fn CoordinatorNodeConfig::with_network_ha(Self, @moonweave/moonweave/runtime/async.NetworkHaConfig) -> Self
 pub fn CoordinatorNodeConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 pub fn CoordinatorNodeConfig::workers(Self) -> ArrayView[WorkerSlot]
 
@@ -205,20 +218,56 @@ pub fn CoordinatorNodeSummary::plan_digest(Self) -> String
 pub fn CoordinatorNodeSummary::sent_batches(Self) -> Int
 pub fn CoordinatorNodeSummary::worker_count(Self) -> Int
 
+pub struct CoordinatorService {
+  data_listener : CoordinatorListener
+  control_listener : DriverControlListener
+  catalog : @moonweave/moonweave/runtime/async.Wal
+  registry : OperatorRegistry
+  maximum_events : Int
+  entries : Array[JobSubmission]
+  jobs : Map[String, String]
+  children : Map[String, DriverCoordinator]
+  graphs : Map[String, GraphExecution]
+  migrations : Map[(String, String), WorkerMigrationExchange]
+  network_ha : @moonweave/moonweave/runtime/async.NetworkHaNode?
+  mut authority_index : Int64
+  mut authority_term : Int64
+  mut authority_active : Bool
+  mut last_authority_sync : Int64
+  catalog_lock : @moonbitlang/async.Mutex
+  authority_lock : @moonbitlang/async.Mutex
+  mut running : Bool
+  mut closed : Bool
+  mut shutting_down : Bool
+}
+pub async fn CoordinatorService::bind(CoordinatorNodeConfig, DriverControlConfig, registry? : OperatorRegistry, maximum_events? : Int) -> Self raise ApiError
+pub fn CoordinatorService::close(Self) -> Unit
+pub fn CoordinatorService::control_endpoint(Self) -> NodeEndpoint raise ApiError
+pub fn CoordinatorService::data_endpoint(Self) -> NodeEndpoint raise ApiError
+pub fn CoordinatorService::job_count(Self) -> Int
+pub async fn CoordinatorService::run(Self) -> Unit raise ApiError
+pub async fn CoordinatorService::shutdown_gracefully(Self) -> Unit raise ApiError
+pub fn CoordinatorService::statuses(Self) -> Array[JobRunStatus] raise ApiError
+
 pub(all) enum DeliveryGuarantee {
   AtLeastOnce
 } derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn DeliveryGuarantee::at_least_once() -> Self
 
+type DriverAuthoritySnapshot derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub struct DriverClient {
   config : DriverConfig
   registry : OperatorRegistry
-  connection : @socket.Tcp
-  outbound : @protocol.FrameBuilder
-  session : @protocol.DriverClientSession
+  mut connection : @socket.Tcp
+  mut outbound : @protocol.FrameBuilder
+  mut session : @protocol.DriverClientSession
   mut closed : Bool
   operation_lock : @moonbitlang/async.Mutex
   mut submitted : JobSubmission?
+  mut pending_update : JobSubmission?
+  mut endpoint_index : Int
+  mut connected : Bool
 }
 pub async fn DriverClient::await_completion(Self, poll_interval_ms? : Int, timeout_ms? : Int) -> JobRunStatus raise ApiError
 pub async fn DriverClient::cancel(Self) -> JobRunStatus raise ApiError
@@ -227,25 +276,32 @@ pub async fn DriverClient::command(Self, JobCommand) -> JobRunStatus raise ApiEr
 pub async fn DriverClient::connect(DriverConfig, registry? : OperatorRegistry) -> Self raise ApiError
 pub async fn DriverClient::drain(Self) -> JobRunStatus raise ApiError
 pub async fn DriverClient::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
+pub async fn DriverClient::pause(Self) -> JobRunStatus raise ApiError
+pub async fn DriverClient::rescale(Self, ArrayView[String], parallelism? : Int) -> JobRunStatus raise ApiError
+pub async fn DriverClient::resume(Self) -> JobRunStatus raise ApiError
 pub async fn DriverClient::status(Self) -> JobRunStatus raise ApiError
 pub async fn DriverClient::submit(Self, JobSubmission) -> JobRunStatus raise ApiError
+pub async fn DriverClient::update(Self, JobSubmission) -> JobRunStatus raise ApiError
 
 pub(all) struct DriverConfig {
   cluster_id : String
   coordinator_id : String
   driver_id : String
   endpoint : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   incarnation : String
   auth_token : String?
 } derive(Eq)
 pub fn DriverConfig::auth_token(Self) -> String?
 pub fn DriverConfig::cluster_id(Self) -> String
+pub fn DriverConfig::coordinator_endpoints(Self) -> ArrayView[NodeEndpoint]
 pub fn DriverConfig::coordinator_id(Self) -> String
 pub fn DriverConfig::driver_id(Self) -> String
 pub fn DriverConfig::endpoint(Self) -> NodeEndpoint
 pub fn DriverConfig::incarnation(Self) -> String
 pub fn DriverConfig::new(String, String, String, NodeEndpoint) -> Self raise ApiError
 pub fn DriverConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn DriverConfig::with_coordinator_endpoints(Self, ArrayView[NodeEndpoint]) -> Self raise ApiError
 pub fn DriverConfig::with_incarnation(Self, String) -> Self raise ApiError
 
 pub(all) struct DriverControlConfig {
@@ -284,8 +340,11 @@ pub struct DriverCoordinator {
   mut execution : CoordinatorNodeSummary?
   mut live_execution : SourceBackedExecution?
   mut live_task : @moonbitlang/async.Task[Result[CoordinatorNodeSummary, String]]?
+  mut pending_authority : ExecutionAuthoritySnapshot?
+  mut confirm_authority : (async () -> Unit raise ApiError)?
   mut running : Bool
   mut closed : Bool
+  mut rebalancing : Bool
 }
 pub async fn DriverCoordinator::bind(CoordinatorNodeConfig, DriverControlConfig, DriverStore) -> Self raise ApiError
 pub fn DriverCoordinator::close(Self) -> Unit
@@ -312,54 +371,146 @@ pub struct DriverStore {
   mut phase : JobRunPhase
   mut accepted_events : Int64
   mut failure : String?
+  mut paused : Bool
+  mut rescale_workers : Array[String]?
+  mut rescale_resume : Bool
+  mut parallelism : Int
+  mut rescale_parallelism : Int?
+  mut graph_update : JobSubmission?
   inputs : Array[Event]
   mut event_index : Map[@causal.EventId, Event]
+  mut retired : Array[@causal.EventRange]
   maximum_events : Int
   write_lock : @moonbitlang/async.Mutex
 }
 pub fn DriverStore::accepted_events(Self) -> Int64
 pub async fn DriverStore::cancel(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::close(Self) -> Unit
-pub async fn DriverStore::compact(Self) -> Unit raise ApiError
+pub async fn DriverStore::compact(Self, retired? : Array[@causal.EventRange]) -> Unit raise ApiError
 pub async fn DriverStore::drain(Self) -> JobRunStatus raise ApiError
 pub async fn DriverStore::handle(Self, JobCommand) -> Result[JobRunStatus, String]
 pub async fn DriverStore::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
 pub fn DriverStore::inputs(Self) -> Array[Event] raise ApiError
+pub fn DriverStore::is_paused(Self) -> Bool
 pub async fn DriverStore::open(String, registry? : OperatorRegistry, maximum_bytes? : Int64, maximum_events? : Int) -> Self raise ApiError
 pub fn DriverStore::path(Self) -> String
+pub async fn DriverStore::pause(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::phase(Self) -> JobRunPhase
+pub async fn DriverStore::resume(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::stats(Self) -> @moonweave/moonweave/runtime/async.WalStats
 pub fn DriverStore::status(Self) -> JobRunStatus raise ApiError
 pub fn DriverStore::submission(Self) -> JobSubmission? raise ApiError
 pub async fn DriverStore::submit(Self, JobSubmission) -> JobRunStatus raise ApiError
+pub async fn DriverStore::update(Self, JobSubmission) -> JobRunStatus raise ApiError
 
 pub struct Event {
   record : @protocol.EventRecord
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Event::event_time(Self) -> Int64?
 pub fn Event::id(Self) -> @causal.EventId
+pub fn Event::input_id(Self) -> String
 pub fn Event::key(Self) -> String
 pub fn Event::keyed_sum(@causal.EventId, String, Int64) -> Self raise ApiError
 pub fn Event::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ApiError
 pub fn Event::parents(Self) -> ArrayView[@causal.EventId]
 pub fn Event::payload(Self) -> Json
+pub fn Event::with_event_time(Self, Int64, input_id? : String) -> Self raise ApiError
+
+pub struct EventTimeAggregateResult[U] {
+  output : Stream[U]
+  late_events : Int
+  final_watermark : Int64
+}
+pub fn[U] EventTimeAggregateResult::final_watermark(Self[U]) -> Int64
+pub fn[U] EventTimeAggregateResult::late_events(Self[U]) -> Int
+pub fn[U] EventTimeAggregateResult::output(Self[U]) -> Stream[U]
+
+pub(all) struct EventTimeWindow {
+  size_ms : Int64
+  allowed_lateness_ms : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn EventTimeWindow::allowed_lateness_ms(Self) -> Int64
+pub fn EventTimeWindow::size_ms(Self) -> Int64
+pub fn EventTimeWindow::tumbling(Int64, Int64) -> Self raise ApiError
+
+pub struct EventTimeWindowedKeyedStream[T] {
+  records : Array[(String, T)]
+  window : EventTimeWindow
+  timestamp : (T) -> Int64
+}
+pub fn[T, S, U] EventTimeWindowedKeyedStream::aggregate(Self[T], Aggregate[T, S, U]) -> Stream[U] raise ApiError
+pub fn[T, S, U] EventTimeWindowedKeyedStream::aggregate_with_metrics(Self[T], Aggregate[T, S, U]) -> EventTimeAggregateResult[U] raise ApiError
+
+type ExecutionAuthoritySnapshot derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct GraphDefinition {
+  stages : Array[GraphStage]
+  edges : Array[GraphEdge]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn GraphDefinition::new(ArrayView[GraphStage], ArrayView[GraphEdge]) -> Self
+
+pub(all) struct GraphEdge {
+  from : String
+  to : String
+  input_id : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn GraphEdge::new(String, String, input_id? : String) -> Self
+
+type GraphExecution
+
+type GraphOutputSink
+
+type GraphOutputTarget
+
+pub(all) struct GraphStage {
+  id : String
+  definition : JobDefinition
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn GraphStage::new(String, JobDefinition) -> Self raise ApiError
+
+pub(all) enum GraphTransform {
+  SetField(String, Json)
+  Multiply(String, Int64)
+  KeepEqual(String, Json)
+  KeyBy(String)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type GraphValue derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct IntervalJoinWindow {
+  before_ms : Int64
+  after_ms : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn IntervalJoinWindow::after_ms(Self) -> Int64
+pub fn IntervalJoinWindow::before_ms(Self) -> Int64
+pub fn IntervalJoinWindow::new(Int64, Int64) -> Self raise ApiError
 
 pub(all) enum JobCommand {
   Submit(JobSubmission)
   Input(Array[Event])
   Status
+  Pause
+  Resume
+  Rescale(RescaleRequest)
+  Update(JobSubmission)
   Drain
   Cancel
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobCommand::cancel() -> Self
 pub fn JobCommand::drain() -> Self
 pub fn JobCommand::input(ArrayView[Event]) -> Self
+pub fn JobCommand::pause() -> Self
+pub fn JobCommand::rescale(ArrayView[String], parallelism? : Int) -> Self
+pub fn JobCommand::resume() -> Self
 pub fn JobCommand::status() -> Self
 pub fn JobCommand::submit(JobSubmission) -> Self
+pub fn JobCommand::update(JobSubmission) -> Self
 
 pub struct JobDefinition {
   job_id : String
   operator : OperatorRef
   partition_count : Int
+  parallelism : Int?
   workers : Array[String]
   routes : Array[@plan.ExchangeRoute]
   source : SourceSpec
@@ -367,13 +518,22 @@ pub struct JobDefinition {
   sink : SinkSpec
   artifact : OperatorArtifact?
   max_state_events : Int?
+  event_time_config : @task.TaskEventTimeConfig?
+  watermark_idle_timeout_ms : Int64?
+  graph : GraphDefinition?
+  graph_input : @task.TaskGraphConfig?
+  transform : Array[GraphTransform]?
+  graph_watermarks : Array[String]?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobDefinition::artifact(Self) -> OperatorArtifact?
 pub fn JobDefinition::compile(Self, registry? : OperatorRegistry) -> CompiledJob raise ApiError
+pub fn JobDefinition::dataflow(String, GraphDefinition) -> Self raise ApiError
+pub fn JobDefinition::event_time_config(Self) -> @task.TaskEventTimeConfig?
 pub fn JobDefinition::job_id(Self) -> String
 pub fn JobDefinition::max_state_events(Self) -> Int?
 pub fn JobDefinition::new(String, OperatorRef) -> Self raise ApiError
 pub fn JobDefinition::operator(Self) -> OperatorRef
+pub fn JobDefinition::parallelism(Self) -> Int
 pub fn JobDefinition::partition_count(Self) -> Int
 pub fn JobDefinition::partitioning(Self) -> Partitioning
 pub fn JobDefinition::routes(Self) -> ArrayView[@plan.ExchangeRoute]
@@ -381,13 +541,17 @@ pub fn JobDefinition::run_local(Self, registry? : OperatorRegistry) -> LocalRun 
 pub async fn JobDefinition::run_local_cluster(Self, ClusterConfig, ArrayView[Event], registry? : OperatorRegistry) -> ClusterRunSummary raise ApiError
 pub fn JobDefinition::sink(Self) -> SinkSpec
 pub fn JobDefinition::source(Self) -> SourceSpec
+pub fn JobDefinition::transform(String, ArrayView[GraphTransform]) -> Self raise ApiError
 pub fn JobDefinition::with_artifact(Self, OperatorArtifact) -> Self
+pub fn JobDefinition::with_event_time(Self, @task.TaskEventTimeConfig) -> Self
+pub fn JobDefinition::with_parallelism(Self, Int) -> Self raise ApiError
 pub fn JobDefinition::with_partition_count(Self, Int) -> Self raise ApiError
 pub fn JobDefinition::with_partitioning(Self, Partitioning) -> Self
 pub fn JobDefinition::with_routes(Self, ArrayView[@plan.ExchangeRoute]) -> Self
 pub fn JobDefinition::with_sink(Self, SinkSpec) -> Self
 pub fn JobDefinition::with_source(Self, SourceSpec) -> Self
 pub fn JobDefinition::with_state_limit(Self, Int) -> Self raise ApiError
+pub fn JobDefinition::with_watermark_idle_timeout(Self, Int64) -> Self raise ApiError
 pub fn JobDefinition::with_workers(Self, ArrayView[String]) -> Self raise ApiError
 pub fn JobDefinition::workers(Self) -> ArrayView[String]
 
@@ -408,13 +572,17 @@ pub(all) struct JobRunStatus {
   accepted_events : Int64
   failure : String?
   idempotent_sink_required : Bool
+  paused : Bool
+  parallelism : Int
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn JobRunStatus::accepted_events(Self) -> Int64
 pub fn JobRunStatus::delivery_guarantee(Self) -> DeliveryGuarantee
 pub fn JobRunStatus::failure(Self) -> String?
 pub fn JobRunStatus::idempotent_sink_required(Self) -> Bool
+pub fn JobRunStatus::is_paused(Self) -> Bool
 pub fn JobRunStatus::job_id(Self) -> String
-pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?, idempotent_sink_required? : Bool) -> Self
+pub fn JobRunStatus::new(String, String, String, JobRunPhase, Int64, String?, idempotent_sink_required? : Bool, paused? : Bool, parallelism? : Int) -> Self
+pub fn JobRunStatus::parallelism(Self) -> Int
 pub fn JobRunStatus::phase(Self) -> JobRunPhase
 pub fn JobRunStatus::plan_digest(Self) -> String
 pub fn JobRunStatus::recovery_capability(Self) -> RecoveryCapability
@@ -611,7 +779,9 @@ pub struct KeyedStream[T] {
 }
 pub fn[T, S, U] KeyedStream::aggregate(Self[T], Aggregate[T, S, U]) -> Stream[U]
 pub fn[T] KeyedStream::records(Self[T]) -> ArrayView[(String, T)]
+pub fn[T] KeyedStream::tumbling_event_time(Self[T], Int64, Int64, (T) -> Int64) -> EventTimeWindowedKeyedStream[T] raise ApiError
 pub fn[T] KeyedStream::window(Self[T], Window) -> WindowedKeyedStream[T]
+pub fn[T] KeyedStream::window_event_time(Self[T], EventTimeWindow, (T) -> Int64) -> EventTimeWindowedKeyedStream[T]
 
 pub(all) struct KeyedSumEvent {
   event : Event
@@ -730,8 +900,10 @@ pub struct LocalRun {
   next_offsets : Map[Int, Int64]
   mut closed : Bool
 }
+pub fn LocalRun::advance_watermark(Self, Int64) -> Array[Output] raise ApiError
 pub fn LocalRun::cancel(Self) -> Unit
 pub fn LocalRun::close(Self) -> Unit raise ApiError
+pub fn LocalRun::drain(Self) -> Array[Output] raise ApiError
 pub fn LocalRun::job_id(Self) -> String
 pub fn LocalRun::phase(Self) -> LocalRunPhase
 pub fn LocalRun::plan_digest(Self) -> String
@@ -748,6 +920,20 @@ pub(all) enum LocalRunPhase {
   Mixed
 } derive(Compare, Eq, @debug.Debug)
 
+type MigrationAuthoritySnapshot derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct NamedSource {
+  input_id : String
+  source : SourceSpec
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NamedSource::new(String, SourceSpec) -> Self raise ApiError
+
+type NetworkJobSnapshot derive(ToJson, @json.FromJson)
+
+type NetworkServiceSnapshot derive(ToJson, @json.FromJson)
+
+type NetworkStageSnapshot derive(ToJson, @json.FromJson)
+
 pub(all) struct NodeEndpoint {
   host : String
   port : Int
@@ -756,6 +942,10 @@ pub fn NodeEndpoint::host(Self) -> String
 pub fn NodeEndpoint::new(String, Int) -> Self raise ApiError
 pub fn NodeEndpoint::port(Self) -> Int
 pub fn NodeEndpoint::to_string(Self) -> String
+
+type NodeMigrationIntent derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type NodeMigrationLog
 
 pub struct OperatorArtifact {
   reference : OperatorRef
@@ -829,6 +1019,7 @@ pub fn OperatorRegistry::resolve(Self, OperatorRef) -> OperatorDescriptor raise 
 pub fn OperatorRegistry::resolve_artifact(Self, OperatorArtifact) -> OperatorDescriptor raise ApiError
 
 pub(all) enum Output {
+  WindowedSum(@task.WindowedSum)
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
@@ -837,6 +1028,7 @@ pub(all) enum Output {
 pub fn Output::as_keyed_sum(Self) -> @aggregation.KeyedSum?
 pub fn Output::as_reachable(Self) -> @reachability.Reachable?
 pub fn Output::as_security_alert(Self) -> @security.SecurityAlert?
+pub fn Output::as_windowed_sum(Self) -> @task.WindowedSum?
 pub fn Output::keyed_sum(@aggregation.KeyedSum) -> Self
 pub fn Output::reachable(@reachability.Reachable) -> Self
 pub fn Output::security_alert(@security.SecurityAlert) -> Self
@@ -853,7 +1045,7 @@ pub(all) enum RecoveryCapability {
 pub fn RecoveryCapability::replayable() -> Self
 
 pub struct RemoteJobHandle {
-  submission : JobSubmission
+  mut submission : JobSubmission
   client : DriverClient
   mut last_status : JobRunStatus
 }
@@ -862,9 +1054,18 @@ pub async fn RemoteJobHandle::cancel(Self) -> JobRunStatus raise ApiError
 pub fn RemoteJobHandle::close(Self) -> Unit
 pub async fn RemoteJobHandle::drain(Self) -> JobRunStatus raise ApiError
 pub async fn RemoteJobHandle::input(Self, ArrayView[Event]) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::pause(Self) -> JobRunStatus raise ApiError
 pub async fn RemoteJobHandle::refresh(Self) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::rescale(Self, ArrayView[String], parallelism? : Int) -> JobRunStatus raise ApiError
+pub async fn RemoteJobHandle::resume(Self) -> JobRunStatus raise ApiError
 pub fn RemoteJobHandle::status(Self) -> JobRunStatus
 pub fn RemoteJobHandle::submission(Self) -> JobSubmission
+pub async fn RemoteJobHandle::update(Self, JobSubmission) -> JobRunStatus raise ApiError
+
+pub(all) struct RescaleRequest {
+  workers : Array[String]
+  parallelism : Int?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct RunHandle[T] {
   mut status : RunStatus
@@ -923,19 +1124,23 @@ pub struct SourceBackedExecution {
   job_store : @moonweave/moonweave/runtime/async.JobStore
   source : @moonweave/moonweave/runtime/async.SourceBackedJob
   output_manifest : @moonweave/moonweave/runtime/async.JobOutputManifest?
-  mut kafka_source : KafkaSource?
-  mut kafka_source_started : Bool
-  mut kafka_source_stopped : Bool
+  kafka_sources : Array[KafkaSource]
+  json_lines_sources : Array[JsonLinesSource]
+  mut active_source_pumps : Int
   mut kafka_stop_requested : Bool
   mut closed : Bool
+  mut confirm_authority : (async () -> Unit raise ApiError)?
+  mut active_migrations : NodeMigrationLog?
 }
 
 pub(all) enum SourceSpec {
   Events
   JsonLines(String)
   Kafka(KafkaSourceSpec)
+  Inputs(Array[NamedSource])
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn SourceSpec::events() -> Self
+pub fn SourceSpec::inputs(ArrayView[NamedSource]) -> Self raise ApiError
 pub fn SourceSpec::json_lines(String) -> Self raise ApiError
 pub fn SourceSpec::kafka(KafkaSourceSpec) -> Self
 pub fn SourceSpec::path(Self) -> String?
@@ -947,6 +1152,7 @@ pub struct Stream[T] {
 pub fn[T] Stream::collect(Self[T]) -> RunHandle[T]
 pub fn[T] Stream::discard(Self[T]) -> RunHandle[T]
 pub fn[T] Stream::filter(Self[T], (T) -> Bool) -> Self[T]
+pub fn[T, U, V] Stream::interval_join(Self[T], Self[U], (T) -> String, (U) -> String, (T) -> Int64, (U) -> Int64, IntervalJoinWindow, (T, U) -> V) -> Self[V] raise ApiError
 pub fn[T] Stream::key_by(Self[T], KeyBy[T]) -> KeyedStream[T] raise ApiError
 pub fn[T] Stream::key_by_fn(Self[T], (T) -> String) -> KeyedStream[T] raise ApiError
 pub fn[T, U] Stream::map(Self[T], (T) -> U) -> Self[U]
@@ -966,10 +1172,19 @@ pub struct WindowedKeyedStream[T] {
 }
 pub fn[T, S, U] WindowedKeyedStream::aggregate(Self[T], Aggregate[T, S, U]) -> Stream[U]
 
+type WorkerAllocation derive(ToJson, @json.FromJson)
+
+type WorkerMigrationExchange
+
+type WorkerMigrationReport derive(ToJson, @json.FromJson)
+
+type WorkerMigrationRequest derive(Eq, ToJson, @json.FromJson)
+
 pub struct WorkerNodeConfig {
   cluster_id : String
   coordinator_id : String
   coordinator : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   worker_id : String
   incarnation : String
   storage_dir : String
@@ -984,6 +1199,7 @@ pub struct WorkerNodeConfig {
 pub fn WorkerNodeConfig::auth_token(Self) -> String?
 pub fn WorkerNodeConfig::cluster_id(Self) -> String
 pub fn WorkerNodeConfig::coordinator(Self) -> NodeEndpoint
+pub fn WorkerNodeConfig::coordinator_endpoints(Self) -> ArrayView[NodeEndpoint]
 pub fn WorkerNodeConfig::coordinator_id(Self) -> String
 pub fn WorkerNodeConfig::epoch(Self) -> Int
 pub fn WorkerNodeConfig::incarnation(Self) -> String
@@ -996,6 +1212,7 @@ pub fn WorkerNodeConfig::storage_budget_bytes(Self) -> Int64
 pub fn WorkerNodeConfig::storage_dir(Self) -> String
 pub fn WorkerNodeConfig::with_assignment(Self, Int, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn WorkerNodeConfig::with_coordinator_endpoints(Self, ArrayView[NodeEndpoint]) -> Self raise ApiError
 pub fn WorkerNodeConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn WorkerNodeConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
 pub fn WorkerNodeConfig::worker_id(Self) -> String
@@ -1004,6 +1221,7 @@ pub struct WorkerNodeSetConfig {
   cluster_id : String
   coordinator_id : String
   coordinator : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   worker_id : String
   incarnation : String
   storage_dir : String
@@ -1015,6 +1233,7 @@ pub struct WorkerNodeSetConfig {
 pub fn WorkerNodeSetConfig::auth_token(Self) -> String?
 pub fn WorkerNodeSetConfig::cluster_id(Self) -> String
 pub fn WorkerNodeSetConfig::coordinator(Self) -> NodeEndpoint
+pub fn WorkerNodeSetConfig::coordinator_endpoints(Self) -> ArrayView[NodeEndpoint]
 pub fn WorkerNodeSetConfig::coordinator_id(Self) -> String
 pub fn WorkerNodeSetConfig::incarnation(Self) -> String
 pub fn WorkerNodeSetConfig::new(String, String, NodeEndpoint, String, String, String) -> Self raise ApiError
@@ -1022,6 +1241,7 @@ pub fn WorkerNodeSetConfig::partitions(Self) -> ArrayView[Int]
 pub fn WorkerNodeSetConfig::storage_budget_bytes(Self) -> Int64
 pub fn WorkerNodeSetConfig::storage_dir(Self) -> String
 pub fn WorkerNodeSetConfig::with_auth_token(Self, String) -> Self raise ApiError
+pub fn WorkerNodeSetConfig::with_coordinator_endpoints(Self, ArrayView[NodeEndpoint]) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::with_kafka_runtime(Self, KafkaRuntimeConfig) -> Self
 pub fn WorkerNodeSetConfig::with_partitions(Self, ArrayView[Int]) -> Self raise ApiError
 pub fn WorkerNodeSetConfig::with_storage_budget(Self, Int64) -> Self raise ApiError
@@ -1075,5 +1295,6 @@ pub fn WorkerSlot::with_storage_dir(Self, String) -> Self raise ApiError
 pub fn WorkerSlot::worker_id(Self) -> String
 
 // Type aliases
+pub using @task {type WindowedSum}
 
 // Traits

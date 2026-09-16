@@ -5,6 +5,7 @@
 /// accepted.
 enum LiveJobPhase {
   Open
+  Paused
   Draining
   Cancelled
 } derive(Eq)
@@ -26,8 +27,22 @@ fn LiveJobControl::phase(self : LiveJobControl) -> LiveJobPhase {
 
 ///|
 fn LiveJobControl::request_drain(self : LiveJobControl) -> Unit {
-  if self.phase == LiveJobPhase::Open {
+  if self.phase == LiveJobPhase::Open || self.phase == LiveJobPhase::Paused {
     self.phase = LiveJobPhase::Draining
+  }
+}
+
+///|
+fn LiveJobControl::request_pause(self : LiveJobControl) -> Unit {
+  if self.phase == LiveJobPhase::Open {
+    self.phase = LiveJobPhase::Paused
+  }
+}
+
+///|
+fn LiveJobControl::request_resume(self : LiveJobControl) -> Unit {
+  if self.phase == LiveJobPhase::Paused {
+    self.phase = LiveJobPhase::Open
   }
 }
 
@@ -47,15 +62,25 @@ fn LiveJobControl::is_draining(self : LiveJobControl) -> Bool {
 /// reconcile cursors without guessing which input was intended.
 pub struct SourceBackedJob {
   source : SourceLog
+  watermark_store : SourceWatermarkStore?
+  external_watermark_store : SourceWatermarkStore?
+  confirmed_watermarks : Map[Int, Int64]
   plan : @plan.JobSpec
   coordinator : CoordinatorStore
   job_store : JobStore
   required_capability : String?
   ingress_lock : @async.Mutex
+  ingress_gate : @async.Mutex
+  acknowledged_cuts : Map[Int, Array[Int64]]
+  mut retirement : @causal.CausalRetirement?
+  retirement_acks : Map[Int, String]
   lifecycle : LiveJobControl
   mut failed : Bool
   mut closed : Bool
   mut session_sequence : Int64
+  mut supervising : Bool
+  mut authority_barrier : (async () -> Unit raise FrameIoError)?
+  mut published_cut : (Array[Int64], Int64, Int64)?
 }
 
 ///|
@@ -66,6 +91,11 @@ pub async fn SourceBackedJob::open(
   job_store : JobStore,
   required_capability? : String,
   maximum_bytes? : Int64,
+  event_time_config? : @task.TaskEventTimeConfig,
+  watermark_idle_timeout_ms? : Int64 = 0L,
+  watermark_inputs? : Array[String],
+  external_watermarks? : Array[String],
+  authority? : LiveJobAuthoritySnapshot,
 ) -> SourceBackedJob raise FrameIoError {
   if !same_job_spec(plan, job_store.snapshot()) {
     raise FrameIoError::Handler("live source topology does not match JobStore")
@@ -73,18 +103,106 @@ pub async fn SourceBackedJob::open(
   let source = SourceLog::open(source_path, maximum_bytes?) catch {
     error => raise FrameIoError::SourceLog(error)
   }
-  {
+  let input_ids = match watermark_inputs {
+    Some(ids) => Some(ids)
+    None =>
+      event_time_config.map(config => {
+        if config.window_size_ms() > 0L {
+          ["main"]
+        } else {
+          ["left", "right"]
+        }
+      })
+  }
+  let watermark_store = match (input_ids, external_watermarks) {
+    (Some(input_ids), None) =>
+      Some(
+        SourceWatermarkStore::open(
+          source_path + ".watermark",
+          input_ids,
+          watermark_idle_timeout_ms,
+          maximum_bytes,
+        ),
+      ) catch {
+        error => {
+          source.close()
+          raise error
+        }
+      }
+    _ => None
+  }
+  let external_watermark_store = match external_watermarks {
+    None => None
+    Some(ids) =>
+      Some(
+        SourceWatermarkStore::open(
+          source_path + ".graph-watermark",
+          ids,
+          watermark_idle_timeout_ms,
+          maximum_bytes,
+        ),
+      )
+  }
+  let job : SourceBackedJob = {
     source,
+    watermark_store,
+    external_watermark_store,
+    confirmed_watermarks: Map([]),
     plan,
     coordinator,
     job_store,
     required_capability,
     ingress_lock: @async.Mutex::Mutex(),
+    ingress_gate: @async.Mutex::Mutex(),
+    acknowledged_cuts: Map([]),
+    retirement: None,
+    retirement_acks: Map([]),
     lifecycle: LiveJobControl::new(),
     failed: false,
     closed: false,
     session_sequence: 0L,
+    supervising: false,
+    authority_barrier: None,
+    published_cut: None,
   }
+  errdefer job.close()
+  if authority is Some(snapshot) {
+    job.restore_source_authority(snapshot)
+  }
+  job.finish_source_reclamation()
+  // Reconcile the source of truth after a crash window between SourceLog and
+  // the watermark WAL. The durable published frontier remains monotone while
+  // newly discovered source events restore per-input progress.
+  match job.watermark_store {
+    None => ()
+    Some(store) => {
+      let now = @async.now()
+      let candidate = store.progress.copy()
+      for location in job.source.locations.values() {
+        match location.event.event_time() {
+          None => ()
+          Some(timestamp) =>
+            if candidate.inputs.any(input => {
+                input.input_id == location.event.input_id() &&
+                (
+                  input.source_id is None ||
+                  input.source_id == Some(location.event.id().origin())
+                )
+              }) {
+              candidate.observe(
+                location.event.input_id(),
+                timestamp,
+                now,
+                source_id=location.event.id().origin(),
+              )
+            }
+        }
+      }
+      ignore(candidate.advance(now))
+      store.save(candidate)
+    }
+  }
+  job
 }
 
 ///|
@@ -92,6 +210,14 @@ pub fn SourceBackedJob::close(self : SourceBackedJob) -> Unit {
   self.closed = true
   self.lifecycle.cancel()
   self.source.close()
+  match self.watermark_store {
+    Some(store) => store.wal.close()
+    None => ()
+  }
+  match self.external_watermark_store {
+    Some(store) => store.wal.close()
+    None => ()
+  }
 }
 
 ///|
@@ -126,6 +252,38 @@ pub async fn SourceBackedJob::seal(
     raise FrameIoError::Handler("live Job cannot drain in its current phase")
   }
   self.lifecycle.request_drain()
+}
+
+///|
+/// Pause ingress while retaining all Worker sessions and durable state.
+pub async fn SourceBackedJob::pause(
+  self : SourceBackedJob,
+) -> Unit raise FrameIoError {
+  self.ingress_lock.acquire() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  defer self.ingress_lock.release()
+  self.check_open()
+  if self.job_store.phase() != @control.JobPhase::Running {
+    raise FrameIoError::Handler("live Job cannot pause in its current phase")
+  }
+  self.lifecycle.request_pause()
+}
+
+///|
+/// Resume a previously paused live source.
+pub async fn SourceBackedJob::resume(
+  self : SourceBackedJob,
+) -> Unit raise FrameIoError {
+  self.ingress_lock.acquire() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  defer self.ingress_lock.release()
+  self.check_open()
+  if self.job_store.phase() != @control.JobPhase::Running {
+    raise FrameIoError::Handler("live Job cannot resume in its current phase")
+  }
+  self.lifecycle.request_resume()
 }
 
 ///|
@@ -220,6 +378,14 @@ fn SourceBackedJob::source_work_unlocked(
     error => raise FrameIoError::SourceLog(error)
   }
   let deltas : Array[@protocol.DeltaBatch] = []
+  let planned : Map[@causal.EventId, @protocol.DeltaBatch] = Map([])
+  if self.job_store.work_plans.get(partition) is Some(previous) {
+    for delta in previous.deltas {
+      if delta.events().length() == 1 {
+        planned[delta.events()[0].id()] = delta
+      }
+    }
+  }
   // Source locations retain WAL insertion order, including interleaved origins.
   for location in self.source.locations.values() {
     let source_partition = location.partition
@@ -231,6 +397,15 @@ fn SourceBackedJob::source_work_unlocked(
     }
     let source_assignment = source_backed_assignment(control, source_partition)
     if location.offset >= source_assignment.start_offset() {
+      // A source lease move does not create a new logical exchange. Preserve
+      // the already published delta identity and source attempt; only the
+      // receiving lease is rebound when this target itself migrates.
+      if planned.get(location.event.id()) is Some(previous) &&
+        previous.source_partition() == source_partition &&
+        previous.events() == [location.event][:] {
+        deltas.push({ ..previous, target_epoch: assignment.epoch(), })
+        continue
+      }
       deltas.push(
         self.plan.delta(
           source_partition,
@@ -292,6 +467,8 @@ pub async fn SourceBackedJob::ingest(
   self : SourceBackedJob,
   event : @protocol.EventRecord,
 ) -> Int64 raise FrameIoError {
+  self.acquire_ingress([event])
+  defer self.ingress_gate.release()
   self.ingress_lock.acquire() catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
   }
@@ -300,6 +477,7 @@ pub async fn SourceBackedJob::ingest(
   if self.lifecycle.phase() != LiveJobPhase::Open {
     raise FrameIoError::Handler("live source is sealed")
   }
+  let watermark_candidate = self.prepare_watermark([event])
   errdefer {
     self.failed = true
   }
@@ -308,12 +486,16 @@ pub async fn SourceBackedJob::ingest(
   let assignment = source_backed_assignment(control, target.partition())
   let offset = self.source.append(
     assignment.partition(),
-    assignment.start_offset(),
+    self.input_floor(assignment.partition(), assignment.start_offset()),
     event,
   ) catch {
     error => raise FrameIoError::SourceLog(error)
   }
   self.refresh_work_plans_unlocked()
+  match (self.watermark_store, watermark_candidate) {
+    (Some(store), Some(candidate)) => store.save(candidate)
+    _ => ()
+  }
   offset
 }
 
@@ -324,6 +506,39 @@ pub async fn SourceBackedJob::ingest_all(
   self : SourceBackedJob,
   events : ArrayView[@protocol.EventRecord],
 ) -> Unit raise FrameIoError {
+  // Authority replay is allowed after a local execution has already sealed
+  // its source. Equal identities are durable evidence that the replay was
+  // already applied; only a genuinely new identity must be rejected.
+  if self.lifecycle.phase() != LiveJobPhase::Open {
+    for event in events {
+      if !self.source.contains(event.id()) &&
+        !self.source.retired.any(range => range.contains(event.id())) {
+        raise FrameIoError::Handler("live source is sealed")
+      }
+    }
+    return
+  }
+  if events.is_empty() {
+    self.ingest_chunk(events)
+    return
+  }
+  for start = 0; start < events.length(); start = start + 16 {
+    let end = if start + 16 < events.length() {
+      start + 16
+    } else {
+      events.length()
+    }
+    self.ingest_chunk(events[start:end])
+  }
+}
+
+///|
+async fn SourceBackedJob::ingest_chunk(
+  self : SourceBackedJob,
+  events : ArrayView[@protocol.EventRecord],
+) -> Unit raise FrameIoError {
+  self.acquire_ingress(events)
+  defer self.ingress_gate.release()
   self.ingress_lock.acquire() catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
   }
@@ -332,6 +547,7 @@ pub async fn SourceBackedJob::ingest_all(
   if self.lifecycle.phase() != LiveJobPhase::Open {
     raise FrameIoError::Handler("live source is sealed")
   }
+  let watermark_candidate = self.prepare_watermark(events)
   errdefer {
     self.failed = true
   }
@@ -342,7 +558,7 @@ pub async fn SourceBackedJob::ingest_all(
     ignore(
       self.source.append(
         assignment.partition(),
-        assignment.start_offset(),
+        self.input_floor(assignment.partition(), assignment.start_offset()),
         event,
       ) catch {
         error => raise FrameIoError::SourceLog(error)
@@ -350,6 +566,100 @@ pub async fn SourceBackedJob::ingest_all(
     )
   }
   self.refresh_work_plans_unlocked()
+  match (self.watermark_store, watermark_candidate) {
+    (Some(store), Some(candidate)) => store.save(candidate)
+    _ => ()
+  }
+}
+
+///|
+/// Equal source retries do not reactivate idle inputs. Validate new timestamps
+/// before admitting source data and install progress after its delivery plan.
+fn SourceBackedJob::prepare_watermark(
+  self : SourceBackedJob,
+  events : ArrayView[@protocol.EventRecord],
+) -> SourceWatermarks? raise FrameIoError {
+  match self.watermark_store {
+    None => None
+    Some(store) => {
+      let candidate = store.progress.copy()
+      let now = @async.now()
+      let mut changed = false
+      for event in events {
+        if self.source.locations.contains(event.id()) ||
+          self.source.retired.any(range => range.contains(event.id())) {
+          continue
+        }
+        guard event.event_time() is Some(timestamp) else {
+          raise FrameIoError::Handler("event-time input requires a timestamp")
+        }
+        candidate.observe(
+          event.input_id(),
+          timestamp,
+          now,
+          source_id=event.id().origin(),
+        )
+        changed = true
+      }
+      ignore(candidate.advance(now))
+      if changed || candidate.watermark != store.progress.watermark {
+        Some(candidate)
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+pub async fn SourceBackedJob::assign_source_partitions(
+  self : SourceBackedJob,
+  input_id : String,
+  source_ids : ArrayView[String],
+) -> Unit raise FrameIoError {
+  self.ingress_lock.acquire() catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
+  }
+  defer self.ingress_lock.release()
+  self.check_open()
+  match self.watermark_store {
+    None => ()
+    Some(store) => {
+      let candidate = store.progress.copy()
+      candidate.assign_partitions(input_id, source_ids, @async.now())
+      if candidate.snapshot() != store.progress.snapshot() {
+        store.save(candidate)
+      }
+    }
+  }
+}
+
+///|
+async fn SourceBackedJob::source_watermark_unlocked(
+  self : SourceBackedJob,
+) -> Int64 raise FrameIoError {
+  if self.external_watermark_store is Some(store) {
+    let candidate = store.progress.copy()
+    ignore(candidate.advance(@async.now()))
+    if candidate.watermark != store.progress.watermark {
+      store.save(candidate)
+    }
+    return candidate.watermark
+  }
+  match self.watermark_store {
+    None => -1L
+    Some(store) => {
+      let now = @async.now()
+      let candidate = store.progress.copy()
+      let before = candidate.watermark
+      ignore(candidate.advance(now))
+      if candidate.watermark != before ||
+        candidate.inputs != store.progress.inputs {
+        store.save(candidate)
+      }
+      candidate.watermark
+    }
+  }
 }
 
 ///|
@@ -357,6 +667,35 @@ async fn SourceBackedJob::work(
   self : SourceBackedJob,
   partition : Int,
 ) -> SupervisorWork raise FrameIoError {
+  self.work_cut(partition).work
+}
+
+///|
+/// Capture work and progress under one lock. A concurrent append must not
+/// publish a watermark ahead of the last event included in this work cut.
+async fn SourceBackedJob::work_cut(
+  self : SourceBackedJob,
+  partition : Int,
+) -> LiveWorkCut raise FrameIoError {
+  let cut = self.unconfirmed_work_cut(partition)
+  // Release ingress before replicating the service snapshot. The snapshot
+  // includes this cut (or a later one); no Worker sees unreplicated inputs or
+  // watermarks even when the originating Driver loses its connection.
+  let identity = (cut.source_offsets, cut.watermark, cut.generation)
+  if self.authority_barrier is Some(confirm) &&
+    self.published_cut != Some(identity) {
+    confirm()
+    self.published_cut = Some(identity)
+  }
+  self.check_open()
+  cut
+}
+
+///|
+async fn SourceBackedJob::unconfirmed_work_cut(
+  self : SourceBackedJob,
+  partition : Int,
+) -> LiveWorkCut raise FrameIoError {
   self.ingress_lock.acquire() catch {
     error => raise FrameIoError::Io(@debug.to_string(error))
   }
@@ -365,7 +704,7 @@ async fn SourceBackedJob::work(
   guard self.job_store.work_plans.get(partition) is Some(plan) else {
     raise FrameIoError::JobStore(JobStoreError::PlanMismatch(partition))
   }
-  SupervisorWork::new(
+  let work = SupervisorWork::new(
     plan.worker_id,
     "live",
     partition,
@@ -373,6 +712,13 @@ async fn SourceBackedJob::work(
     deltas=plan.deltas,
     required_capability?=plan.required_capability,
   )
+  {
+    work,
+    watermark: self.source_watermark_unlocked(),
+    retained_from: plan.retained_from.unwrap_or(plan.start_offset),
+    source_offsets: self.source_offsets(),
+    generation: self.job_store.journal_generation(),
+  }
 }
 
 ///|
@@ -499,6 +845,68 @@ async fn process_live_frame(
         error => raise FrameIoError::Message(error)
       }
       let previous = job_store_partition(live.job_store, assignment.partition())
+      // A Worker can reconnect with a durable progress offset that the new
+      // Coordinator has not yet journaled (for example after losing the old
+      // Coordinator's local disk). Rebuild the sent prefix from the durable
+      // work plan before applying the Resume progress, otherwise a valid
+      // offset is incorrectly rejected as "ahead of sent".
+      if resume_message.persisted_offset() >= previous.next_offset() {
+        let work = live.work(assignment.partition())
+        for batch in work.batches() {
+          if batch.end_offset() <= resume_message.persisted_offset() {
+            record_job_send(live.job_store, assignment, batch)
+          }
+        }
+      }
+      // The Coordinator cursor is a separate durable fact from JobStore's
+      // delivery plan. A failover can restore the latter while losing the
+      // former, so rebuild the sent prefix before recording the Worker resume.
+      // `record_batch_sent` is idempotent here by cursor: batches already
+      // covered by the Coordinator are skipped, while a missing contiguous
+      // prefix is journaled in order. This also handles a resume offset in the
+      // middle of a batch; the subsequent resume rewinds to the exact suffix.
+      let work = live.work(assignment.partition())
+      for batch in work.batches() {
+        if batch.end_offset() > resume_message.persisted_offset() {
+          break
+        }
+        let next_offset = match
+          live.coordinator.state().assignment(assignment.partition()) {
+          Some(current) => current.next_offset()
+          None =>
+            raise FrameIoError::CoordinatorStore(
+              CoordinatorStoreError::Coordinator(
+                @control.CoordinatorError::UnknownPartition(
+                  assignment.partition(),
+                ),
+              ),
+            )
+        }
+        if next_offset <= batch.first_offset() {
+          if next_offset != batch.first_offset() {
+            raise FrameIoError::CoordinatorStore(
+              CoordinatorStoreError::Coordinator(
+                @control.CoordinatorError::InvalidSendOffset(
+                  expected=next_offset,
+                  actual=batch.first_offset(),
+                ),
+              ),
+            )
+          }
+          ignore(
+            live.coordinator.record_batch_sent(
+              assignment.partition(),
+              assignment.worker_id(),
+              assignment.incarnation(),
+              assignment.epoch(),
+              batch.first_offset(),
+              batch.events().length().to_int64(),
+            ) catch {
+              error => raise FrameIoError::CoordinatorStore(error)
+            },
+          )
+        }
+      }
       record_job_progress(
         live.job_store,
         assignment,
@@ -532,6 +940,17 @@ async fn process_live_frame(
           acked_deltas + 1
         }
       }
+    }
+    @protocol.FrameKind::RetireAck => {
+      let ack = @protocol.RetireAck::from_payload(frame.payload()) catch {
+        error => raise FrameIoError::Message(error)
+      }
+      if live.retirement.map(certificate => certificate.checkpoint_id()) !=
+        Some(ack.checkpoint_id) {
+        raise FrameIoError::Handler("unexpected retirement acknowledgement")
+      }
+      live.retirement_acks[assignment.partition()] = ack.checkpoint_id
+      acked_deltas
     }
     @protocol.FrameKind::Heartbeat => {
       let heartbeat = @protocol.Heartbeat::from_payload(frame.payload()) catch {
@@ -580,6 +999,14 @@ async fn process_live_frame(
         progress.persisted_offset(),
         progress.applied_offset(),
       )
+      if progress.watermark is Some(value) {
+        let previous = live.confirmed_watermarks
+          .get(assignment.partition())
+          .unwrap_or(-1L)
+        if value > previous {
+          live.confirmed_watermarks[assignment.partition()] = value
+        }
+      }
       acked_deltas
     }
     _ =>
@@ -661,6 +1088,9 @@ async fn run_live_source_session_loop(
   let mut resumed = false
   let mut next_batch = 0
   let mut next_delta = 0
+  let mut sent_watermark = -1L
+  let mut work_generation = live.job_store.journal_generation()
+  let mut sent_retirement : String? = None
   for ;; {
     if lifecycle.phase() == LiveJobPhase::Cancelled {
       raise FrameIoError::Handler("live job cancelled")
@@ -705,7 +1135,17 @@ async fn run_live_source_session_loop(
       )
     }
     let draining = lifecycle.is_draining()
-    let work = live.work(assignment.partition())
+    let cut = live.work_cut(assignment.partition())
+    let work = cut.work
+    let watermark = cut.watermark
+    if cut.generation != work_generation {
+      work_generation = cut.generation
+      next_batch = 0
+      next_delta = 0
+      sent_delta_ids.clear()
+      acked_deltas = 0
+      sent_deltas = 0
+    }
     let mut send_cursor = current.next_offset()
     while next_batch < work.batches().length() {
       let batch = work.batches()[next_batch]
@@ -756,14 +1196,50 @@ async fn run_live_source_session_loop(
       next_delta += 1
     }
     let last_offset = match work.batches().last() {
-      None => assignment.start_offset() - 1L
+      None => cut.retained_from - 1L
       Some(batch) => batch.end_offset()
     }
-    if draining &&
-      send_cursor > last_offset &&
+    let caught_up = send_cursor > last_offset &&
       session.last_applied_offset() >= last_offset &&
       sent_delta_ids.length() == work.deltas().length() &&
-      acked_deltas == sent_deltas {
+      acked_deltas == sent_deltas
+    if caught_up {
+      live.acknowledged_cuts[assignment.partition()] = cut.source_offsets
+    }
+    if !draining &&
+      caught_up &&
+      live.retirement is Some(certificate) &&
+      sent_retirement != Some(certificate.checkpoint_id()) {
+      let request : @protocol.Retire = {
+        partition: assignment.partition(),
+        epoch: assignment.epoch(),
+        offset: last_offset,
+        certificate,
+      }
+      let frame = outbound.build(
+        @protocol.FrameKind::Retire,
+        request.to_payload(),
+      ) catch {
+        error => raise FrameIoError::Protocol(error)
+      }
+      write_frame(connection, frame, maximum_frame_bytes~)
+      sent_retirement = Some(certificate.checkpoint_id())
+    }
+    if !draining && caught_up && watermark > sent_watermark {
+      coordinator_send_watermark(
+        connection,
+        session,
+        outbound,
+        assignment.partition(),
+        assignment.epoch(),
+        watermark,
+        maximum_frame_bytes~,
+      )
+      sent_watermark = watermark
+    }
+    let retirement_complete = sent_retirement is None ||
+      live.retirement_acks.get(assignment.partition()) == sent_retirement
+    if draining && caught_up && retirement_complete {
       confirm_job_drain(
         connection,
         live.coordinator.state(),
@@ -994,9 +1470,21 @@ pub async fn run_live_source_supervisor(
     raise FrameIoError::JobStore(JobStoreError::AlreadyRunning)
   }
   defer live.job_store.supervisor_lock.release()
+  live.supervising = true
+  defer {
+    live.supervising = false
+  }
   let lifecycle = live.lifecycle
   live.refresh_work_plans()
   (@async.with_task_group <| group => {
+    group.spawn_bg(no_wait=true) <| () => {
+      while !live.closed && live.lifecycle.phase() != LiveJobPhase::Cancelled {
+        if live.lifecycle.phase() == LiveJobPhase::Open {
+          live.reclaim_running()
+        }
+        @async.sleep(5)
+      }
+    }
     let claimed : Set[String] = Set([])
     let claim_lock = @async.Mutex::Mutex()
     let accept_lock = @async.Mutex::Mutex()

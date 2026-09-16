@@ -476,6 +476,11 @@ pub struct KafkaSource {
 
 ///|
 fn kafka_source_error(stage : String, error : Error) -> ApiError {
+  if kafka_retryable(error) {
+    return ApiError::KafkaUnavailable(
+      "Kafka " + stage + ": " + @debug.to_string(error),
+    )
+  }
   let detail = match error {
     @moonkafka.ProtocolError::ProtocolError(message) => message
     _ => @debug.to_string(error)
@@ -682,7 +687,17 @@ fn kafka_record_to_event(
   ) catch {
     error => raise ApiError::Source(@debug.to_string(error))
   }
-  Event::new(id, input.parents(), input.key(), input.payload())
+  let record = @protocol.EventRecord::new(
+    id,
+    input.parents(),
+    input.key(),
+    input.payload(),
+    event_time?=input.event_time(),
+    input_id?=Some(input.input_id()),
+  ) catch {
+    error => raise ApiError::Source(@debug.to_string(error))
+  }
+  { record, }
 }
 
 ///|
@@ -883,7 +898,9 @@ pub async fn KafkaSource::commit_offsets(
   }
   for partition in pending {
     if !current.contains(partition) {
-      raise ApiError::Source("Kafka partition was revoked before commit")
+      raise ApiError::KafkaUnavailable(
+        "Kafka partition was revoked before commit",
+      )
     }
   }
   self.consumer.commit(offsets=next_offsets) catch {
@@ -989,6 +1006,11 @@ pub struct KafkaSink {
 
 ///|
 fn kafka_sink_error(stage : String, error : Error) -> ApiError {
+  if kafka_retryable(error) {
+    return ApiError::KafkaUnavailable(
+      "Kafka " + stage + ": " + @debug.to_string(error),
+    )
+  }
   let detail = match error {
     @moonkafka.ProtocolError::ProtocolError(message) => message
     _ => @debug.to_string(error)

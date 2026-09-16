@@ -1,0 +1,535 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+}
+
+///|
+struct Status {
+  phase : String
+  accepted_events : Int64
+} derive(FromJson)
+
+///|
+struct Sum {
+  key : String
+  total : Int64
+} derive(Eq, FromJson)
+
+///|
+enum Output {
+  KeyedSum(Sum)
+} derive(Eq, FromJson)
+
+///|
+struct Record {
+  task_id : String
+  sequence : Int64
+  output : Output
+} derive(FromJson)
+
+///|
+struct Checkpoint {
+  applied_offset : Int64
+} derive(FromJson)
+
+///|
+struct Plan {
+  retained_from : Int64?
+} derive(FromJson)
+
+///|
+struct JobCheckpoint {
+  work_plans : Array[Plan]
+} derive(FromJson)
+
+///|
+struct Remote {
+  binary : String
+  root : String
+  endpoint : String
+}
+
+///|
+fn input(sequence : Int64, value? : Int64 = 1L) -> Json {
+  {
+    "record": {
+      "id": { "origin": "crash-input", "sequence": sequence.to_string() },
+      "parents": [],
+      "key": "store",
+      "payload": { "value": value.to_string() },
+    },
+  }
+}
+
+///|
+async fn Remote::execute(
+  self : Remote,
+  command : String,
+  events? : Array[Json],
+) -> @shell.Output {
+  let args = [
+    "--endpoint",
+    self.endpoint,
+    "--cluster",
+    "crash-matrix",
+    "--coordinator",
+    "coordinator",
+    "--job-config",
+    self.root + "/job.json",
+    "--command",
+    command,
+    "--format",
+    "json",
+  ]
+  if events is Some(events) {
+    @fs.write_file(
+      self.root + "/events.json",
+      @json.to_json(events).stringify(),
+    )
+    args.push_iter(["--events", self.root + "/events.json"].iter())
+  }
+  if command == "rescale" {
+    args.push_iter(["--workers", "b", "--parallelism", "1"].iter())
+  }
+  @shell.Cmd(self.binary, args).output(timeout_ms=45000)
+}
+
+///|
+async fn Remote::command(
+  self : Remote,
+  command : String,
+  events? : Array[Json],
+) -> Status {
+  let output = self.execute(command, events?)
+  if output.exit_code() != 0 {
+    fail(command + ": " + output.stderr() + output.stdout())
+  }
+  @json.from_json(@json.parse(output.stdout()))
+}
+
+///|
+async fn wait_port(endpoint : String) -> Unit {
+  @async.with_timeout(15000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(10)
+      } noraise {
+        socket => {
+          socket.close()
+          return
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn stop(pid : Int) -> Unit {
+  if @process.run("/bin/kill", ["-KILL", pid.to_string()]) == 0 {
+    ignore(@async.with_timeout(10000, () => @process.wait_pid(pid)))
+  }
+}
+
+///|
+async fn launch(
+  binary : String,
+  args : Array[String],
+  log_path : String,
+  point : String,
+  gate : String,
+) -> Int {
+  let log = @process.redirect_to_file(log_path)
+  defer log.close()
+  @process.spawn_orphan(
+    binary,
+    args,
+    extra_env={ "MOONWEAVE_CRASH_POINT": point, "MOONWEAVE_CRASH_GATE": gate },
+    stdout=log,
+    stderr=log,
+  )
+}
+
+///|
+async fn output_values(path : String) -> Array[Int64] {
+  if !@fs.exists(path) {
+    return []
+  }
+  let owner = @fs.open(
+    path + ".lock",
+    mode=@fs.ReadWrite,
+    create_mode=@fs.OpenOrCreate,
+  )
+  defer owner.close()
+  owner.lock(@fs.Shared)
+  defer owner.unlock()
+  let seen : Map[(String, Int64), Output] = Map([])
+  let totals = []
+  for line in @fs.read_file(path).text().split("\n") {
+    if line.trim().is_empty() {
+      continue
+    }
+    let record : Record = @json.from_json(@json.parse(line))
+    let id = (record.task_id, record.sequence)
+    if seen.get(id) is Some(previous) {
+      assert_true(previous == record.output)
+    } else {
+      seen[id] = record.output
+      let KeyedSum(sum) = record.output
+      assert_eq(sum.key, "store")
+      totals.push(sum.total)
+    }
+  }
+  totals
+}
+
+///|
+async fn wait_outputs(root : String, count : Int) -> Unit {
+  @async.with_timeout(20000, () => {
+    for ;; {
+      if output_values(root + "/output.jsonl").length() >= count {
+        return
+      }
+      @async.sleep(5)
+    }
+  })
+}
+
+///|
+async fn wait_primed(root : String, count : Int, migration : Bool) -> Unit {
+  wait_outputs(root, count)
+  @async.with_timeout(20000, () => {
+    for ;; {
+      let path = root + "/worker-a/worker-p0.json"
+      if @fs.exists(path) {
+        let saved : Checkpoint = @json.from_json(
+          @json.parse(@fs.read_file(path).text()),
+        )
+        if saved.applied_offset >= (count - 1).to_int64() {
+          break
+        }
+      }
+      @async.sleep(5)
+    }
+    if migration {
+      for ;; {
+        let path = root + "/coordinator/jobs/job-0/job.json"
+        if @fs.exists(path) {
+          let saved : JobCheckpoint = @json.from_json(
+            @json.parse(@fs.read_file(path).text()),
+          )
+          if saved.work_plans.length() == 1 &&
+            saved.work_plans[0].retained_from.unwrap_or(0L) >= count.to_int64() {
+            break
+          }
+        }
+        @async.sleep(5)
+      }
+    }
+  })
+}
+
+///|
+async fn run_case(
+  parent : String,
+  point : String,
+  coordinator_binary : String,
+  worker_binary : String,
+  driver_binary : String,
+) -> Json {
+  let root = parent + "/" + point
+  let gate = root + "/gate"
+  @fs.mkdir(gate, recursive=true)
+  let lock = @fs.open(
+    gate + "/gate.lock",
+    mode=@fs.ReadWrite,
+    create_mode=@fs.OpenOrCreate,
+  )
+  defer lock.close()
+  lock.lock(@fs.Exclusive)
+  let data_socket = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let control_socket = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let data = "127.0.0.1:" + data_socket.addr.port().to_string()
+  let control = "127.0.0.1:" + control_socket.addr.port().to_string()
+  data_socket.close()
+  control_socket.close()
+  let definition : Json = {
+    "job_id": "crash-job",
+    "operator": { "id": "keyed-sum", "version": 1 },
+    "partition_count": 1,
+    "workers": ["a"],
+    "routes": [],
+    "source": "Events",
+    "partitioning": "ByKey",
+    "sink": ["JsonLines", root + "/output.jsonl"],
+    "max_state_events": 128,
+  }
+  @fs.write_file(root + "/definition.json", definition.stringify())
+  let compiled = @shell.Cmd(driver_binary, [
+    "--command",
+    "compile",
+    "--job-config",
+    root + "/definition.json",
+    "--submission-id",
+    "crash-submit",
+  ]).output()
+  if compiled.exit_code() != 0 {
+    fail(compiled.stderr())
+  }
+  @fs.write_file(root + "/job.json", compiled.stdout())
+  let coordinator_args = [
+    "--cluster",
+    "crash-matrix",
+    "--coordinator",
+    "coordinator",
+    "--bind",
+    data,
+    "--advertise",
+    data,
+    "--driver-bind",
+    control,
+    "--driver-advertise",
+    control,
+    "--storage",
+    root + "/coordinator",
+    "--workers",
+    "a@boot-a,b@boot-b",
+    "--storage-budget-bytes",
+    "65536",
+  ]
+  let worker_args = (id : String) => {
+    [
+      "--cluster",
+      "crash-matrix",
+      "--coordinator",
+      "coordinator",
+      "--coordinator-endpoint",
+      data,
+      "--worker",
+      id,
+      "--incarnation",
+      "boot-" + id,
+      "--managed",
+      "true",
+      "--storage",
+      root + "/worker-" + id,
+      "--job-config",
+      root + "/job.json",
+      "--storage-budget-bytes",
+      "65536",
+    ]
+  }
+  let worker_fault = point.has_prefix("worker.")
+  let migration = point.has_prefix("migration.")
+  let running : Set[Int] = Set([])
+  defer (@async.protect_from_cancel(() => {
+    for pid in running {
+      stop(pid)
+    }
+  }) catch {
+    _ => ()
+  })
+  let mut coordinator = launch(
+    coordinator_binary,
+    coordinator_args,
+    root + "/coordinator-0.log",
+    if worker_fault {
+      ""
+    } else {
+      point
+    },
+    gate,
+  )
+  running.add(coordinator)
+  wait_port(control)
+  let remote = Remote::{ binary: driver_binary, root, endpoint: control, }
+  ignore(remote.command("submit"))
+  let mut worker = launch(
+    worker_binary,
+    worker_args("a"),
+    root + "/worker-a-0.log",
+    if worker_fault {
+      point
+    } else {
+      ""
+    },
+    gate,
+  )
+  running.add(worker)
+  if migration {
+    running.add(
+      launch(
+        worker_binary,
+        worker_args("b"),
+        root + "/worker-b-0.log",
+        "",
+        gate,
+      ),
+    )
+  }
+  let initial = if migration { 16 } else { 1 }
+  assert_eq(
+    remote.command(
+      "input",
+      events=Array::makei(initial, i => input(i.to_int64())),
+    ).accepted_events,
+    initial.to_int64(),
+  )
+  wait_primed(root, initial, migration)
+  @fs.write_file(gate + "/armed", point, sync=@fs.Full)
+  let pending_events = Array::makei(16, i => input(i.to_int64() + 1L))
+  let mut acknowledged_before_crash = initial.to_int64()
+  let reached = @async.with_task_group <| group => {
+    let request = group.spawn() <| () => {
+      if migration {
+        remote.execute("rescale")
+      } else {
+        remote.execute("input", events=pending_events)
+      }
+    }
+    let marker = @async.with_timeout(20000, () => {
+      for ;; {
+        if @fs.exists(gate + "/reached.json") {
+          return @json.parse(@fs.read_file(gate + "/reached.json").text())
+        }
+        @async.sleep(5)
+      }
+    })
+    if request.try_wait() is Some(output) &&
+      output.exit_code() == 0 &&
+      !migration {
+      let status : Status = @json.from_json(@json.parse(output.stdout()))
+      acknowledged_before_crash = status.accepted_events
+    }
+    let victim = if worker_fault { worker } else { coordinator }
+    stop(victim)
+    running.remove(victim)
+    @fs.remove(gate + "/armed")
+    lock.unlock()
+    @fs.mkdir(root + "/at-crash")
+    let state_dir = root +
+      (if worker_fault { "/worker-a" } else { "/coordinator" })
+    @shell.Cmd("cp", ["-a", state_dir, root + "/at-crash/"]).run()
+    if worker_fault {
+      worker = launch(
+        worker_binary,
+        worker_args("a"),
+        root + "/worker-a-1.log",
+        "",
+        gate,
+      )
+      running.add(worker)
+    } else {
+      coordinator = launch(
+        coordinator_binary,
+        coordinator_args,
+        root + "/coordinator-1.log",
+        "",
+        gate,
+      )
+      running.add(coordinator)
+      wait_port(control)
+    }
+    let output = request.wait()
+    @fs.write_file(
+      root + "/interrupted-command.json",
+      (
+        {
+          "exit_code": output.exit_code(),
+          "stdout": output.stdout(),
+          "stderr": output.stderr(),
+        } : Json).stringify(),
+    )
+    marker
+  }
+  if migration {
+    assert_eq(remote.command("rescale").phase, "Running")
+  }
+  let accepted = if migration { 16L } else { 17L }
+  if !migration {
+    assert_eq(
+      remote.command("input", events=pending_events).accepted_events,
+      accepted,
+    )
+  }
+  assert_eq(remote.command("status").accepted_events, accepted)
+  assert_eq(
+    remote.command("input", events=[input(0L), input(accepted, value=2L)]).accepted_events,
+    accepted + 1L,
+  )
+  assert_eq(remote.command("drain").phase, "Succeeded")
+  let expected = Array::makei(accepted.to_int(), i => i.to_int64() + 1L)
+  expected.push(accepted + 2L)
+  assert_eq(output_values(root + "/output.jsonl"), expected)
+  let result : Json = {
+    "point": point,
+    "reached": reached,
+    "victim": if worker_fault {
+      "worker"
+    } else {
+      "coordinator"
+    },
+    "signal": "SIGKILL",
+    "acknowledged_before_crash": acknowledged_before_crash.to_string(),
+    "accepted_after_retry": (accepted + 1L).to_string(),
+    "confirmed_input_loss": 0,
+    "output_mismatch": 0,
+    "old_input_retry": true,
+    "new_input_after_recovery": true,
+    "passed": true,
+  }
+  @fs.write_file(root + "/result.json", result.stringify(), sync=@fs.Full)
+  println("PASS: " + point)
+  result
+}
+
+///|
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-crash-matrix-")
+  println("Crash boundary evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+    "--warn-list", "-a",
+  ]).run(timeout_ms=180000)
+  let base = "_build/native/debug/build/moonweave/moonweave/cmd/"
+  let coordinator = @fs.realpath(base + "coordinator/coordinator.exe")
+  let worker = @fs.realpath(base + "worker/worker.exe")
+  let driver = @fs.realpath(base + "driver/driver.exe")
+  let points = [
+    "driver.input.persisted", "worker.input.persisted", "worker.output.written",
+    "worker.output.acked", "worker.checkpoint.saved", "worker.reclaim.prepared",
+    "worker.reclaim.installed", "worker.reclaim.delta_removed", "coordinator.checkpoint.staged",
+    "coordinator.checkpoint.published", "job.checkpoint.staged", "job.checkpoint.published",
+    "job.checkpoint.rotated", "coordinator.source.reclaimed", "driver.history.reclaimed",
+    "migration.captured", "migration.moved", "migration.installed", "migration.committed",
+  ]
+  let args = @env.args()
+  let results : Array[Json] = []
+  for point in points {
+    if args.length() > 1 && !args[1:].contains(point) {
+      continue
+    }
+    results.push(run_case(root, point, coordinator, worker, driver))
+    @fs.write_file(
+      root + "/progress.json",
+      @json.to_json(results).stringify(),
+      sync=@fs.Full,
+    )
+  }
+  assert_true(!results.is_empty())
+  @fs.write_file(
+    root + "/result.json",
+    (
+      {
+        "passed": true,
+        "boundaries": results.length(),
+        "cases": @json.to_json(results),
+      } : Json).stringify(),
+    sync=@fs.Full,
+  )
+}

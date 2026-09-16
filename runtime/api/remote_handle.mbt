@@ -3,7 +3,7 @@
 /// transport adapter; callers interact with the same lifecycle vocabulary as
 /// LocalJobHandle.
 pub struct RemoteJobHandle {
-  submission : JobSubmission
+  mut submission : JobSubmission
   client : DriverClient
   mut last_status : JobRunStatus
 }
@@ -43,6 +43,42 @@ pub async fn RemoteJobHandle::input(
   events : ArrayView[Event],
 ) -> JobRunStatus raise ApiError {
   self.last_status = self.client.input(events)
+  self.last_status
+}
+
+///|
+pub async fn RemoteJobHandle::pause(
+  self : RemoteJobHandle,
+) -> JobRunStatus raise ApiError {
+  self.last_status = self.client.pause()
+  self.last_status
+}
+
+///|
+pub async fn RemoteJobHandle::resume(
+  self : RemoteJobHandle,
+) -> JobRunStatus raise ApiError {
+  self.last_status = self.client.resume()
+  self.last_status
+}
+
+///|
+pub async fn RemoteJobHandle::update(
+  self : RemoteJobHandle,
+  submission : JobSubmission,
+) -> JobRunStatus raise ApiError {
+  self.last_status = self.client.update(submission)
+  self.submission = submission
+  self.last_status
+}
+
+///|
+pub async fn RemoteJobHandle::rescale(
+  self : RemoteJobHandle,
+  workers : ArrayView[String],
+  parallelism? : Int,
+) -> JobRunStatus raise ApiError {
+  self.last_status = self.client.rescale(workers, parallelism?)
   self.last_status
 }
 

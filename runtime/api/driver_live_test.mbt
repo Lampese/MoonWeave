@@ -106,6 +106,84 @@ async test "remote inputs compute before drain and retries do not add totals twi
 }
 
 ///|
+async test "paused compatible update resumes the same state and persists across restart" {
+  let root = @fs.tmpdir(prefix="moonweave-driver-update")
+  defer @fs.rmdir(root, recursive=true)
+  @async_runtime.with_timeout(15000, () => {
+    let old_job = JobDefinition::new("live-update", OperatorRef::keyed_sum())
+      .with_workers(["worker"])
+      .with_state_limit(64)
+      .with_sink(SinkSpec::durable("totals"))
+      .compile()
+    let new_job = JobDefinition::new("live-update", OperatorRef::keyed_sum())
+      .with_workers(["worker"])
+      .with_state_limit(128)
+      .with_sink(SinkSpec::durable("totals"))
+      .compile()
+    let submission = old_job.submission_with_id("live-update-submit")
+    let updated = new_job.submission_with_id("live-update-submit")
+    let coordinator = bind_live_driver(root, old_job.job_id())
+    @async_runtime.with_task_group <| group => {
+      let runner = group.spawn() <| () => { coordinator.run() }
+      let worker = group.spawn() <| () => {
+        old_job.run_worker_node(
+          WorkerNodeConfig::new_auto(
+            old_job.job_id(),
+            "coordinator",
+            coordinator.data_endpoint(),
+            "worker",
+            "boot-worker",
+            root + "/worker",
+          ),
+        )
+      }
+      let client = submission.run_remote(
+        DriverConfig::new(
+          old_job.job_id(),
+          "coordinator",
+          "update-driver",
+          coordinator.control_endpoint(),
+        ),
+      )
+      defer client.close()
+      let first = Event::keyed_sum(
+        @causal.EventId::new("update-orders", 0L),
+        "store",
+        4L,
+      )
+      let second = Event::keyed_sum(
+        @causal.EventId::new("update-orders", 1L),
+        "store",
+        6L,
+      )
+      assert_eq(client.input([first]).accepted_events(), 1L)
+      ignore(wait_live_checkpoint(root + "/worker/worker-p0.json", 0L))
+      assert_true(client.pause().is_paused())
+      let changed = client.update(updated)
+      assert_true(changed.is_paused())
+      assert_eq(changed.accepted_events(), 1L)
+      assert_eq(changed.plan_digest(), new_job.plan_digest())
+      assert_false(client.resume().is_paused())
+      assert_eq(client.input([second]).accepted_events(), 2L)
+      assert_eq(client.drain().phase(), JobRunPhase::Succeeded)
+      assert_true(runner.wait().status().phase() == JobRunPhase::Succeeded)
+      ignore(worker.wait())
+      let output = @runtime.TaskOutputLog::open(root + "/worker/output-p0.wal")
+      defer output.close()
+      assert_eq(output.records().length(), 2)
+      assert_eq(output.records().map(record => record.output()), [
+        @task.TaskOutput::KeyedSum({ key: "store", total: 4L, }),
+        @task.TaskOutput::KeyedSum({ key: "store", total: 10L, }),
+      ])
+    }
+    let restored = DriverStore::open(root + "/driver.wal")
+    defer restored.close()
+    assert_eq(restored.status().phase(), JobRunPhase::Succeeded)
+    assert_eq(restored.status().plan_digest(), new_job.plan_digest())
+  })
+}
+
+///|
 async test "remote JSONL sink reports retention proof before source compaction" {
   let root = @fs.tmpdir(prefix="moonweave-driver-live-jsonl")
   defer @fs.rmdir(root, recursive=true)
@@ -160,7 +238,7 @@ async test "remote JSONL sink reports retention proof before source compaction" 
       source.close()
       let output = @runtime.TaskOutputLog::open(root + "/worker/output-p0.wal")
       assert_eq(output.records().length(), 0)
-      assert_eq(output.retained_from("live-jsonl/dynamic/worker"), 1L)
+      assert_eq(output.retained_from("live-jsonl/p0/e0"), 1L)
       output.close()
       assert_eq(runner.wait().status().phase(), JobRunPhase::Succeeded)
       assert_eq(worker.wait().live_batches(), 1)

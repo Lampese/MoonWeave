@@ -8,6 +8,7 @@ import {
 }
 
 // Values
+pub fn key_partition(String, Int) -> Int
 
 // Errors
 pub(all) suberror PlanError {
@@ -35,15 +36,17 @@ pub(all) struct JobSpec {
   job_id : String
   operator_id : String
   partition_count : Int
+  parallelism : Int
   workers : ReadOnlyArray[String]
   routes : ReadOnlyArray[ExchangeRoute]
 } derive(Eq, @debug.Debug)
 pub fn JobSpec::delta(Self, Int, Int, Int, Int, ArrayView[@protocol.EventRecord]) -> @protocol.DeltaBatch raise PlanError
 pub fn JobSpec::exchange_targets(Self, Int) -> Array[RouteTarget] raise PlanError
 pub fn JobSpec::job_id(Self) -> String
-pub fn JobSpec::new(String, String, Int, ArrayView[String], ArrayView[ExchangeRoute]) -> Self raise PlanError
+pub fn JobSpec::new(String, String, Int, ArrayView[String], ArrayView[ExchangeRoute], parallelism? : Int) -> Self raise PlanError
 pub fn JobSpec::operator_id(Self) -> String
 pub fn JobSpec::owner(Self, Int) -> String raise PlanError
+pub fn JobSpec::parallelism(Self) -> Int
 pub fn JobSpec::partition_count(Self) -> Int
 pub fn JobSpec::partition_for_key(Self, String) -> Int
 pub fn JobSpec::plan_partitions(Self, start_offset? : Int64) -> Array[PartitionPlan] raise PlanError

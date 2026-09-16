@@ -115,6 +115,7 @@ struct OutputRetentionMarker {
   retain_from : Int64
   output_count : Int64
   output_digest : String
+  continuing : Bool?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -131,6 +132,7 @@ struct OutputRetentionMetadata {
   retain_from : Int64
   output_count : Int64
   output_digest : String
+  continuing : Bool
 } derive(Debug, Eq)
 
 ///|
@@ -201,6 +203,7 @@ fn output_retention_marker(metadata : OutputRetentionMetadata) -> Bytes {
       retain_from: metadata.retain_from,
       output_count: metadata.output_count,
       output_digest: metadata.output_digest,
+      continuing: Some(metadata.continuing),
     }).stringify(),
   )
 }
@@ -266,6 +269,7 @@ fn retention_metadata_from_barrier(
     retain_from: barrier.retain_from,
     output_count: barrier.output_count,
     output_digest: barrier.output_digest,
+    continuing: false,
   })
 }
 
@@ -288,6 +292,7 @@ fn output_retention_marker_from_json(
     retain_from: marker.retain_from,
     output_count: marker.output_count,
     output_digest: marker.output_digest,
+    continuing: marker.continuing.unwrap_or(false),
   })
   if marker.version != 1 {
     raise OutputLogError::UnsupportedVersion(marker.version)
@@ -301,6 +306,7 @@ fn output_retention_marker_from_json(
     retain_from: metadata.retain_from,
     output_count: metadata.output_count,
     output_digest: metadata.output_digest,
+    continuing: Some(metadata.continuing),
   })
 }
 
@@ -335,6 +341,7 @@ pub async fn TaskOutputLog::open(
           retain_from: marker.retain_from,
           output_count: marker.output_count,
           output_digest: marker.output_digest,
+          continuing: marker.continuing.unwrap_or(false),
         }
         match identities.get(marker.task_id) {
           Some(previous) if previous.partition != marker.partition ||
@@ -399,7 +406,8 @@ pub async fn TaskOutputLog::open(
   }
   for metadata in retention.values() {
     let next = next_sequences.get(metadata.task_id).unwrap_or(0L)
-    if next != metadata.output_count {
+    if next < metadata.output_count ||
+      (!metadata.continuing && next != metadata.output_count) {
       raise OutputLogError::SequenceGap(
         expected=next,
         actual=metadata.output_count,
@@ -525,7 +533,13 @@ pub fn TaskOutputLog::output_digest(
   task_id : String,
 ) -> String {
   match self.retention.get(task_id) {
-    Some(metadata) => metadata.output_digest
+    Some(metadata) =>
+      manifest_extend_output_digest(
+        metadata.output_digest,
+        self
+        .records_for(task_id)
+        .filter(record => record.sequence >= metadata.output_count),
+      )
     None => manifest_records_digest(self.records_for(task_id))
   }
 }
@@ -564,8 +578,12 @@ pub fn TaskOutputLog::records_after(
 pub async fn TaskOutputLog::compact(
   self : TaskOutputLog,
   barrier : TaskOutputRetentionBarrier,
+  continuing? : Bool = false,
 ) -> Unit raise OutputLogError {
-  let metadata = retention_metadata_from_barrier(barrier)
+  let metadata = { ..retention_metadata_from_barrier(barrier), continuing, }
+  if continuing && metadata.retain_from != metadata.output_count {
+    raise OutputLogError::RetentionConflict(metadata.task_id)
+  }
   self.write_lock.acquire() catch {
     error => raise OutputLogError::Io(@debug.to_string(error))
   }
@@ -582,8 +600,12 @@ pub async fn TaskOutputLog::compact(
     raise OutputLogError::RetentionConflict(metadata.task_id)
   }
   match self.retention.get(metadata.task_id) {
-    Some(previous) if previous != metadata =>
-      raise OutputLogError::RetentionConflict(metadata.task_id)
+    Some(previous) if previous != metadata &&
+      (
+        !previous.continuing ||
+        previous.retain_from > metadata.retain_from ||
+        previous.output_count > metadata.output_count
+      ) => raise OutputLogError::RetentionConflict(metadata.task_id)
     _ => ()
   }
   let retained_records = self.records.filter(record => {
@@ -659,7 +681,10 @@ pub async fn TaskOutputLog::append(
   self.wal.check_writable() catch {
     error => raise OutputLogError::Wal(error)
   }
-  if self.retention.contains(task_id) {
+  if self.retention
+    .get(task_id)
+    .map(metadata => !metadata.continuing)
+    .unwrap_or(false) {
     raise OutputLogError::RetentionConflict(task_id)
   }
   self.check_identity(task_id, partition, epoch)

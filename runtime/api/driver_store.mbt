@@ -9,6 +9,15 @@ struct DriverJournalEntry {
   events : Array[Event]
   accepted_events : Int64
   reason : String
+  retired : Array[@causal.EventRange]?
+  paused : Bool?
+  update_submission : JobSubmission?
+  rescale_workers : Array[String]?
+  rescale_resume : Bool?
+  parallelism : Int?
+  rescale_parallelism : Int?
+  graph_update : JobSubmission?
+  authority : DriverAuthoritySnapshot?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -26,8 +35,15 @@ pub struct DriverStore {
   mut phase : JobRunPhase
   mut accepted_events : Int64
   mut failure : String?
+  mut paused : Bool
+  mut rescale_workers : Array[String]?
+  mut rescale_resume : Bool
+  mut parallelism : Int
+  mut rescale_parallelism : Int?
+  mut graph_update : JobSubmission?
   inputs : Array[Event]
   mut event_index : Map[@causal.EventId, Event]
+  mut retired : Array[@causal.EventRange]
   maximum_events : Int
   write_lock : @async_runtime.Mutex
 }
@@ -41,6 +57,15 @@ fn driver_entry(kind : String) -> DriverJournalEntry {
     events: [],
     accepted_events: -1L,
     reason: "",
+    retired: None,
+    paused: None,
+    update_submission: None,
+    rescale_workers: None,
+    rescale_resume: None,
+    parallelism: None,
+    rescale_parallelism: None,
+    graph_update: None,
+    authority: None,
   }
 }
 
@@ -87,6 +112,7 @@ fn DriverStore::install_submission(
     None => {
       self.submission = Some(submission)
       self.compiled = Some(compiled)
+      self.parallelism = compiled.initial_parallelism()
     }
     Some(previous) if driver_submission_equal(previous, submission) => ()
     Some(_) => raise ApiError::RequestConflict(submission.submission_id())
@@ -129,10 +155,21 @@ fn DriverStore::validate_input(
       actual=self.phase,
     )
   }
+  if self.paused {
+    raise ApiError::InvalidDriverCommand("Job is paused")
+  }
   let accepted : Array[Event] = []
   let pending_events : Map[@causal.EventId, Event] = Map([])
   for event in events {
-    compiled.operator_descriptor().validate_event(event)
+    if !compiled.definition.source.accepts_driver_input(event.input_id()) {
+      raise ApiError::InvalidDriverCommand(
+        "Driver input must target a declared Events source",
+      )
+    }
+    compiled.validate_event(event)
+    if self.retired.any(range => range.contains(event.id())) {
+      continue
+    }
     match self.event_index.get(event.id()) {
       Some(previous) if previous != event =>
         raise ApiError::RequestConflict(event.id().origin())
@@ -191,7 +228,97 @@ fn DriverStore::install_entry(
       self.install_submission(submission)
       self.phase = JobRunPhase::Running
     }
+    "update" => {
+      guard entry.update_submission is Some(submission) else {
+        raise ApiError::Cluster("malformed Driver update entry")
+      }
+      if self.phase != JobRunPhase::Running || !self.paused {
+        raise ApiError::InvalidDriverCommand(
+          "Job update requires a paused Running job",
+        )
+      }
+      let compiled = submission.job().compile(registry=self.registry)
+      guard self.submission is Some(previous) &&
+        previous.submission_id() == submission.submission_id() else {
+        raise ApiError::RequestConflict(submission.submission_id())
+      }
+      self.submission = Some(submission)
+      self.compiled = Some(compiled)
+    }
+    "graph_update" => {
+      guard entry.graph_update is Some(candidate) &&
+        self.phase == Running &&
+        self.paused else {
+        raise ApiError::Cluster("invalid graph update intent")
+      }
+      ignore(self.validate_update(candidate))
+      self.graph_update = Some(candidate)
+    }
+    "graph_updated" => self.graph_update = None
     "input" => self.install_input(entry.events[:])
+    "pause" => {
+      if self.phase != JobRunPhase::Running {
+        raise ApiError::InvalidJobPhase(
+          expected=JobRunPhase::Running,
+          actual=self.phase,
+        )
+      }
+      self.paused = true
+    }
+    "resume" => {
+      if self.phase != JobRunPhase::Running {
+        raise ApiError::InvalidJobPhase(
+          expected=JobRunPhase::Running,
+          actual=self.phase,
+        )
+      }
+      self.paused = false
+    }
+    "rescale" => {
+      guard entry.rescale_workers is Some(workers) &&
+        !workers.is_empty() &&
+        self.phase == JobRunPhase::Running else {
+        raise ApiError::Cluster("invalid rescale intent")
+      }
+      self.rescale_workers = Some(workers)
+      self.rescale_resume = entry.rescale_resume.unwrap_or(true)
+      self.rescale_parallelism = entry.rescale_parallelism
+      self.paused = true
+    }
+    "rescaled" => {
+      if self.rescale_workers is None {
+        raise ApiError::Cluster("rescale completion without intent")
+      }
+      self.rescale_workers = None
+      self.parallelism = self.rescale_parallelism.unwrap_or(self.parallelism)
+      self.rescale_parallelism = None
+      self.paused = !self.rescale_resume
+    }
+    "parallelism" => {
+      guard entry.parallelism is Some(value) &&
+        value > 0 &&
+        self.compiled is Some(job) &&
+        value <= job.maximum_parallelism() else {
+        raise ApiError::Cluster("invalid execution parallelism")
+      }
+      self.parallelism = value
+    }
+    "checkpoint" => {
+      if self.phase != JobRunPhase::Running ||
+        !self.inputs.is_empty() ||
+        entry.accepted_events < 0L {
+        raise ApiError::Cluster("invalid Driver checkpoint")
+      }
+      self.retired = @causal.CausalRetirement::new(
+          "driver",
+          entry.retired.unwrap_or([]),
+        )
+        .ranges()
+        .to_owned() catch {
+          error => raise driver_error("restore Driver retirement", error)
+        }
+      self.accepted_events = entry.accepted_events
+    }
     "drain" => {
       if self.phase != JobRunPhase::Running {
         raise ApiError::InvalidJobPhase(
@@ -241,6 +368,12 @@ fn DriverStore::install_entry(
       self.accepted_events = entry.accepted_events
       self.phase = JobRunPhase::Succeeded
     }
+    "authority_snapshot" => {
+      guard entry.authority is Some(snapshot) else {
+        raise ApiError::Cluster("missing Driver authority")
+      }
+      self.install_authority_snapshot(snapshot)
+    }
     _ => raise ApiError::Cluster("unknown Driver journal command")
   }
 }
@@ -271,8 +404,15 @@ pub async fn DriverStore::open(
     phase: JobRunPhase::Created,
     accepted_events: 0L,
     failure: None,
+    paused: false,
+    rescale_workers: None,
+    rescale_resume: true,
+    parallelism: 1,
+    rescale_parallelism: None,
+    graph_update: None,
     inputs: [],
     event_index: Map([]),
+    retired: [],
     maximum_events,
     write_lock: @async_runtime.Mutex::Mutex(),
   }
@@ -333,6 +473,11 @@ pub fn DriverStore::accepted_events(self : DriverStore) -> Int64 {
 }
 
 ///|
+pub fn DriverStore::is_paused(self : DriverStore) -> Bool {
+  self.paused
+}
+
+///|
 pub fn DriverStore::inputs(self : DriverStore) -> Array[Event] raise ApiError {
   driver_owned(self.inputs)
 }
@@ -351,6 +496,8 @@ pub fn DriverStore::status(self : DriverStore) -> JobRunStatus raise ApiError {
     self.accepted_events,
     self.failure,
     idempotent_sink_required=compiled.sink().requires_idempotent_consumer(),
+    paused=self.paused,
+    parallelism=self.parallelism,
   )
 }
 
@@ -389,7 +536,62 @@ pub async fn DriverStore::submit(
   )
   self.submission = Some(submission)
   self.compiled = Some(compiled)
+  self.parallelism = compiled.initial_parallelism()
   self.phase = JobRunPhase::Running
+  self.status()
+}
+
+///|
+/// Validate an update without changing durable state. The Coordinator calls
+/// this before stopping the current live execution so a rejected topology or
+/// state-schema change leaves the paused execution recoverable.
+fn DriverStore::validate_update(
+  self : DriverStore,
+  submission : JobSubmission,
+) -> CompiledJob raise ApiError {
+  self.check_open()
+  guard self.submission is Some(previous) && self.compiled is Some(old_job) else {
+    raise ApiError::UnknownSubmission("update before submit")
+  }
+  if self.phase != JobRunPhase::Running || !self.paused {
+    raise ApiError::InvalidDriverCommand(
+      "Job update requires a paused Running job",
+    )
+  }
+  if submission.submission_id() != previous.submission_id() {
+    raise ApiError::RequestConflict(submission.submission_id())
+  }
+  let new_job = submission.job().compile(registry=self.registry)
+  old_job.validate_compatible_update(new_job)
+  new_job
+}
+
+///|
+/// Persist a compatible update. The Coordinator pauses and recreates the live
+/// execution around this operation; this store owns the durable intent.
+pub async fn DriverStore::update(
+  self : DriverStore,
+  submission : JobSubmission,
+) -> JobRunStatus raise ApiError {
+  self.write_lock.acquire() catch {
+    error => raise driver_error("lock Driver update", error)
+  }
+  defer self.write_lock.release()
+  let new_job = self.validate_update(submission)
+  let entry = DriverJournalEntry::{
+    ..driver_entry("update"),
+    update_submission: Some(driver_owned(submission)),
+  }
+  ignore(
+    self.journal.append(driver_entry_line(entry)) catch {
+      error => raise driver_error("persist Driver update", error)
+    },
+  )
+  guard entry.update_submission is Some(updated) else {
+    raise ApiError::Cluster("missing Driver update")
+  }
+  self.submission = Some(updated)
+  self.compiled = Some(new_job)
   self.status()
 }
 
@@ -442,6 +644,68 @@ pub async fn DriverStore::drain(
     },
   )
   self.phase = JobRunPhase::Draining
+  self.status()
+}
+
+///|
+/// Persist a pause intent. It is idempotent and replayable.
+pub async fn DriverStore::pause(
+  self : DriverStore,
+) -> JobRunStatus raise ApiError {
+  self.write_lock.acquire() catch {
+    error => raise driver_error("lock Driver pause", error)
+  }
+  defer self.write_lock.release()
+  self.check_open()
+  if self.phase != JobRunPhase::Running {
+    raise ApiError::InvalidJobPhase(
+      expected=JobRunPhase::Running,
+      actual=self.phase,
+    )
+  }
+  if !self.paused {
+    let entry = DriverJournalEntry::{
+      ..driver_entry("pause"),
+      paused: Some(true),
+    }
+    ignore(
+      self.journal.append(driver_entry_line(entry)) catch {
+        error => raise driver_error("persist Driver pause", error)
+      },
+    )
+    self.paused = true
+  }
+  self.status()
+}
+
+///|
+/// Persist a resume intent. It is idempotent and replayable.
+pub async fn DriverStore::resume(
+  self : DriverStore,
+) -> JobRunStatus raise ApiError {
+  self.write_lock.acquire() catch {
+    error => raise driver_error("lock Driver resume", error)
+  }
+  defer self.write_lock.release()
+  self.check_open()
+  if self.phase != JobRunPhase::Running {
+    raise ApiError::InvalidJobPhase(
+      expected=JobRunPhase::Running,
+      actual=self.phase,
+    )
+  }
+  if self.paused {
+    let entry = DriverJournalEntry::{
+      ..driver_entry("resume"),
+      paused: Some(false),
+    }
+    ignore(
+      self.journal.append(driver_entry_line(entry)) catch {
+        error => raise driver_error("persist Driver resume", error)
+      },
+    )
+    self.paused = false
+  }
   self.status()
 }
 
@@ -544,7 +808,10 @@ async fn DriverStore::fail(
 /// Compact the Driver intent WAL without changing its logical recovery state.
 /// The retained command sequence is sufficient to reconstruct submission,
 /// input identity, and the current terminal phase after a process restart.
-pub async fn DriverStore::compact(self : DriverStore) -> Unit raise ApiError {
+pub async fn DriverStore::compact(
+  self : DriverStore,
+  retired? : Array[@causal.EventRange],
+) -> Unit raise ApiError {
   self.write_lock.acquire() catch {
     error => raise driver_error("lock Driver store", error)
   }
@@ -558,21 +825,93 @@ pub async fn DriverStore::compact(self : DriverStore) -> Unit raise ApiError {
       submission: Some(submission),
     }),
   )
+  if self.compiled
+    .map(job => self.parallelism != job.initial_parallelism())
+    .unwrap_or(false) {
+    entries.push(
+      driver_entry_line({
+        ..driver_entry("parallelism"),
+        parallelism: Some(self.parallelism),
+      }),
+    )
+  }
   // A terminal Driver no longer needs to replay every input: the live
   // execution and JobStore have already reached a durable terminal state.
   // Keeping the input records for Running/Draining is required for restart.
   let retain_inputs = self.phase == JobRunPhase::Running ||
     self.phase == JobRunPhase::Draining
-  if retain_inputs && !self.inputs.is_empty() {
+  let ranges = self.retired.copy()
+  match retired {
+    Some(values) => ranges.push_iter(values.iter())
+    None => ()
+  }
+  let ranges = @causal.CausalRetirement::new("driver", ranges)
+    .ranges()
+    .to_owned() catch {
+      error => raise driver_error("compact Driver identities", error)
+    }
+  let retained = if retain_inputs {
+    self.inputs.filter(event => !ranges.any(range => range.contains(event.id())))
+  } else {
+    []
+  }
+  if retain_inputs &&
+    (!ranges.is_empty() || self.accepted_events != retained.length().to_int64()) {
+    entries.push(
+      driver_entry_line(DriverJournalEntry::{
+        ..driver_entry("checkpoint"),
+        accepted_events: self.accepted_events - retained.length().to_int64(),
+        retired: Some(ranges),
+      }),
+    )
+  }
+  if !retained.is_empty() {
     entries.push(
       driver_entry_line(DriverJournalEntry::{
         ..driver_entry("input"),
-        events: self.inputs.copy(),
+        events: retained,
+      }),
+    )
+  }
+  if self.rescale_workers is Some(workers) {
+    entries.push(
+      driver_entry_line({
+        ..driver_entry("rescale"),
+        rescale_workers: Some(workers),
+        rescale_resume: Some(self.rescale_resume),
+        rescale_parallelism: self.rescale_parallelism,
+      }),
+    )
+  }
+  if self.graph_update is Some(candidate) {
+    entries.push(driver_entry_line(driver_entry("pause")))
+    entries.push(
+      driver_entry_line({
+        ..driver_entry("graph_update"),
+        graph_update: Some(candidate),
       }),
     )
   }
   match self.phase {
-    JobRunPhase::Created | JobRunPhase::Running => ()
+    JobRunPhase::Created => ()
+    JobRunPhase::Running =>
+      if self.paused {
+        entries.push(
+          driver_entry_line(DriverJournalEntry::{
+            ..driver_entry("pause"),
+            paused: Some(true),
+          }),
+        )
+        guard self.submission is Some(submission) else {
+          raise ApiError::UnknownSubmission("paused Driver without submission")
+        }
+        entries.push(
+          driver_entry_line(DriverJournalEntry::{
+            ..driver_entry("update"),
+            update_submission: Some(submission),
+          }),
+        )
+      }
     JobRunPhase::Draining =>
       entries.push(driver_entry_line(driver_entry("drain")))
     JobRunPhase::Succeeded => {
@@ -603,6 +942,17 @@ pub async fn DriverStore::compact(self : DriverStore) -> Unit raise ApiError {
   self.journal.rewrite(entries[:]) catch {
     error => raise driver_error("compact Driver store", error)
   }
+  @crash_boundary.hit("driver.history.reclaimed", self.path) catch {
+    error => raise driver_error("Driver reclamation boundary", error)
+  }
+  if retain_inputs {
+    self.inputs.clear()
+    self.inputs.push_iter(retained.iter())
+    self.event_index = Map::from_array(
+      retained.map(event => (event.id(), event)),
+    )
+    self.retired = ranges
+  }
   if self.phase != JobRunPhase::Created &&
     self.phase != JobRunPhase::Running &&
     self.phase != JobRunPhase::Draining {
@@ -626,6 +976,11 @@ pub async fn DriverStore::handle(
       JobCommand::Submit(value) => Ok(self.submit(value))
       JobCommand::Input(events) => Ok(self.input(events[:]))
       JobCommand::Status => Ok(self.status())
+      JobCommand::Pause => Ok(self.pause())
+      JobCommand::Resume => Ok(self.resume())
+      JobCommand::Rescale(_) =>
+        Err("rescale must be handled by the Coordinator")
+      JobCommand::Update(_) => Err("update must be handled by the Coordinator")
       JobCommand::Drain => Ok(self.drain())
       JobCommand::Cancel => Ok(self.cancel())
     }

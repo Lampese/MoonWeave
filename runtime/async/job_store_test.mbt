@@ -10,6 +10,41 @@ fn durable_job_spec() -> @plan.JobSpec raise @plan.PlanError {
 }
 
 ///|
+async test "online worker admission survives journal and checkpoint recovery" {
+  let root = @fs.tmpdir(prefix="moonweave-job-spare")
+  defer @fs.rmdir(root, recursive=true)
+  let spec = durable_job_spec()
+  let path = root + "/job.wal"
+  let checkpoint = root + "/job.json"
+  let store = JobStore::open(spec, path, checkpoint_path=checkpoint)
+  store.allow_worker("spare")
+  store.close()
+  let replayed = JobStore::open(spec, path, checkpoint_path=checkpoint)
+  assert_true(replayed.snapshot().workers().contains("spare"))
+  ignore(replayed.assign(0, "spare", 0, 0L))
+  replayed.checkpoint_and_compact()
+  replayed.close()
+  let restored = JobStore::open(spec, path, checkpoint_path=checkpoint)
+  assert_eq(restored.snapshot().partitions()[0].worker_id(), "spare")
+  restored.close()
+  let foreign = @plan.JobSpec::new(
+    "other-job",
+    "reachability",
+    2,
+    ["worker-a", "worker-b"],
+    [],
+  )
+  try JobStore::open(foreign, path, checkpoint_path=checkpoint) catch {
+    _ => ()
+  } noraise {
+    wrong => {
+      wrong.close()
+      fail("accepted foreign topology")
+    }
+  }
+}
+
+///|
 async fn with_job_store_paths(f : async (String, String) -> Unit) -> Unit {
   let directory = @fs.tmpdir(prefix="moonweave-job-store")
   let journal_path = directory + "/job.journal"

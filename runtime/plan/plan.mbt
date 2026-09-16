@@ -93,6 +93,7 @@ pub(all) struct JobSpec {
   job_id : String
   operator_id : String
   partition_count : Int
+  parallelism : Int
   workers : ReadOnlyArray[String]
   routes : ReadOnlyArray[ExchangeRoute]
 } derive(Debug, Eq)
@@ -104,6 +105,7 @@ pub fn JobSpec::new(
   partition_count : Int,
   worker_ids : ArrayView[String],
   routes : ArrayView[ExchangeRoute],
+  parallelism? : Int = partition_count,
 ) -> JobSpec raise PlanError {
   if job_id.is_empty() {
     raise PlanError::EmptyJobId
@@ -113,6 +115,9 @@ pub fn JobSpec::new(
   }
   if partition_count <= 0 {
     raise PlanError::InvalidPartitionCount(partition_count)
+  }
+  if parallelism <= 0 || parallelism > partition_count {
+    raise PlanError::InvalidPartitionCount(parallelism)
   }
   let unique : Set[String] = Set([])
   for worker_id in worker_ids {
@@ -150,6 +155,7 @@ pub fn JobSpec::new(
     job_id,
     operator_id,
     partition_count,
+    parallelism,
     workers: ReadOnlyArray::from_array(sorted_workers),
     routes: ReadOnlyArray::from_array(sorted_routes),
   }
@@ -171,6 +177,11 @@ pub fn JobSpec::partition_count(self : JobSpec) -> Int {
 }
 
 ///|
+pub fn JobSpec::parallelism(self : JobSpec) -> Int {
+  self.parallelism
+}
+
+///|
 pub fn JobSpec::workers(self : JobSpec) -> ArrayView[String] {
   self.workers[:]
 }
@@ -188,23 +199,33 @@ pub fn JobSpec::owner(
   if partition < 0 || partition >= self.partition_count {
     raise PlanError::InvalidPartition(partition)
   }
-  self.workers[partition % self.workers.length()]
+  self.workers[partition % self.parallelism % self.workers.length()]
 }
 
 ///|
 /// Stable FNV-1a routing. This is a placement function, not a security hash.
 pub fn JobSpec::partition_for_key(self : JobSpec, key : String) -> Int {
+  key_partition(key, self.partition_count)
+}
+
+///|
+/// Stable key placement shared by the planner and graph stage admission.
+/// `partition_count` must be positive, as validated by JobSpec/TaskGraphConfig.
+pub fn key_partition(key : String, partition_count : Int) -> Int {
   let mut hash : UInt = 2166136261U
   for byte in @utf8.encode(key) {
     hash = (hash ^ byte.to_int().reinterpret_as_uint()) * 16777619U
   }
-  (hash % self.partition_count.reinterpret_as_uint()).reinterpret_as_int()
+  (hash % partition_count.reinterpret_as_uint()).reinterpret_as_int()
 }
 
 ///|
 pub fn JobSpec::route_key(self : JobSpec, key : String) -> RouteTarget {
   let partition = self.partition_for_key(key)
-  { partition, worker_id: self.workers[partition % self.workers.length()], }
+  {
+    partition,
+    worker_id: self.workers[partition % self.parallelism % self.workers.length()],
+  }
 }
 
 ///|
@@ -230,7 +251,9 @@ pub fn JobSpec::exchange_targets(
       let target = route.target_partition()
       RouteTarget::{
         partition: target,
-        worker_id: self.workers[target % self.workers.length()],
+        worker_id: self.workers[target %
+        self.parallelism %
+        self.workers.length()],
       }
     })
     .view()

@@ -1,0 +1,276 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+}
+
+///|
+struct ObservedStatus {
+  node_id : String
+  term : Int64
+  leader : String
+  commit_index : Int64
+  available_peers : Int
+  quorum : Int
+} derive(FromJson)
+
+///|
+fn endpoint(server : @socket.TcpServer) -> String {
+  "127.0.0.1:" + server.addr.port().to_string()
+}
+
+///|
+fn forget_pid(live : Array[Int], pid : Int) -> Unit {
+  match live.search_by(value => value == pid) {
+    Some(index) => ignore(live.remove(index))
+    None => ()
+  }
+}
+
+///|
+async fn wait_status(
+  root : String,
+  node : String,
+  predicate : (ObservedStatus) -> Bool,
+) -> Unit {
+  @async.with_timeout(15000, () => {
+    for ;; {
+      let path = root + "/observe/" + node + ".json"
+      if @fs.exists(path) {
+        try {
+          let status : ObservedStatus = @json.from_json(
+            @json.parse(@fs.read_file(path).text()),
+          )
+          if predicate(status) {
+            return
+          }
+        } catch {
+          _ => ()
+        }
+      }
+      @async.sleep(25)
+    }
+  })
+}
+
+///|
+async fn start_node(
+  executable : String,
+  root : String,
+  node : String,
+  nodes : String,
+  bind : String,
+  storage : String,
+  round : Int,
+) -> Int {
+  let log = @process.redirect_to_file(
+    root + "/" + node + "-" + round.to_string() + ".log",
+  )
+  defer log.close()
+  @process.spawn_orphan(
+    executable,
+    [
+      "--mode",
+      "serve",
+      "--cluster",
+      "network-ha",
+      "--coordinator",
+      "coordinator",
+      "--node",
+      node,
+      "--nodes",
+      nodes,
+      "--ha-bind",
+      bind,
+      "--storage",
+      storage,
+      "--observe",
+      root + "/observe",
+      "--stop-file",
+      root + "/stop",
+    ],
+    stdout=log,
+    stderr=log,
+  )
+}
+
+///|
+async fn run_client(
+  executable : String,
+  nodes : String,
+  mode : String,
+  state? : String,
+) -> @shell.Output {
+  let args = [
+    "--mode", mode, "--cluster", "network-ha", "--coordinator", "coordinator", "--nodes",
+    nodes,
+  ]
+  if state is Some(value) {
+    args.push_iter(["--state", value].iter())
+  }
+  @shell.Cmd(executable, args).output(timeout_ms=15000)
+}
+
+///|
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-network-ha-")
+  @fs.mkdir(root + "/observe", recursive=true)
+  println("Network HA evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator_network_ha_fixture",
+  ]).run(timeout_ms=120000)
+  let executable = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/coordinator_network_ha_fixture/coordinator_network_ha_fixture.exe",
+  )
+  let s0 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let s1 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let s2 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let p0 = endpoint(s0)
+  let p1 = endpoint(s1)
+  let p2 = endpoint(s2)
+  s0.close()
+  s1.close()
+  s2.close()
+  let nodes = "node-0@" +
+    p0 +
+    "@" +
+    root +
+    "/n0,node-1@" +
+    p1 +
+    "@" +
+    root +
+    "/n1,node-2@" +
+    p2 +
+    "@" +
+    root +
+    "/n2"
+  let live : Array[Int] = []
+  let mut node0 = start_node(
+    executable,
+    root,
+    "node-0",
+    nodes,
+    p0,
+    root + "/n0",
+    0,
+  )
+  live.push(node0)
+  let node1 = start_node(executable, root, "node-1", nodes, p1, root + "/n1", 0)
+  live.push(node1)
+  let node2 = start_node(executable, root, "node-2", nodes, p2, root + "/n2", 0)
+  live.push(node2)
+  defer (@async.protect_from_cancel(() => {
+    @fs.write_file(root + "/stop", "stop") catch {
+      _ => ()
+    }
+    for pid in live {
+      ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+      ignore(@process.wait_pid(pid))
+    }
+  }) catch {
+    _ => ()
+  })
+  wait_status(root, "node-0", status => {
+    status.leader == "node-0" &&
+    status.term >= 1L &&
+    status.available_peers >= 2
+  })
+  wait_status(root, "node-1", status => {
+    status.term >= 1L && status.leader == "node-0"
+  })
+  wait_status(root, "node-2", status => {
+    status.term >= 1L && status.leader == "node-0"
+  })
+  let first = run_client(
+    executable,
+    nodes,
+    "propose",
+    state?=Some("{\"revision\":\"one\"}"),
+  )
+  if first.exit_code() != 0 {
+    fail(
+      "first network quorum write failed: " + first.stderr() + first.stdout(),
+    )
+  }
+  let read_one = run_client(executable, nodes, "read")
+  if read_one.exit_code() != 0 || !read_one.stdout().contains("revision") {
+    fail("first committed state not readable")
+  }
+  ignore(@process.run("/bin/kill", ["-KILL", node0.to_string()]))
+  ignore(@process.wait_pid(node0))
+  forget_pid(live, node0)
+  wait_status(root, "node-1", status => {
+    status.leader == "node-1" &&
+    status.term >= 2L &&
+    status.available_peers >= 2
+  })
+  let second = run_client(
+    executable,
+    nodes,
+    "propose",
+    state?=Some("{\"revision\":\"two\"}"),
+  )
+  if second.exit_code() != 0 {
+    fail("failover quorum write failed: " + second.stderr() + second.stdout())
+  }
+  let read_two = run_client(executable, nodes, "read")
+  if read_two.exit_code() != 0 ||
+    !read_two.stdout().contains("revision") ||
+    !read_two.stdout().contains("two") {
+    fail("failover state not readable")
+  }
+  ignore(@process.run("/bin/kill", ["-KILL", node1.to_string()]))
+  ignore(@process.wait_pid(node1))
+  forget_pid(live, node1)
+  let minority = run_client(
+    executable,
+    nodes,
+    "propose",
+    state?=Some("{\"revision\":\"rejected\"}"),
+  )
+  if minority.exit_code() == 0 {
+    fail("minority accepted a network quorum write")
+  }
+  node0 = start_node(executable, root, "node-0", nodes, p0, root + "/n0", 1)
+  live.push(node0)
+  wait_status(root, "node-0", status => {
+    status.available_peers >= 2 && status.leader != ""
+  })
+  let recovered = run_client(
+    executable,
+    nodes,
+    "propose",
+    state?=Some("{\"revision\":\"three\"}"),
+  )
+  if recovered.exit_code() != 0 {
+    fail(
+      "recovered quorum write failed: " +
+      recovered.stderr() +
+      recovered.stdout(),
+    )
+  }
+  let read_three = run_client(executable, nodes, "read")
+  if read_three.exit_code() != 0 || !read_three.stdout().contains("three") {
+    fail("restarted replica lost committed state")
+  }
+  @fs.write_file(
+    root + "/result.json",
+    "{\"three_nodes\":true,\"leader_failover\":true,\"minority_rejected\":true,\"restarted_replica\":true}",
+    sync=@fs.Full,
+  )
+  @fs.write_file(root + "/stop", "stop")
+  for pid in live {
+    ignore(@process.run("/bin/kill", ["-TERM", pid.to_string()]))
+    ignore(@process.wait_pid(pid))
+  }
+  live.clear()
+  println(
+    "PASS: network quorum election, failover, minority fencing, and replica recovery",
+  )
+}

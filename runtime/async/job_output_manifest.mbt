@@ -613,9 +613,26 @@ pub fn task_snapshot_digest(snapshot : @task.TaskSnapshot) -> String {
 
 ///|
 fn manifest_records_digest(records : Array[TaskOutputRecord]) -> String {
-  manifest_json_digest(
-    Json::array(records.map(record => @json.to_json(record))),
-  )
+  manifest_extend_output_digest(manifest_json_digest(Json::array([])), records)
+}
+
+///|
+/// A chain over immutable sink identities and values can be extended after
+/// its prefix has been reclaimed. Ownership metadata may change on migration.
+fn manifest_extend_output_digest(
+  prefix : String,
+  records : Array[TaskOutputRecord],
+) -> String {
+  records.fold(init=prefix, (digest, record) => {
+    manifest_json_digest(
+      Json::array([
+        Json::string(digest),
+        Json::string(record.task_id),
+        Json::string(record.sequence.to_string()),
+        @json.to_json(record.output),
+      ]),
+    )
+  })
 }
 
 ///|
@@ -711,8 +728,8 @@ pub struct JobOutputManifest {
   job_id : String
   operator_id : String
   partition_count : Int
-  partitions : Map[Int, JobOutputPartitionSummary]
-  consumers : Map[String, JobOutputConsumerSummary]
+  mut partitions : Map[Int, JobOutputPartitionSummary]
+  mut consumers : Map[String, JobOutputConsumerSummary]
   mut certificate : JobOutputCertificate?
   write_lock : @async.Mutex
 }

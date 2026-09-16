@@ -1,4 +1,5 @@
 import {
+  "moonweave/moonweave/internal/crash_boundary",
   "moonweave/moonweave/causal",
   "moonweave/moonweave/runtime/control",
   "moonweave/moonweave/runtime/plan",

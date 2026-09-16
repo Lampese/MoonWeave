@@ -192,14 +192,7 @@ pub async fn JsonLinesSource::poll_with_offset(
             @debug.to_string(error),
           )
       }
-      result.push(
-        Event::new(
-          event.id(),
-          event.record.parents(),
-          event.key(),
-          event.payload(),
-        ),
-      )
+      result.push(event.bind_input(event.input_id()))
     }
     physical += 1
   }

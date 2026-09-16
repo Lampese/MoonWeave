@@ -18,6 +18,7 @@ pub(all) suberror SessionError {
   MessageRegression(expected_at_least~ : Int64, actual~ : Int64)
   MessageGap(expected~ : Int64, actual~ : Int64)
   MessageIdConflict(String)
+  WatermarkRegression(expected_at_least~ : Int64, actual~ : Int64)
   Frame(ProtocolError)
   Payload(MessageError)
   Assignment(ProtocolError)
@@ -37,6 +38,7 @@ pub struct WorkerSession {
   mut last_received_offset : Int64
   mut last_persisted_offset : Int64
   mut last_applied_offset : Int64
+  mut watermark : Int64
   state : WorkerState
 }
 
@@ -65,6 +67,7 @@ pub fn WorkerSession::new(
     last_received_offset: -1L,
     last_persisted_offset: -1L,
     last_applied_offset: -1L,
+    watermark: -1L,
     state: worker_state,
   }
 }
@@ -116,6 +119,11 @@ pub fn WorkerSession::last_applied_offset(self : WorkerSession) -> Int64 {
 }
 
 ///|
+pub fn WorkerSession::watermark(self : WorkerSession) -> Int64 {
+  self.watermark
+}
+
+///|
 /// Record that a received input offset has been durably written to the worker
 /// WAL. The async storage adapter must call this only after its write barrier.
 pub fn WorkerSession::mark_persisted(
@@ -163,6 +171,21 @@ pub fn WorkerSession::restore_progress(
   self.last_received_offset = received_offset
   self.last_persisted_offset = persisted_offset
   self.last_applied_offset = applied_offset
+}
+
+///|
+/// Restore the event-time frontier from a trusted checkpoint/WAL replay.
+pub fn WorkerSession::restore_watermark(
+  self : WorkerSession,
+  watermark : Int64,
+) -> Unit raise SessionError {
+  if watermark < -1L || watermark < self.watermark {
+    raise SessionError::WatermarkRegression(
+      expected_at_least=self.watermark,
+      actual=watermark,
+    )
+  }
+  self.watermark = watermark
 }
 
 ///|
@@ -341,6 +364,45 @@ pub fn WorkerSession::accept_frame(
         )
       }
     }
+    (Running, FrameKind::Retire) => {
+      let request = Retire::from_payload(frame.payload()) catch {
+        error => raise SessionError::Payload(error)
+      }
+      guard self.state.assignment() is Some(assignment) else {
+        raise SessionError::Assignment(ProtocolError::UnknownAssignment)
+      }
+      if request.partition != assignment.partition() ||
+        request.epoch != assignment.epoch() ||
+        frame.assignment_epoch() != request.epoch ||
+        request.offset != self.last_applied_offset {
+        raise SessionError::Frame(ProtocolError::InvalidOffset(request.offset))
+      }
+    }
+    (Running, FrameKind::Watermark) => {
+      let watermark = Watermark::from_payload(frame.payload()) catch {
+        error => raise SessionError::Payload(error)
+      }
+      guard self.state.assignment() is Some(assignment) else {
+        raise SessionError::Assignment(ProtocolError::UnknownAssignment)
+      }
+      if assignment.partition() != watermark.partition() ||
+        assignment.epoch() != watermark.epoch() ||
+        frame.assignment_epoch() != watermark.epoch() {
+        raise SessionError::Assignment(
+          ProtocolError::StaleEpoch(
+            expected=assignment.epoch(),
+            actual=watermark.epoch(),
+          ),
+        )
+      }
+      if watermark.timestamp() < self.watermark {
+        raise SessionError::WatermarkRegression(
+          expected_at_least=self.watermark,
+          actual=watermark.timestamp(),
+        )
+      }
+      self.watermark = watermark.timestamp()
+    }
     (Running, FrameKind::Probe) => {
       let probe = Probe::from_payload(frame.payload()) catch {
         error => raise SessionError::Payload(error)
@@ -421,7 +483,7 @@ pub fn WorkerSession::accept_frame(
         actual=self.phase,
       )
   }
-  self.seen_messages[frame.message_id()] = frame
+  remember_recent_frame(self.seen_messages, frame)
   self.next_sequence += 1L
 }
 
@@ -594,7 +656,7 @@ pub fn CoordinatorSession::accept_hello(
   self.incarnation = hello.incarnation()
   self.state = Some(worker_state)
   self.phase = Handshaking
-  self.seen_messages[frame.message_id()] = frame
+  remember_recent_frame(self.seen_messages, frame)
   self.next_sequence += 1L
   hello
 }
@@ -814,6 +876,24 @@ pub fn CoordinatorSession::accept_frame(
           ),
         )
       }
+      // A reconnecting Worker may have durably applied a batch before the
+      // Coordinator's local send journal was lost. If this fresh session has
+      // not reserved any source records yet, seed its send cursor from the
+      // Worker's persisted resume offset before applying the normal monotone
+      // check. The Coordinator's durable work plan validates the offset at the
+      // higher-level supervisor boundary.
+      guard state.assignment() is Some(assignment) else {
+        raise SessionError::Assignment(ProtocolError::UnknownAssignment)
+      }
+      if resume_message.persisted_offset() >= assignment.next_offset() &&
+        assignment.next_offset() == assignment.acked_offset() + 1L {
+        state.restore_send_cursor(
+          resume_message.epoch,
+          resume_message.persisted_offset() + 1L,
+        ) catch {
+          error => raise SessionError::Assignment(error)
+        }
+      }
       state.resume_from(resume_message.epoch, resume_message.persisted_offset) catch {
         error => raise SessionError::Assignment(error)
       }
@@ -861,6 +941,16 @@ pub fn CoordinatorSession::accept_frame(
         error => raise SessionError::Assignment(error)
       }
       self.last_persisted_offset = ack.offset
+    }
+    FrameKind::RetireAck => {
+      let ack = RetireAck::from_payload(frame.payload()) catch {
+        error => raise SessionError::Payload(error)
+      }
+      ignore(self.check_assignment(ack.partition, ack.epoch))
+      if frame.assignment_epoch() != ack.epoch ||
+        ack.offset != self.last_applied_offset {
+        raise SessionError::Frame(ProtocolError::InvalidOffset(ack.offset))
+      }
     }
     FrameKind::DeltaAck => {
       let ack = DeltaAck::from_payload(frame.payload()) catch {
@@ -966,7 +1056,7 @@ pub fn CoordinatorSession::accept_frame(
     FrameKind::Drain => self.phase = Draining
     _ => raise SessionError::WrongPhase(expected=Running, actual=self.phase)
   }
-  self.seen_messages[frame.message_id()] = frame
+  remember_recent_frame(self.seen_messages, frame)
   self.next_sequence += 1L
 }
 

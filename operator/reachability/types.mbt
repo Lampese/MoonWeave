@@ -9,7 +9,7 @@ pub(all) suberror ReachabilityError {
 pub struct Edge {
   source : String
   target : String
-} derive(Debug, Eq, Compare, Hash)
+} derive(Debug, Eq, Compare, Hash, ToJson, FromJson)
 
 ///|
 pub fn Edge::new(

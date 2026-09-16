@@ -35,7 +35,7 @@ fn driver_event_limit(args : Array[String]) -> Int raise @flow.ApiError {
 }
 
 ///|
-fn parse_endpoint(value : String) -> @flow.NodeEndpoint raise {
+fn parse_endpoint(value : String) -> @flow.NodeEndpoint raise @flow.ApiError {
   let parts = value.split(":").to_array()
   if parts.length() != 2 {
     raise @flow.ApiError::InvalidEndpoint(value)
@@ -47,6 +47,50 @@ fn parse_endpoint(value : String) -> @flow.NodeEndpoint raise {
 }
 
 ///|
+fn parse_network_ha(
+  args : Array[String],
+  cluster_id : String,
+  coordinator_id : String,
+  default_storage : String,
+) -> @runtime.NetworkHaConfig? raise @flow.ApiError {
+  let nodes = option(args, "--ha-nodes", "")
+  if nodes.is_empty() {
+    return None
+  }
+  let self_id = option(args, "--ha-node", "node-0")
+  let peers : Array[@runtime.NetworkHaPeer] = []
+  for item in nodes.split(",") {
+    let fields = item.split("@").to_array()
+    if fields.length() != 3 {
+      raise @flow.ApiError::Cluster("invalid --ha-nodes entry")
+    }
+    let endpoint = parse_endpoint(fields[1].to_owned())
+    peers.push(
+      @runtime.NetworkHaPeer::new(
+        fields[0].to_owned(),
+        @runtime.NetworkHaEndpoint::new(endpoint.host(), endpoint.port()),
+        fields[2].to_owned(),
+      ) catch {
+        error => raise @flow.ApiError::Cluster(@debug.to_string(error))
+      },
+    )
+  }
+  let bind = parse_endpoint(option(args, "--ha-bind", "127.0.0.1:7901"))
+  Some(
+    @runtime.NetworkHaConfig::new(
+      cluster_id,
+      coordinator_id,
+      self_id,
+      @runtime.NetworkHaEndpoint::new(bind.host(), bind.port()),
+      peers[:],
+      default_storage + "/network-ha-" + self_id,
+    ) catch {
+      error => raise @flow.ApiError::Cluster(@debug.to_string(error))
+    },
+  )
+}
+
+///|
 fn worker_slots(value : String) -> Array[@flow.WorkerSlot] raise {
   if value.is_empty() {
     raise @flow.ApiError::EmptyWorkerList
@@ -54,11 +98,15 @@ fn worker_slots(value : String) -> Array[@flow.WorkerSlot] raise {
   let result : Array[@flow.WorkerSlot] = []
   for item in value.split(",") {
     let fields = item.split("@").to_array()
-    if fields.length() != 2 {
+    if fields.length() < 2 || fields.length() > 3 {
       raise @flow.ApiError::InvalidWorkerAssignment(item.to_owned())
     }
+    let slot = @flow.WorkerSlot::new(fields[0].to_owned(), fields[1].to_owned())
     result.push(
-      @flow.WorkerSlot::new(fields[0].to_owned(), fields[1].to_owned()),
+      match fields.length() {
+        2 => slot
+        _ => slot.with_storage_dir(fields[2].to_owned())
+      },
     )
   }
   result
@@ -98,6 +146,11 @@ async fn main {
     )
     .with_advertised_endpoint(advertise)
     .with_storage_budget(budget)
+  let coordinator_config = match
+    parse_network_ha(args, cluster_id, coordinator_id, storage) {
+    Some(ha) => coordinator_config.with_network_ha(ha)
+    None => coordinator_config
+  }
   let coordinator_config = if auth_token.is_empty() {
     coordinator_config
   } else {
@@ -111,24 +164,20 @@ async fn main {
   } else {
     driver_config.with_auth_token(auth_token)
   }
-  let store = @flow.DriverStore::open(
-    storage + "/driver.wal",
-    maximum_bytes=budget,
+  let coordinator = @flow.CoordinatorService::bind(
+    coordinator_config,
+    driver_config,
     maximum_events=event_limit,
-  )
-  let coordinator = @flow.DriverCoordinator::bind(
-    coordinator_config, driver_config, store,
   )
   println(
     "coordinator data=\{coordinator.data_endpoint().to_string()} driver=\{coordinator.control_endpoint().to_string()}",
   )
-  let mut completed : @flow.DriverCoordinatorSummary? = None
+  let mut completed = false
+  let mut statuses : Array[@flow.JobRunStatus] = []
   try
     @async.with_task_group <| group => {
       let service = group.spawn() <| () => {
-        @async.protect_from_cancel <| () => {
-          coordinator.run(keep_terminal=true)
-        }
+        @async.protect_from_cancel <| () => { coordinator.run() }
       }
       @async.with_cancellation_handler(
         handler=() => {
@@ -137,23 +186,30 @@ async fn main {
               error =>
                 println("graceful shutdown failed: \{@debug.to_string(error)}")
             }
-            // The production service stays available for terminal status
-            // queries until its supervisor explicitly delivers SIGTERM.
+            statuses = coordinator.statuses()
             coordinator.close()
-            completed = Some(service.wait())
+            service.wait()
+            completed = true
           }
         },
-        () => completed = Some(service.wait()),
+        () => {
+          service.wait()
+          completed = true
+        },
       )
     }
   catch {
-    error if @async.is_cancellation_error(error) && completed is Some(_) => ()
-    error => raise error
+    error if @async.is_cancellation_error(error) && completed => ()
+    error => {
+      println("coordinator service failed: " + @debug.to_string(error))
+      raise error
+    }
   }
-  let summary = completed.unwrap()
-  println("phase=\{@debug.to_string(summary.status().phase())}")
-  match summary.status().failure() {
-    Some(reason) => println("failure=\{reason}")
-    None => ()
+  for status in statuses {
+    println("job=\{status.job_id()} phase=\{@debug.to_string(status.phase())}")
+    match status.failure() {
+      Some(reason) => println("failure=\{reason}")
+      None => ()
+    }
   }
 }

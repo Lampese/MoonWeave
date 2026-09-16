@@ -18,7 +18,7 @@ pub(all) struct SumPayload {
 pub(all) struct Contribution {
   key : String
   value : Int64
-} derive(Debug, Eq)
+} derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 pub fn Contribution::new(

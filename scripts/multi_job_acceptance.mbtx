@@ -1,0 +1,577 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+  "moonbitlang/core/env",
+  "moonbitlang/core/string",
+}
+
+///|
+struct Status {
+  job_id : String
+  phase : String
+  accepted_events : Int64
+} derive(FromJson)
+
+///|
+struct CheckpointCursor {
+  applied_offset : Int64
+} derive(FromJson)
+
+///|
+struct RetainedPlan {
+  retained_from : Int64?
+} derive(FromJson)
+
+///|
+struct JobCheckpoint {
+  journal_generation : Int64
+  work_plans : Array[RetainedPlan]
+} derive(FromJson)
+
+///|
+async fn wait_retired(root : String, cut : Int64) -> JobCheckpoint {
+  let path = root + "/coordinator/jobs/job-3/job.json"
+  @async.with_timeout(15000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        let saved : JobCheckpoint = @json.from_json(
+          @json.parse(@fs.read_file(path).text()),
+        )
+        if saved.journal_generation > 0L &&
+          saved.work_plans.length() == 1 &&
+          saved.work_plans[0].retained_from.unwrap_or(0L) >= cut {
+          return saved
+        }
+      }
+      @async.sleep(5)
+    }
+  })
+}
+
+///|
+struct Sum {
+  key : String
+  total : Int64
+} derive(Eq, FromJson)
+
+///|
+enum Output {
+  KeyedSum(Sum)
+} derive(Eq, FromJson)
+
+///|
+struct Record {
+  task_id : String
+  sequence : Int64
+  output : Output
+} derive(FromJson)
+
+///|
+struct Remote {
+  binary : String
+  root : String
+  id : String
+  endpoint : String
+}
+
+///|
+async fn Remote::command(
+  self : Remote,
+  command : String,
+  events? : Array[Json],
+) -> Status {
+  let args = [
+    "--endpoint",
+    self.endpoint,
+    "--cluster",
+    "multi-process",
+    "--coordinator",
+    "coordinator",
+    "--job-config",
+    self.root + "/" + self.id + ".json",
+    "--command",
+    command,
+    "--format",
+    "json",
+  ]
+  if events is Some(events) {
+    let path = self.root + "/input-" + self.id + ".json"
+    @fs.write_file(
+      path,
+      @json.to_json(events).stringify(),
+      create_mode=@fs.CreateOrTruncate,
+    )
+    args.push_iter(["--events", path].iter())
+  }
+  let output = @shell.Cmd(self.binary, args).output(timeout_ms=20000)
+  if output.exit_code() != 0 {
+    fail(command + " " + self.id + ": " + output.stderr() + output.stdout())
+  }
+  let status : Status = @json.from_json(@json.parse(output.stdout()))
+  assert_eq(status.job_id, self.id)
+  status
+}
+
+///|
+fn input(sequence : Int64, value : Int64) -> Json {
+  {
+    "record": {
+      "id": { "origin": "same-input", "sequence": sequence.to_string() },
+      "parents": [],
+      "key": "store",
+      "payload": { "value": value.to_string() },
+    },
+  }
+}
+
+///|
+async fn wait_port(endpoint : String) -> Unit {
+  @async.with_timeout(10000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(20)
+      } noraise {
+        connection => {
+          connection.close()
+          return
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn wait_checkpoint(
+  root : String,
+  job_id : String,
+  offset : Int64,
+) -> Unit {
+  let path = root + "/worker-" + job_id + "/worker-p0.json"
+  @async.with_timeout(10000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        let checkpoint : CheckpointCursor = @json.from_json(
+          @json.parse(@fs.read_file(path).text()),
+        )
+        if checkpoint.applied_offset >= offset {
+          return
+        }
+      }
+      @async.sleep(5)
+    }
+  })
+}
+
+///|
+async fn start_coordinator(
+  binary : String,
+  root : String,
+  data : String,
+  control : String,
+  round : Int,
+) -> Int {
+  let output = @process.redirect_to_file(
+    root + "/coordinator-" + round.to_string() + ".log",
+  )
+  defer output.close()
+  let pid = @process.spawn_orphan(
+    binary,
+    [
+      "--cluster",
+      "multi-process",
+      "--coordinator",
+      "coordinator",
+      "--bind",
+      data,
+      "--advertise",
+      data,
+      "--driver-bind",
+      control,
+      "--driver-advertise",
+      control,
+      "--storage",
+      root + "/coordinator",
+      "--workers",
+      "worker@boot-worker",
+      "--storage-budget-bytes",
+      "65536",
+      "--driver-event-limit",
+      "32",
+    ],
+    stdout=output,
+    stderr=output,
+  )
+  wait_port(control)
+  pid
+}
+
+///|
+async fn start_worker(
+  binary : String,
+  root : String,
+  data : String,
+  job_id : String,
+  round : Int,
+) -> Int {
+  let output = @process.redirect_to_file(
+    root + "/worker-" + job_id + "-" + round.to_string() + ".log",
+  )
+  defer output.close()
+  @process.spawn_orphan(
+    binary,
+    [
+      "--cluster",
+      "multi-process",
+      "--coordinator",
+      "coordinator",
+      "--coordinator-endpoint",
+      data,
+      "--worker",
+      "worker",
+      "--incarnation",
+      "boot-worker",
+      "--storage",
+      root + "/worker-" + job_id,
+      "--job-config",
+      root + "/" + job_id + ".json",
+      "--storage-budget-bytes",
+      "65536",
+    ],
+    stdout=output,
+    stderr=output,
+  )
+}
+
+///|
+async fn verify_output(path : String, expected : Array[Int64]) -> Unit {
+  let identities : Map[(String, Int64), Output] = Map([])
+  let values : Array[Int64] = []
+  for line in @fs.read_file(path).text().split("\n") {
+    if line.trim().is_empty() {
+      continue
+    }
+    let record : Record = @json.from_json(@json.parse(line))
+    let key = (record.task_id, record.sequence)
+    if identities.get(key) is Some(previous) {
+      if previous != record.output {
+        fail("conflicting idempotency key")
+      }
+    } else {
+      identities[key] = record.output
+      let KeyedSum(sum) = record.output
+      assert_eq(sum.key, "store")
+      values.push(sum.total)
+    }
+  }
+  assert_eq(values, expected)
+}
+
+///|
+/// Coordinator, Workers and Driver run as independent native processes.
+async fn main {
+  let args = @env.args()
+  let duration_ms = if args.length() > 1 {
+    @string.parse_int(args[1])
+  } else {
+    0
+  }
+  let period_ms = if args.length() > 2 {
+    @string.parse_int(args[2])
+  } else {
+    10000
+  }
+  if duration_ms < 0 ||
+    duration_ms > 172800000 ||
+    period_ms <= 0 ||
+    period_ms > 60000 {
+    fail("duration must be 0..172800000 ms and period 1..60000 ms")
+  }
+  let root = @fs.tmpdir(prefix="moonweave-multi-process-")
+  println("Multi-job evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+    "--warn-list", "-a",
+  ]).run(timeout_ms=180000)
+  let binaries = "_build/native/debug/build/moonweave/moonweave/cmd/"
+  let coordinator_binary = @fs.realpath(
+    binaries + "coordinator/coordinator.exe",
+  )
+  let worker_binary = @fs.realpath(binaries + "worker/worker.exe")
+  let driver_binary = @fs.realpath(binaries + "driver/driver.exe")
+  @shell.Cmd("moon", ["run", "scripts/capture_candidate.mbtx", root]).run(
+    timeout_ms=120000,
+  )
+  @fs.write_file(
+    root + "/run-config.json",
+    (
+      {
+        "duration_ms": duration_ms,
+        "period_ms": period_ms,
+        "worker_wal_budget_bytes": 65536,
+        "operator_state_limit": 128,
+        "driver_event_limit": 32,
+        "input_batch_size": 16,
+        "active_keys": 1,
+        "capacity_target": "unspecified; measured values only",
+      } : Json).stringify(),
+    sync=@fs.Full,
+  )
+  let ds = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let cs = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let data = "127.0.0.1:" + ds.addr.port().to_string()
+  let control = "127.0.0.1:" + cs.addr.port().to_string()
+  ds.close()
+  cs.close()
+  for id in ["a", "b", "c", "d"] {
+    let definition : Json = {
+      "job_id": id,
+      "operator": { "id": "keyed-sum", "version": 1 },
+      "partition_count": 1,
+      "workers": ["worker"],
+      "routes": [],
+      "source": "Events",
+      "partitioning": "ByKey",
+      "sink": ["JsonLines", root + "/output-" + id + ".jsonl"],
+      "max_state_events": 128,
+    }
+    let path = root + "/definition-" + id + ".json"
+    @fs.write_file(path, definition.stringify())
+    let compiled = @shell.Cmd(driver_binary, [
+      "--command",
+      "compile",
+      "--job-config",
+      path,
+      "--submission-id",
+      "submit-" + id,
+    ]).output(timeout_ms=10000)
+    if compiled.exit_code() != 0 {
+      fail("compile " + id + ": " + compiled.stderr())
+    }
+    @fs.write_file(root + "/" + id + ".json", compiled.stdout())
+  }
+  let running : Set[Int] = Set([])
+  defer @async.protect_from_cancel(() => {
+    for pid in running {
+      ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+      ignore(@process.wait_pid(pid))
+    }
+  })
+  @async.with_timeout(duration_ms + 180000, () => {
+    let first_coordinator = start_coordinator(
+      coordinator_binary, root, data, control, 0,
+    )
+    running.add(first_coordinator)
+    let a = Remote::{ binary: driver_binary, root, id: "a", endpoint: control, }
+    let b = Remote::{ binary: driver_binary, root, id: "b", endpoint: control, }
+    ignore(a.command("submit"))
+    ignore(b.command("submit"))
+    let wa = start_worker(worker_binary, root, data, "a", 0)
+    running.add(wa)
+    let wb = start_worker(worker_binary, root, data, "b", 0)
+    running.add(wb)
+    assert_eq(a.command("input", events=[input(0L, 3L)]).accepted_events, 1L)
+    assert_eq(b.command("input", events=[input(0L, 7L)]).accepted_events, 1L)
+    wait_checkpoint(root, "a", 0L)
+    wait_checkpoint(root, "b", 0L)
+    assert_eq(a.command("cancel").phase, "Cancelled")
+    ignore(@async.with_timeout(10000, () => @process.wait_pid(wa)))
+    running.remove(wa)
+    assert_eq(b.command("status").phase, "Running")
+    assert_eq(b.command("input", events=[input(1L, 3L)]).accepted_events, 2L)
+    wait_checkpoint(root, "b", 1L)
+    ignore(@process.run("/bin/kill", ["-KILL", first_coordinator.to_string()]))
+    ignore(@process.wait_pid(first_coordinator))
+    running.remove(first_coordinator)
+    ignore(@async.with_timeout(10000, () => @process.wait_pid(wb)))
+    running.remove(wb)
+    let second_coordinator = start_coordinator(
+      coordinator_binary, root, data, control, 1,
+    )
+    running.add(second_coordinator)
+    assert_eq(a.command("status").phase, "Cancelled")
+    let restored = b.command("status")
+    assert_eq(restored.phase, "Running")
+    assert_eq(restored.accepted_events, 2L)
+    let wb = start_worker(worker_binary, root, data, "b", 1)
+    running.add(wb)
+    assert_eq(
+      b.command("input", events=[input(0L, 7L), input(1L, 3L), input(2L, 6L)]).accepted_events,
+      3L,
+    )
+    let c = Remote::{ binary: driver_binary, root, id: "c", endpoint: control, }
+    ignore(c.command("submit"))
+    let wc = start_worker(worker_binary, root, data, "c", 1)
+    running.add(wc)
+    assert_eq(c.command("input", events=[input(0L, 13L)]).accepted_events, 1L)
+    assert_eq(c.command("drain").phase, "Succeeded")
+    assert_eq(@process.wait_pid(wc), 0)
+    running.remove(wc)
+    assert_eq(b.command("drain").phase, "Succeeded")
+    assert_eq(@process.wait_pid(wb), 0)
+    running.remove(wb)
+    verify_output(root + "/output-a.jsonl", [3L])
+    verify_output(root + "/output-b.jsonl", [7L, 10L, 16L])
+    verify_output(root + "/output-c.jsonl", [13L])
+    let d = Remote::{ binary: driver_binary, root, id: "d", endpoint: control, }
+    ignore(d.command("submit"))
+    let wd = start_worker(worker_binary, root, data, "d", 1)
+    running.add(wd)
+    let started = @async.now()
+    let mut cycles = 0
+    let samples : Array[Json] = []
+    let mut last_generation = -1L
+    while cycles < 110 || @async.now() - started < duration_ms.to_int64() {
+      let cycle = cycles
+      let sent = @async.now()
+      let events = Array::makei(16, index => {
+        input((cycle * 16 + index).to_int64(), 1L)
+      })
+      let status = d.command("input", events~)
+      assert_eq(status.phase, "Running")
+      assert_eq(status.accepted_events, ((cycle + 1) * 16).to_int64())
+      let saved = wait_retired(root, ((cycle + 1) * 16).to_int64())
+      assert_true(saved.journal_generation > last_generation)
+      last_generation = saved.journal_generation
+      cycles += 1
+      if cycle % 20 == 0 || (duration_ms > 0 && cycle % 6 == 0) {
+        let memory = @shell.Cmd("ps", [
+            "-o",
+            "pid=,rss=,etime=",
+            "-p",
+            second_coordinator.to_string() + "," + wd.to_string(),
+          ])
+          .output()
+          .stdout()
+        let storage = @shell.Cmd("du", [
+            "-sb",
+            root + "/coordinator",
+            root + "/worker-d",
+          ])
+          .output()
+          .stdout()
+        samples.push({
+          "elapsed_ms": (@async.now() - started).to_string(),
+          "accepted_inputs": status.accepted_events.to_string(),
+          "checkpoint_generation": saved.journal_generation.to_string(),
+          "retained_from": saved.work_plans[0].retained_from
+          .unwrap_or(0L)
+          .to_string(),
+          "batch_through_checkpoint_ms": (@async.now() - sent).to_string(),
+          "process_rss_kib": memory,
+          "state_disk_bytes": storage,
+        })
+        @fs.write_file(
+          root + "/trajectory.json",
+          @json.to_json(samples).stringify(),
+          sync=@fs.Full,
+        )
+        @fs.write_file(
+          root + "/progress.json",
+          (
+            {
+              "state": "running",
+              "elapsed_ms": (@async.now() - started).to_string(),
+              "required_ms": duration_ms,
+              "completed_cycles": cycles,
+              "confirmed_inputs": status.accepted_events.to_string(),
+            } : Json).stringify(),
+          sync=@fs.Full,
+        )
+      }
+      if cycle % 20 == 0 {
+        println("Running checkpoint cycles: " + (cycle + 1).to_string())
+      }
+      if duration_ms > 0 {
+        @async.sleep(period_ms)
+      }
+    }
+    let base = (cycles * 16).to_int64()
+    // A stopped downstream process fills the retained input window. A second
+    // Driver command waits until the Worker resumes and a safe cut completes.
+    ignore(@process.run("/bin/kill", ["-STOP", wd.to_string()]))
+    assert_eq(
+      d.command(
+        "input",
+        events=Array::makei(16, index => input(base + index.to_int64(), 1L)),
+      ).accepted_events,
+      base + 16L,
+    )
+    @async.with_task_group <| group => {
+      let blocked = group.spawn() <| () => {
+        d.command(
+          "input",
+          events=Array::makei(16, index => {
+            input(base + 16L + index.to_int64(), 1L)
+          }),
+        )
+      }
+      @async.sleep(200)
+      assert_true(blocked.try_wait() is None)
+      ignore(@process.run("/bin/kill", ["-CONT", wd.to_string()]))
+      assert_eq(blocked.wait().accepted_events, base + 32L)
+    }
+    ignore(wait_retired(root, base + 32L))
+    let uninterrupted_ms = @async.now() - started
+    assert_true(uninterrupted_ms >= duration_ms.to_int64())
+    ignore(@process.run("/bin/kill", ["-KILL", second_coordinator.to_string()]))
+    ignore(@process.wait_pid(second_coordinator))
+    running.remove(second_coordinator)
+    ignore(@async.with_timeout(10000, () => @process.wait_pid(wd)))
+    running.remove(wd)
+    let third_coordinator = start_coordinator(
+      coordinator_binary, root, data, control, 2,
+    )
+    running.add(third_coordinator)
+    assert_eq(d.command("status").accepted_events, base + 32L)
+    let wd = start_worker(worker_binary, root, data, "d", 2)
+    running.add(wd)
+    assert_eq(
+      d.command("input", events=[
+        input(0L, 1L),
+        input(base + 31L, 1L),
+        input(base + 32L, 1L),
+      ]).accepted_events,
+      base + 33L,
+    )
+    assert_eq(d.command("drain").phase, "Succeeded")
+    assert_eq(@process.wait_pid(wd), 0)
+    running.remove(wd)
+    verify_output(
+      root + "/output-d.jsonl",
+      Array::makei((base + 33L).to_int(), index => (index + 1).to_int64()),
+    )
+    ignore(@process.run("/bin/kill", ["-TERM", third_coordinator.to_string()]))
+    assert_eq(@process.wait_pid(third_coordinator), -15)
+    running.remove(third_coordinator)
+    let report : Json = {
+      "jobs": 4,
+      "confirmed_inputs": (base + 38L).to_string(),
+      "confirmed_input_loss": 0,
+      "deduplicated_output_mismatches": 0,
+      "coordinator_restart": true,
+      "cancellation_isolation": true,
+      "post_terminal_submission": true,
+      "running_checkpoint_cycles_at_least": cycles,
+      "storage_budget_bytes": 65536,
+      "backpressure_resume": true,
+      "uninterrupted_running_ms": uninterrupted_ms.to_string(),
+      "passed_24_hours": uninterrupted_ms >= 86400000L,
+      "measured_events_per_second": (base + 32L).to_double() *
+      1000.0 /
+      uninterrupted_ms.to_double(),
+    }
+    @fs.write_file(root + "/result.json", report.stringify(), sync=@fs.Full)
+    @fs.write_file(root + "/progress.json", report.stringify(), sync=@fs.Full)
+    println(
+      "PASS: multi-job independent processes, restart, retry, cancellation isolation; confirmed loss=0; output mismatch=0",
+    )
+  }) catch {
+    error => fail(@debug.to_string(error))
+  }
+}

@@ -34,6 +34,22 @@ struct SourceEntry {
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
+/// A transportable copy of one durable source entry. The authority snapshot
+/// uses arrays instead of maps so its JSON representation is deterministic.
+pub(all) struct SourceLogEntrySnapshot {
+  partition : Int
+  offset : Int64
+  event : @protocol.EventRecord
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// The next logical offset of one source partition.
+pub(all) struct SourceLogOffsetSnapshot {
+  partition : Int
+  next_offset : Int64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
 /// A durable logical cut line for a compacted source partition. The digest
 /// keeps the full historical identity verifiable after the physical prefix is
 /// gone; retries below the cut line are rejected rather than silently
@@ -47,6 +63,28 @@ struct SourceRetentionMarker {
   event_count : Int
   event_digest : String
   event_hash : UInt64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// Retention metadata retained after a source prefix has been compacted.
+pub(all) struct SourceLogRetentionSnapshot {
+  partition : Int
+  retain_from : Int64
+  covered_to : Int64
+  event_count : Int
+  event_digest : String
+  event_hash : UInt64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// Complete logical SourceLog state, including retired identities and
+/// retention proofs. It is used by Coordinator authority replication.
+pub(all) struct SourceLogSnapshot {
+  version : Int
+  entries : Array[SourceLogEntrySnapshot]
+  offsets : Array[SourceLogOffsetSnapshot]
+  retention : Array[SourceLogRetentionSnapshot]
+  retired : Array[@causal.EventRange]
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -129,14 +167,21 @@ struct SourceLocation {
 }
 
 ///|
+struct SourceIdentityRetirement {
+  kind : String
+  ranges : Array[@causal.EventRange]
+} derive(ToJson, FromJson)
+
+///|
 /// Coordinator-side source-of-truth for input content and logical offsets.
 /// It complements CoordinatorStore, which journals assignment/send intent.
 pub struct SourceLog {
   wal : Wal
-  entries : Map[Int, Array[SourceEntry]]
-  locations : Map[@causal.EventId, SourceLocation]
-  next_offsets : Map[Int, Int64]
-  retention : Map[Int, SourceRetentionMarker]
+  mut entries : Map[Int, Array[SourceEntry]]
+  mut locations : Map[@causal.EventId, SourceLocation]
+  mut next_offsets : Map[Int, Int64]
+  mut retention : Map[Int, SourceRetentionMarker]
+  mut retired : Array[@causal.EventRange]
   maximum_entries : Int
   write_lock : @async.Mutex
 }
@@ -150,6 +195,8 @@ fn validate_source_event(
     event.parents(),
     event.key(),
     event.payload(),
+    event_time?=event.event_time(),
+    input_id?=Some(event.input_id()),
   ) catch {
     error => raise SourceLogError::Protocol(error)
   }
@@ -308,11 +355,23 @@ pub async fn SourceLog::open(
   let locations : Map[@causal.EventId, SourceLocation] = Map([])
   let next_offsets : Map[Int, Int64] = Map([])
   let retention : Map[Int, SourceRetentionMarker] = Map([])
+  let mut retired : Array[@causal.EventRange] = []
   for encoded in replay.records() {
     let text = @utf8.decode(encoded) catch {
       error => raise SourceLogError::Io(@debug.to_string(error))
     }
     let json = @json.parse(text) catch { _ => raise SourceLogError::Malformed }
+    if json is { "kind": "identities", .. } {
+      let identities : SourceIdentityRetirement = @json.from_json(json) catch {
+        _ => raise SourceLogError::Malformed
+      }
+      retired = @causal.CausalRetirement::new("source", identities.ranges)
+        .ranges()
+        .to_owned() catch {
+          _ => raise SourceLogError::Malformed
+        }
+      continue
+    }
     match source_marker_from_json(json) {
       Some(marker) => {
         if marker.covered_to < marker.retain_from {
@@ -358,6 +417,7 @@ pub async fn SourceLog::open(
     locations,
     next_offsets,
     retention,
+    retired,
     maximum_entries,
     write_lock: @async.Mutex::Mutex(),
   }
@@ -381,6 +441,177 @@ pub fn SourceLog::contains(self : SourceLog, id : @causal.EventId) -> Bool {
 ///|
 pub fn SourceLog::next_offset(self : SourceLog, partition : Int) -> Int64? {
   self.next_offsets.get(partition)
+}
+
+///|
+/// Export the complete logical source state. WAL file paths and locks are
+/// deliberately excluded; a recovering Coordinator installs this snapshot
+/// into its own local WAL.
+pub fn SourceLog::snapshot(self : SourceLog) -> SourceLogSnapshot {
+  let entries : Array[SourceLogEntrySnapshot] = []
+  for values in self.entries.values() {
+    for value in values {
+      entries.push({
+        partition: value.partition,
+        offset: value.offset,
+        event: value.event,
+      })
+    }
+  }
+  entries.sort_by((left, right) => {
+    (left.partition, left.offset).compare((right.partition, right.offset))
+  })
+  let offsets = self.next_offsets
+    .to_array()
+    .map(entry => {
+      let (partition, next_offset) = entry
+      { partition, next_offset, }
+    })
+  offsets.sort_by((left, right) => left.partition.compare(right.partition))
+  let retention = self.retention
+    .to_array()
+    .map(entry => {
+      let (partition, marker) = entry
+      SourceLogRetentionSnapshot::{
+        partition,
+        retain_from: marker.retain_from,
+        covered_to: marker.covered_to,
+        event_count: marker.event_count,
+        event_digest: marker.event_digest,
+        event_hash: marker.event_hash,
+      }
+    })
+  retention.sort_by((left, right) => left.partition.compare(right.partition))
+  { version: 1, entries, offsets, retention, retired: self.retired.copy(), }
+}
+
+///|
+/// Install a quorum-confirmed logical source snapshot in a local SourceLog.
+/// The replacement is rebuilt and atomically written as one WAL image, so a
+/// restart cannot observe a partially restored source prefix.
+pub async fn SourceLog::replace_snapshot(
+  self : SourceLog,
+  snapshot : SourceLogSnapshot,
+) -> Unit raise SourceLogError {
+  if snapshot.version != 1 {
+    raise SourceLogError::UnsupportedVersion(snapshot.version)
+  }
+  self.write_lock.acquire() catch {
+    error => raise SourceLogError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  let entries : Map[Int, Array[SourceEntry]] = Map([])
+  let locations : Map[@causal.EventId, SourceLocation] = Map([])
+  let offsets : Map[Int, Int64] = Map([])
+  let retention : Map[Int, SourceRetentionMarker] = Map([])
+  let sorted = snapshot.entries.copy()
+  sorted.sort_by((left, right) => {
+    (left.partition, left.offset).compare((right.partition, right.offset))
+  })
+  for item in sorted {
+    let entry = SourceEntry::{
+      version: 1,
+      partition: item.partition,
+      offset: item.offset,
+      event: item.event,
+    }
+    if locations.contains(item.event.id()) {
+      raise SourceLogError::Malformed
+    }
+    install_source_entry(entries, locations, offsets, entry)
+  }
+  for item in snapshot.retention {
+    let marker = SourceRetentionMarker::{
+      version: 1,
+      kind: "retention",
+      partition: item.partition,
+      retain_from: item.retain_from,
+      covered_to: item.covered_to,
+      event_count: item.event_count,
+      event_digest: item.event_digest,
+      event_hash: item.event_hash,
+    }
+    guard source_marker_from_json(@json.to_json(marker)) is Some(_) else {
+      raise SourceLogError::Malformed
+    }
+    if retention.contains(item.partition) {
+      raise SourceLogError::Malformed
+    }
+    retention[item.partition] = marker
+    if offsets.get(item.partition).unwrap_or(item.retain_from) < item.covered_to {
+      raise SourceLogError::Malformed
+    }
+    if offsets.get(item.partition).unwrap_or(0L) < item.covered_to {
+      offsets[item.partition] = item.covered_to
+    }
+  }
+  let declared : Set[Int] = Set([])
+  for item in snapshot.offsets {
+    if item.partition < 0 ||
+      item.next_offset < 0L ||
+      !declared.add_and_check(item.partition) ||
+      offsets.get(item.partition) != Some(item.next_offset) {
+      raise SourceLogError::Malformed
+    }
+  }
+  if declared.length() != offsets.length() {
+    raise SourceLogError::Malformed
+  }
+  if self.maximum_entries > 0 && locations.length() > self.maximum_entries {
+    raise SourceLogError::StateLimitExceeded(
+      limit=self.maximum_entries,
+      actual=locations.length(),
+    )
+  }
+  let retired = @causal.CausalRetirement::new("source", snapshot.retired)
+    .ranges()
+    .to_owned() catch {
+      _ => raise SourceLogError::Malformed
+    }
+  // Validate all physical entries against the declared retention boundary.
+  for partition, values in entries {
+    match retention.get(partition) {
+      Some(marker) =>
+        if values.any(value => value.offset < marker.retain_from) ||
+          (!values.is_empty() && values[0].offset != marker.retain_from) {
+          raise SourceLogError::Malformed
+        }
+      None => ()
+    }
+  }
+  if locations
+    .values()
+    .any(location => retired.any(range => range.contains(location.event.id()))) {
+    raise SourceLogError::Malformed
+  }
+  let payloads : Array[Bytes] = [
+    @utf8.encode(
+      @json.to_json(SourceIdentityRetirement::{
+        kind: "identities",
+        ranges: retired,
+      }).stringify(),
+    ),
+  ]
+  let marker_partitions = retention.keys().to_array()
+  marker_partitions.sort()
+  for partition in marker_partitions {
+    payloads.push(@utf8.encode(@json.to_json(retention[partition]).stringify()))
+  }
+  let partitions = entries.keys().to_array()
+  partitions.sort()
+  for partition in partitions {
+    for value in entries.get(partition).unwrap_or([]) {
+      payloads.push(@utf8.encode(@json.to_json(value).stringify()))
+    }
+  }
+  self.wal.rewrite(payloads[:]) catch {
+    error => raise SourceLogError::Wal(error)
+  }
+  self.entries = entries
+  self.locations = locations
+  self.next_offsets = offsets
+  self.retention = retention
+  self.retired = retired
 }
 
 ///|
@@ -469,6 +700,12 @@ pub async fn SourceLog::append(
     error => raise SourceLogError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  if self.retired.any(range => range.contains(event.id())) {
+    return self.retention
+      .get(partition)
+      .map(marker => marker.retain_from - 1L)
+      .unwrap_or(-1L)
+  }
   match self.locations.get(event.id()) {
     Some(previous) => {
       if previous.partition == partition && previous.event == event {
@@ -573,7 +810,33 @@ pub async fn SourceLog::compact(
   }
   let markers = self.retention.copy()
   markers[partition] = marker
-  let payloads : Array[Bytes] = []
+  let retired = self.retired.copy()
+  for entry in all {
+    if entry.offset < barrier.retain_from {
+      retired.push(
+        @causal.EventRange::new(
+          entry.event.id().origin(),
+          entry.event.id().sequence(),
+          entry.event.id().sequence(),
+        ) catch {
+          _ => raise SourceLogError::Malformed
+        },
+      )
+    }
+  }
+  let retired = @causal.CausalRetirement::new("source", retired)
+    .ranges()
+    .to_owned() catch {
+      _ => raise SourceLogError::Malformed
+    }
+  let payloads : Array[Bytes] = [
+    @utf8.encode(
+      @json.to_json(SourceIdentityRetirement::{
+        kind: "identities",
+        ranges: retired,
+      }).stringify(),
+    ),
+  ]
   let marker_partitions = markers.keys().to_array()
   marker_partitions.sort()
   for marker_partition in marker_partitions {
@@ -599,6 +862,7 @@ pub async fn SourceLog::compact(
   }
   self.entries[partition] = retained
   self.retention[partition] = marker
+  self.retired = retired
   let remove_ids = self.locations
     .to_array()
     .filter(item => {

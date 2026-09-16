@@ -6,6 +6,8 @@ pub(all) enum FrameKind {
   DriverCommand
   DriverStatus
   Welcome
+  WorkerAssignments
+  WorkerMigrationResult
   Assign
   Revoke
   Drain
@@ -14,6 +16,9 @@ pub(all) enum FrameKind {
   Resume
   EventBatch
   DeltaBatch
+  Watermark
+  Retire
+  RetireAck
   DeltaAck
   Credit
   AckReceived

@@ -184,84 +184,212 @@ fn load_wal_deltas(
 }
 
 ///|
-fn replay_wal_deltas(
-  records : Array[DeltaWalRecord],
-  delta_handler : (@protocol.DeltaBatch) -> Unit raise,
-) -> Int raise FrameIoError {
-  let mut replayed = 0
-  for record in records {
-    delta_handler(record.delta) catch {
-      error => raise FrameIoError::Handler(@debug.to_string(error))
-    }
-    replayed += 1
+/// Watermarks use a tagged record in the same WAL as source batches.  Keeping
+/// one sequence is necessary to preserve event/control ordering on replay.
+struct WatermarkWalRecord {
+  kind : String
+  watermark : @protocol.Watermark
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// The payload remains in the exchange WAL. This marker records its exact
+/// position relative to source batches and watermarks in the primary journal.
+struct DeltaOrderWalRecord {
+  kind : String
+  delta_id : String
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+enum WorkerWalRecord {
+  Checkpoint(WorkerJournalCheckpoint)
+  EmbeddedDelta(@protocol.DeltaBatch)
+  Batch(@protocol.EventBatch)
+  Watermark(@protocol.Watermark)
+  Delta(String)
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+fn decode_worker_record(encoded : Bytes) -> WorkerWalRecord raise FrameIoError {
+  let payload = @utf8.decode(encoded) catch {
+    error => raise FrameIoError::Io(@debug.to_string(error))
   }
-  replayed
+  let json = @json.parse(payload) catch {
+    _ => raise FrameIoError::Handler("WAL contains malformed JSON")
+  }
+  guard json is Object(fields) else {
+    raise FrameIoError::Handler("WAL record is not an object")
+  }
+  match fields.get("kind") {
+    Some(Json::String("checkpoint")) => {
+      let saved : WorkerJournalCheckpoint = @json.from_json(json) catch {
+        _ => raise FrameIoError::Handler("malformed journal checkpoint")
+      }
+      WorkerWalRecord::Checkpoint(saved)
+    }
+    Some(Json::String("exchange")) => {
+      let raw : EmbeddedDeltaRecord = @json.from_json(json) catch {
+        _ => raise FrameIoError::Handler("malformed journal exchange")
+      }
+      WorkerWalRecord::EmbeddedDelta(
+        @protocol.DeltaBatch::from_payload(raw.delta.to_payload()) catch {
+          error => raise FrameIoError::Message(error)
+        },
+      )
+    }
+    Some(Json::String("delta-order")) => {
+      let raw : DeltaOrderWalRecord = @json.from_json(json) catch {
+        _ => raise FrameIoError::Handler("WAL delta order marker is malformed")
+      }
+      if raw.delta_id.is_empty() {
+        raise FrameIoError::Handler("empty exchange journal identity")
+      }
+      WorkerWalRecord::Delta(raw.delta_id)
+    }
+    Some(Json::String("watermark")) => {
+      let raw : WatermarkWalRecord = @json.from_json(json) catch {
+        _ => raise FrameIoError::Handler("WAL watermark is malformed")
+      }
+      let watermark = @protocol.Watermark::from_payload(
+        raw.watermark.to_payload(),
+      ) catch {
+        error => raise FrameIoError::Message(error)
+      }
+      WorkerWalRecord::Watermark(watermark)
+    }
+    _ => WorkerWalRecord::Batch(decode_batch_payload(payload))
+  }
 }
 
 ///|
-fn load_wal_batches(
+fn encode_worker_record(record : WorkerWalRecord) -> Bytes {
+  @utf8.encode(
+    match record {
+      WorkerWalRecord::Checkpoint(saved) => @json.to_json(saved).stringify()
+      WorkerWalRecord::EmbeddedDelta(delta) =>
+        @json.to_json(EmbeddedDeltaRecord::{ kind: "exchange", delta, }).stringify()
+      WorkerWalRecord::Batch(batch) => batch.to_payload()
+      WorkerWalRecord::Delta(id) =>
+        @json.to_json(DeltaOrderWalRecord::{
+          kind: "delta-order",
+          delta_id: id,
+        }).stringify()
+      WorkerWalRecord::Watermark(watermark) =>
+        @json.to_json(WatermarkWalRecord::{ kind: "watermark", watermark, }).stringify()
+    },
+  )
+}
+
+///|
+fn load_wal_records(
   session : @protocol.WorkerSession,
   replay : WalReplay,
-) -> (Array[@protocol.EventBatch], Int64, Map[Int64, @protocol.EventBatch]) raise FrameIoError {
+) -> (Array[WorkerWalRecord], Int64, Map[Int64, @protocol.EventBatch]) raise FrameIoError {
   guard session.state().assignment() is Some(assignment) else {
     raise FrameIoError::MissingAssignment
   }
+  let records : Array[WorkerWalRecord] = []
+  let known : Map[Int64, @protocol.EventBatch] = Map([])
   let mut last_offset = assignment.next_offset() - 1L
-  let batches = []
-  let known_batches : Map[Int64, @protocol.EventBatch] = Map([])
+  let mut last_watermark = -1L
   for encoded in replay.records() {
-    let payload = @utf8.decode(encoded) catch {
-      error => raise FrameIoError::Io(@debug.to_string(error))
-    }
-    let batch = decode_batch_payload(payload)
-    if batch.partition() != assignment.partition() ||
-      batch.epoch() != assignment.epoch() {
-      raise FrameIoError::Handler(
-        "WAL batch does not match the active assignment",
-      )
-    }
-    if batch.first_offset() <= last_offset {
-      if batch.end_offset() <= last_offset {
-        match known_batches.get(batch.first_offset()) {
-          Some(previous) => {
-            if previous != batch {
-              raise FrameIoError::Handler("WAL contains conflicting batches")
-            }
-            continue
-          }
-          None =>
-            raise FrameIoError::Handler("WAL contains overlapping batches")
+    let record = decode_worker_record(encoded)
+    match record {
+      WorkerWalRecord::Checkpoint(saved) => {
+        if !records.is_empty() ||
+          saved.checkpoint.partition() != assignment.partition() ||
+          saved.checkpoint.epoch() != assignment.epoch() ||
+          saved.checkpoint.persisted_offset() < last_offset {
+          raise FrameIoError::Handler(
+            "journal checkpoint does not match assignment",
+          )
         }
+        last_offset = saved.checkpoint.persisted_offset()
+        last_watermark = saved.checkpoint.watermark()
       }
-      raise FrameIoError::Handler("WAL contains overlapping batches")
+      WorkerWalRecord::EmbeddedDelta(delta) =>
+        if delta.target_partition() != assignment.partition() ||
+          delta.target_epoch() != assignment.epoch() {
+          raise FrameIoError::Handler(
+            "journal exchange does not match assignment",
+          )
+        }
+      WorkerWalRecord::Delta(_) => ()
+      WorkerWalRecord::Watermark(watermark) => {
+        if watermark.partition() != assignment.partition() ||
+          watermark.epoch() != assignment.epoch() ||
+          watermark.timestamp() < last_watermark {
+          raise FrameIoError::Handler("WAL watermark is invalid or regresses")
+        }
+        last_watermark = watermark.timestamp()
+      }
+      WorkerWalRecord::Batch(batch) => {
+        if batch.partition() != assignment.partition() ||
+          batch.epoch() != assignment.epoch() {
+          raise FrameIoError::Handler("WAL batch does not match assignment")
+        }
+        if batch.first_offset() != last_offset + 1L {
+          raise FrameIoError::Handler("WAL contains a gap or overlap")
+        }
+        last_offset = batch.end_offset()
+        known[batch.first_offset()] = batch
+      }
     }
-    if last_offset == 9223372036854775807L ||
-      batch.first_offset() != last_offset + 1L {
-      raise FrameIoError::Handler("WAL contains a gap between batches")
-    }
-    batches.push(batch)
-    known_batches[batch.first_offset()] = batch
-    last_offset = batch.end_offset()
+    records.push(record)
   }
-  (batches, last_offset, known_batches)
+  (records, last_offset, known)
 }
 
 ///|
-/// Replay only after the complete WAL and checkpoint metadata have been
-/// validated. This prevents a bad manifest from triggering application side
-/// effects before the worker rejects the recovery attempt.
-fn replay_wal_batches(
-  batches : Array[@protocol.EventBatch],
+fn replay_wal_records(
+  records : Array[WorkerWalRecord],
   handler : (@protocol.EventBatch) -> Unit raise,
-) -> Int raise FrameIoError {
+  watermark_handler : ((Int64) -> Unit raise FrameIoError)?,
+  delta_handler : ((@protocol.DeltaBatch) -> Unit raise)?,
+  known_deltas : Map[String, @protocol.DeltaBatch],
+) -> (Int, Int) raise FrameIoError {
   let mut replayed = 0
-  for batch in batches {
-    handler(batch) catch {
-      error => raise FrameIoError::Handler(@debug.to_string(error))
+  let mut replayed_deltas = 0
+  for record in records {
+    match record {
+      WorkerWalRecord::Checkpoint(_) =>
+        raise FrameIoError::Handler("checkpoint must be restored before replay")
+      WorkerWalRecord::EmbeddedDelta(delta) => {
+        guard delta_handler is Some(callback) else {
+          raise FrameIoError::Handler("delta handler is not configured")
+        }
+        callback(delta) catch {
+          error => raise FrameIoError::Handler(@debug.to_string(error))
+        }
+        replayed_deltas += 1
+      }
+      WorkerWalRecord::Batch(batch) => {
+        handler(batch) catch {
+          error => raise FrameIoError::Handler(@debug.to_string(error))
+        }
+        replayed += 1
+      }
+      WorkerWalRecord::Watermark(watermark) =>
+        match watermark_handler {
+          None => ()
+          Some(callback) => callback(watermark.timestamp())
+        }
+      WorkerWalRecord::Delta(id) => {
+        guard known_deltas.get(id) is Some(delta) else {
+          raise FrameIoError::Handler(
+            "journal references missing exchange data",
+          )
+        }
+        guard delta_handler is Some(callback) else {
+          raise FrameIoError::Handler("delta handler is not configured")
+        }
+        callback(delta) catch {
+          error => raise FrameIoError::Handler(@debug.to_string(error))
+        }
+        replayed_deltas += 1
+      }
     }
-    replayed += 1
   }
-  replayed
+  (replayed, replayed_deltas)
 }
 
 ///|
@@ -275,7 +403,7 @@ fn validate_checkpoint(
   replay : WalReplay,
   delta_replay : WalReplay?,
   delta_wal_offset : Int64,
-  wal_batches : ArrayView[@protocol.EventBatch],
+  wal_records : ArrayView[WorkerWalRecord],
   delta_records : ArrayView[DeltaWalRecord],
   restored_offset : Int64,
   state_schema : String,
@@ -318,21 +446,44 @@ fn validate_checkpoint(
           )
       }
   }
-  if primary_count > wal_batches.length() ||
+  if primary_count > wal_records.length() ||
     delta_count > delta_records.length() {
     raise FrameIoError::Handler("checkpoint WAL prefix is inconsistent")
   }
   let checkpoint_log : @causal.CausalLog[Json] = @causal.CausalLog::new() catch {
     error => raise FrameIoError::Handler(@debug.to_string(error))
   }
-  for batch in wal_batches[0:primary_count] {
-    admit_causal_batch(checkpoint_log, batch)
+  let mut watermark = -1L
+  let mut ordered_deltas = 0
+  for record in wal_records[0:primary_count] {
+    match record {
+      WorkerWalRecord::Checkpoint(_) | WorkerWalRecord::EmbeddedDelta(_) =>
+        raise FrameIoError::Handler(
+          "journal checkpoint is authoritative after reclamation",
+        )
+      WorkerWalRecord::Batch(batch) => admit_causal_batch(checkpoint_log, batch)
+      WorkerWalRecord::Watermark(value) => watermark = value.timestamp()
+      WorkerWalRecord::Delta(id) => {
+        if ordered_deltas >= delta_count ||
+          delta_records[ordered_deltas].delta_id != id {
+          raise FrameIoError::Handler(
+            "checkpoint exchange journal prefix mismatch",
+          )
+        }
+        ordered_deltas += 1
+      }
+    }
   }
   for record in delta_records[0:delta_count] {
     admit_causal_delta(checkpoint_log, record.delta)
   }
   if checkpoint.frontier_digest() != frontier_digest(checkpoint_log.frontier()) {
     raise FrameIoError::Handler("checkpoint frontier digest mismatch")
+  }
+  if checkpoint.watermark() != watermark {
+    raise FrameIoError::Handler(
+      "checkpoint watermark does not match journal prefix",
+    )
   }
 }
 
@@ -349,6 +500,7 @@ async fn save_checkpoint(
   delta_wal_offset : Int64,
   state_schema : String,
   operator_state? : Json,
+  watermark? : Int64 = -1L,
 ) -> Unit raise FrameIoError {
   match checkpoint_path {
     None => ()
@@ -363,11 +515,17 @@ async fn save_checkpoint(
         delta_wal_offset~,
         state_schema~,
         operator_state?,
+        watermark?=if watermark < 0L { None } else { Some(watermark) },
       ) catch {
         error => raise FrameIoError::Checkpoint(error)
       }
       checkpoint.save(path) catch {
         error => raise FrameIoError::Checkpoint(error)
+      }
+      if applied_offset >= 0L {
+        @crash_boundary.hit("worker.checkpoint.saved", path) catch {
+          error => raise FrameIoError::Io(@debug.to_string(error))
+        }
       }
     }
   }
@@ -404,9 +562,15 @@ async fn send_worker_progress(
   applied_offset : Int64,
   frontier_digest : String,
   maximum_frame_bytes : Int,
+  watermark? : Int64,
 ) -> Unit raise FrameIoError {
   let progress = @protocol.Progress::new(
-    partition, epoch, persisted_offset, applied_offset, frontier_digest,
+    partition,
+    epoch,
+    persisted_offset,
+    applied_offset,
+    frontier_digest,
+    watermark?,
   ) catch {
     error => raise FrameIoError::Protocol(error)
   }
@@ -531,6 +695,7 @@ async fn run_worker_impl(
   assignment_validator? : (@protocol.Assignment) -> Unit raise FrameIoError,
   state_restore? : (Json, Int64, String) -> Unit raise FrameIoError,
   state_snapshot? : () -> Json raise FrameIoError,
+  watermark_handler? : (Int64) -> Unit raise FrameIoError,
   output_barrier? : async () -> Unit raise FrameIoError,
   requested_partition? : Int,
   state_schema? : String = "moonweave:transport:v1",
@@ -547,12 +712,17 @@ async fn run_worker_impl(
   ) raise FrameIoError,
   terminal_barrier? : async () -> Unit raise FrameIoError,
   auth_token? : String,
+  job_id? : String,
   storage_prepare? : async (@protocol.Assignment) -> (String, String?, String?) raise FrameIoError,
   storage_budget_bytes? : Int64,
   causal_state_limit? : Int = 0,
   primary_admission_validator? : (@protocol.EventBatch) -> Int raise FrameIoError,
   delta_admission_validator? : (@protocol.DeltaBatch) -> Int raise FrameIoError,
   operator_state_count? : () -> Int,
+  state_compact? : (@causal.CausalRetirement) -> Unit raise FrameIoError,
+  state_watermark? : () -> Int64,
+  reclamation_barrier? : async () -> Unit raise FrameIoError,
+  execution_lane? : ExecutionLane,
 ) -> WorkerRunSummary raise FrameIoError {
   if heartbeat_interval_ms < 0 {
     raise FrameIoError::Handler("heartbeat interval cannot be negative")
@@ -568,6 +738,7 @@ async fn run_worker_impl(
     maximum_frame_bytes~,
     requested_partition?,
     auth_token?,
+    job_id?,
   )
   guard session.state().assignment() is Some(assignment) else {
     raise FrameIoError::MissingAssignment
@@ -584,6 +755,29 @@ async fn run_worker_impl(
     None => (wal_path, checkpoint_path, delta_wal_path)
     Some(prepare) => prepare(assignment)
   }
+  let mut permit : ExecutionPermit? = None
+  let release = () => {
+    if permit is Some(held) {
+      held.release()
+      permit = None
+    }
+  }
+  defer release()
+  let acquire : async () -> Unit raise FrameIoError = () => {
+    if execution_lane is Some(lane) {
+      permit = Some(lane.acquire())
+    }
+  }
+  let flush_outputs : async () -> Unit raise FrameIoError = () => {
+    // A sibling shard may be needed to unblock downstream admission. The
+    // shard still has one owner while its slot is available to other shards.
+    release()
+    if output_barrier is Some(barrier) {
+      barrier()
+    }
+    acquire()
+  }
+  acquire()
   let (wal, replay) = Wal::open(wal_path, maximum_bytes?=storage_budget_bytes) catch {
     error => raise FrameIoError::Wal(error)
   }
@@ -608,24 +802,44 @@ async fn run_worker_impl(
     Some(value) => value.write_offset()
     None => 0L
   }
-  let checkpoint = match checkpoint_path {
-    None => None
-    Some(path) =>
+  let (wal_records, restored_offset, known_batches) = load_wal_records(
+    session, replay,
+  )
+  let journal_checkpoint = match wal_records.get(0) {
+    Some(WorkerWalRecord::Checkpoint(saved)) => Some(saved)
+    _ => None
+  }
+  // The embedded checkpoint supersedes sidecars with obsolete byte offsets.
+  let checkpoint = match (journal_checkpoint, checkpoint_path) {
+    (Some(_), _) | (_, None) => None
+    (_, Some(path)) =>
       Checkpoint::load(path) catch {
         error => raise FrameIoError::Checkpoint(error)
       }
   }
-  let causal_log : @causal.CausalLog[Json] = @causal.CausalLog::new() catch {
-    error => raise FrameIoError::Handler(@debug.to_string(error))
+  let mut causal_log : @causal.CausalLog[Json] = match journal_checkpoint {
+    Some(saved) => saved.validate(assignment, state_schema)
+    None =>
+      @causal.CausalLog::new() catch {
+        error => raise FrameIoError::Handler(@debug.to_string(error))
+      }
   }
-  let (wal_batches, restored_offset, known_batches) = load_wal_batches(
-    session, replay,
-  )
+  let mut recovered_watermark = -1L
+  for record in wal_records {
+    match record {
+      WorkerWalRecord::Checkpoint(saved) =>
+        recovered_watermark = saved.checkpoint.watermark()
+      WorkerWalRecord::EmbeddedDelta(_) => ()
+      WorkerWalRecord::Batch(_) | WorkerWalRecord::Delta(_) => ()
+      WorkerWalRecord::Watermark(value) =>
+        recovered_watermark = value.timestamp()
+    }
+  }
   let delta_records : Array[DeltaWalRecord] = []
   let known_deltas : Map[String, @protocol.DeltaBatch] = Map([])
-  match delta_replay {
-    None => ()
-    Some(delta_replay_value) => {
+  match (journal_checkpoint, delta_replay) {
+    (Some(_), _) | (_, None) => ()
+    (_, Some(delta_replay_value)) => {
       let (records, known) = load_wal_deltas(assignment, delta_replay_value)
       for record in records {
         delta_records.push(record)
@@ -636,8 +850,45 @@ async fn run_worker_impl(
       }
     }
   }
-  for batch in wal_batches {
-    admit_causal_batch(causal_log, batch)
+  // A crash may leave one durable exchange payload before its order marker.
+  // It is necessarily a tail record because the Worker processes frames
+  // serially and acknowledges only after writing the marker. Complete that
+  // append before replaying or announcing Resume.
+  let mut referenced_deltas = 0
+  for record in wal_records {
+    match record {
+      WorkerWalRecord::Delta(id) => {
+        if referenced_deltas >= delta_records.length() ||
+          delta_records[referenced_deltas].delta_id != id {
+          raise FrameIoError::Handler("exchange journal order mismatch")
+        }
+        referenced_deltas += 1
+      }
+      _ => ()
+    }
+  }
+  for record in delta_records[referenced_deltas:] {
+    let marker : DeltaOrderWalRecord = {
+      kind: "delta-order",
+      delta_id: record.delta_id,
+    }
+    ignore(
+      wal.append(@utf8.encode(@json.to_json(marker).stringify())) catch {
+        error => raise FrameIoError::Wal(error)
+      },
+    )
+    wal_records.push(WorkerWalRecord::Delta(record.delta_id))
+  }
+  for record in wal_records {
+    match record {
+      WorkerWalRecord::Batch(batch) => admit_causal_batch(causal_log, batch)
+      WorkerWalRecord::EmbeddedDelta(delta) => {
+        admit_causal_delta(causal_log, delta)
+        known_deltas[delta.delta_id()] = delta
+      }
+      WorkerWalRecord::Checkpoint(_) => ()
+      WorkerWalRecord::Watermark(_) | WorkerWalRecord::Delta(_) => ()
+    }
   }
   for record in delta_records {
     admit_causal_delta(causal_log, record.delta)
@@ -648,12 +899,26 @@ async fn run_worker_impl(
     None => ()
     Some(value) =>
       validate_checkpoint(
-        value, assignment, wal, replay, delta_replay, delta_wal_offset, wal_batches,
+        value, assignment, wal, replay, delta_replay, delta_wal_offset, wal_records,
         delta_records, restored_offset, state_schema,
       )
   }
-  let mut primary_replay_start = 0
-  let mut delta_replay_start = 0
+  let mut primary_replay_start = match journal_checkpoint {
+    None => 0
+    Some(saved) => {
+      guard state_restore is Some(restore) else {
+        raise FrameIoError::Handler(
+          "journal checkpoint requires an operator restorer",
+        )
+      }
+      restore(
+        saved.checkpoint.operator_state().unwrap(),
+        saved.checkpoint.persisted_offset(),
+        saved.checkpoint.frontier_digest(),
+      )
+      1
+    }
+  }
   match (checkpoint, state_restore) {
     (Some(saved), Some(restore)) =>
       match saved.operator_state() {
@@ -664,36 +929,22 @@ async fn run_worker_impl(
             _ =>
               raise FrameIoError::Handler("checkpoint is not on a WAL boundary")
           }
-          delta_replay_start = match delta_replay {
-            None => 0
-            Some(delta_replay_value) =>
-              delta_replay_value.record_count_before(saved.delta_wal_offset()) catch {
-                _ =>
-                  raise FrameIoError::Handler(
-                    "checkpoint is not on a Delta WAL boundary",
-                  )
-              }
-          }
         }
       }
     _ => ()
   }
-  let replayed_batches = replay_wal_batches(
-    wal_batches[primary_replay_start:].to_owned(),
+  let (replayed_batches, replayed_deltas) = replay_wal_records(
+    wal_records[primary_replay_start:].to_owned(),
     handler,
+    watermark_handler,
+    delta_handler,
+    known_deltas,
   )
-  let replayed_deltas = if delta_records.is_empty() {
-    0
-  } else {
-    match delta_handler {
-      None => raise FrameIoError::Handler("delta handler is not configured")
-      Some(callback) =>
-        replay_wal_deltas(
-          delta_records[delta_replay_start:].to_owned(),
-          callback,
-        )
-    }
+  session.restore_watermark(recovered_watermark) catch {
+    error => raise FrameIoError::Session(error)
   }
+  // Primary, exchange, and watermark records share a replay order. Restoring
+  // a checkpoint skips exactly the journal prefix represented in its state.
   check_causal_state_limit(
     causal_log,
     causal_state_limit,
@@ -702,10 +953,7 @@ async fn run_worker_impl(
       Some(count) => count()
     },
   )
-  match output_barrier {
-    None => ()
-    Some(barrier) => barrier()
-  }
+  flush_outputs()
   session.restore_progress(restored_offset, restored_offset, restored_offset) catch {
     error => raise FrameIoError::Session(error)
   }
@@ -718,11 +966,13 @@ async fn run_worker_impl(
     recovered_frontier_digest,
     delta_wal_offset,
     state_schema,
+    watermark=session.watermark(),
     operator_state?=match state_snapshot {
       None => None
       Some(snapshot) => Some(snapshot())
     },
   )
+  release()
   let resume_message = @protocol.Resume::new(
     assignment.partition(),
     assignment.epoch(),
@@ -763,7 +1013,60 @@ async fn run_worker_impl(
   }
   write_frame(connection, credit_frame, maximum_frame_bytes~)
   let mut live_batches = 0
+  let mut reclaimed_offset = journal_checkpoint
+    .map(saved => saved.checkpoint.persisted_offset())
+    .unwrap_or(-1L)
+  let mut journal_compacted = journal_checkpoint is Some(_)
+  let mut reported_watermark = -1L
   for ;; {
+    acquire()
+    defer release()
+    if state_watermark is Some(current) && current() > reported_watermark {
+      reported_watermark = current()
+      send_worker_progress(
+        connection,
+        outbound,
+        assignment.partition(),
+        assignment.epoch(),
+        session.last_persisted_offset(),
+        session.last_applied_offset(),
+        frontier_digest(causal_log.frontier()),
+        maximum_frame_bytes,
+        watermark=reported_watermark,
+      )
+    }
+    let operator_count = operator_state_count.map(count => count()).unwrap_or(0)
+    let compact_due = wal.stats().record_count() >= 16 ||
+      (
+        wal.stats().record_count() > 1 &&
+        causal_state_limit > 0 &&
+        causal_log.state_count() + operator_count > causal_state_limit / 2
+      ) ||
+      (
+        wal.stats().record_count() > 1 &&
+        wal.maximum_bytes() > 0L &&
+        wal.write_offset() > wal.maximum_bytes() / 2L
+      )
+    if compact_due {
+      match (state_compact, state_snapshot) {
+        (Some(compact), Some(snapshot)) => {
+          causal_log = reclaim_worker_journal(
+            wal, delta_wal, assignment, session, causal_log, state_schema, compact,
+            snapshot,
+          )
+          journal_compacted = true
+          reclaimed_offset = session.last_applied_offset()
+          known_batches.clear()
+          known_deltas.clear()
+          match reclamation_barrier {
+            None => ()
+            Some(barrier) => barrier()
+          }
+        }
+        _ => ()
+      }
+    }
+    release()
     let frame = match heartbeat_interval_ms {
       0 => read_frame(connection, maximum_frame_bytes~)
       interval => {
@@ -788,9 +1091,19 @@ async fn run_worker_impl(
         }
       }
     }
+    acquire()
     let batch = match frame.kind() {
       @protocol.FrameKind::EventBatch =>
         Some(decode_batch_payload(frame.payload()))
+      _ => None
+    }
+    let watermark = match frame.kind() {
+      @protocol.FrameKind::Watermark =>
+        Some(
+          @protocol.Watermark::from_payload(frame.payload()) catch {
+            error => raise FrameIoError::Message(error)
+          },
+        )
       _ => None
     }
     let delta = match frame.kind() {
@@ -813,6 +1126,7 @@ async fn run_worker_impl(
                   "resent batch conflicts with the recovered WAL",
                 )
               }
+            None if value.end_offset() <= reclaimed_offset => ()
             None =>
               raise FrameIoError::Handler(
                 "resent batch has no matching recovered WAL record",
@@ -839,9 +1153,14 @@ async fn run_worker_impl(
         }
       None => false
     }
+    let duplicate_watermark = match watermark {
+      None => false
+      Some(value) => value.timestamp() <= session.watermark()
+    }
     let duplicate = duplicate_by_id ||
       duplicate_by_range ||
-      duplicate_by_delta_wal
+      duplicate_by_delta_wal ||
+      duplicate_watermark
     // Reject a new batch before WorkerSession advances its receive cursor. A
     // budget refusal must be fully fail-closed: no WAL append, ACK, or cursor
     // movement is allowed for the refused input.
@@ -924,6 +1243,9 @@ async fn run_worker_impl(
               error => raise FrameIoError::Wal(error)
             },
           )
+          @crash_boundary.hit("worker.input.persisted", wal_path) catch {
+            error => raise FrameIoError::Io(@debug.to_string(error))
+          }
           known_batches[batch_value.first_offset()] = batch_value
           admit_causal_batch(causal_log, batch_value)
           session.mark_persisted(batch_value.end_offset()) catch {
@@ -940,23 +1262,10 @@ async fn run_worker_impl(
           handler(batch_value) catch {
             error => raise FrameIoError::Handler(@debug.to_string(error))
           }
-          match output_barrier {
-            None => ()
-            Some(barrier) => barrier()
-          }
+          flush_outputs()
           session.mark_applied(batch_value.end_offset()) catch {
             error => raise FrameIoError::Session(error)
           }
-          send_worker_progress(
-            connection,
-            outbound,
-            batch_value.partition(),
-            batch_value.epoch(),
-            session.last_persisted_offset(),
-            session.last_applied_offset(),
-            frontier_digest(causal_log.frontier()),
-            maximum_frame_bytes,
-          )
           save_checkpoint(
             checkpoint_path,
             assignment,
@@ -969,10 +1278,21 @@ async fn run_worker_impl(
               None => 0L
             },
             state_schema,
+            watermark=session.watermark(),
             operator_state?=match state_snapshot {
               None => None
               Some(snapshot) => Some(snapshot())
             },
+          )
+          send_worker_progress(
+            connection,
+            outbound,
+            batch_value.partition(),
+            batch_value.epoch(),
+            session.last_persisted_offset(),
+            session.last_applied_offset(),
+            frontier_digest(causal_log.frontier()),
+            maximum_frame_bytes,
           )
           send_worker_credit(
             connection,
@@ -1005,23 +1325,44 @@ async fn run_worker_impl(
           raise FrameIoError::Message(@protocol.MessageError::Malformed)
         }
         if !duplicate {
-          match delta_wal {
-            Some(wal) => {
-              let record = DeltaWalRecord::{
-                delta_id: delta_value.delta_id(),
-                delta: delta_value,
+          if journal_compacted {
+            ignore(
+              wal.append(
+                encode_worker_record(
+                  WorkerWalRecord::EmbeddedDelta(delta_value),
+                ),
+              ) catch {
+                error => raise FrameIoError::Wal(error)
+              },
+            )
+          } else {
+            match delta_wal {
+              Some(wal) => {
+                let record = DeltaWalRecord::{
+                  delta_id: delta_value.delta_id(),
+                  delta: delta_value,
+                }
+                let encoded = @utf8.encode(@json.to_json(record).stringify())
+                ignore(
+                  wal.append(encoded) catch {
+                    error => raise FrameIoError::Wal(error)
+                  },
+                )
               }
-              let encoded = @utf8.encode(@json.to_json(record).stringify())
-              ignore(
-                wal.append(encoded) catch {
-                  error => raise FrameIoError::Wal(error)
-                },
-              )
+              None =>
+                raise FrameIoError::Handler(
+                  "delta WAL is required before acknowledging exchange data",
+                )
             }
-            None =>
-              raise FrameIoError::Handler(
-                "delta WAL is required before acknowledging exchange data",
-              )
+            let marker : DeltaOrderWalRecord = {
+              kind: "delta-order",
+              delta_id: delta_value.delta_id(),
+            }
+            ignore(
+              wal.append(@utf8.encode(@json.to_json(marker).stringify())) catch {
+                error => raise FrameIoError::Wal(error)
+              },
+            )
           }
           known_deltas[delta_value.delta_id()] = delta_value
           admit_causal_delta(causal_log, delta_value)
@@ -1033,10 +1374,7 @@ async fn run_worker_impl(
                 error => raise FrameIoError::Handler(@debug.to_string(error))
               }
           }
-          match output_barrier {
-            None => ()
-            Some(barrier) => barrier()
-          }
+          flush_outputs()
           save_checkpoint(
             checkpoint_path,
             assignment,
@@ -1049,6 +1387,7 @@ async fn run_worker_impl(
               None => 0L
             },
             state_schema,
+            watermark=session.watermark(),
             operator_state?=match state_snapshot {
               None => None
               Some(snapshot) => Some(snapshot())
@@ -1075,14 +1414,152 @@ async fn run_worker_impl(
           )
         }
       }
+      @protocol.FrameKind::Retire => {
+        let request = @protocol.Retire::from_payload(frame.payload()) catch {
+          error => raise FrameIoError::Message(error)
+        }
+        match (state_compact, state_snapshot) {
+          (Some(compact), Some(snapshot)) => {
+            causal_log = reclaim_worker_journal(
+              wal,
+              delta_wal,
+              assignment,
+              session,
+              causal_log,
+              state_schema,
+              compact,
+              snapshot,
+              global_certificate=request.certificate,
+            )
+            journal_compacted = true
+            reclaimed_offset = session.last_applied_offset()
+            known_batches.clear()
+            known_deltas.clear()
+            match reclamation_barrier {
+              None => ()
+              Some(barrier) => barrier()
+            }
+          }
+          _ => ()
+        }
+        let ack : @protocol.RetireAck = {
+          partition: request.partition,
+          epoch: request.epoch,
+          offset: request.offset,
+          checkpoint_id: request.certificate.checkpoint_id(),
+        }
+        let reply = outbound.build(
+          @protocol.FrameKind::RetireAck,
+          ack.to_payload(),
+        ) catch {
+          error => raise FrameIoError::Protocol(error)
+        }
+        write_frame(connection, reply, maximum_frame_bytes~)
+      }
+      @protocol.FrameKind::Watermark => {
+        guard watermark is Some(value) else {
+          raise FrameIoError::Message(@protocol.MessageError::Malformed)
+        }
+        if !duplicate {
+          let record = WatermarkWalRecord::{
+            kind: "watermark",
+            watermark: value,
+          }
+          ignore(
+            wal.append(@utf8.encode(@json.to_json(record).stringify())) catch {
+              error => raise FrameIoError::Wal(error)
+            },
+          )
+        }
+        if !duplicate {
+          match watermark_handler {
+            None => ()
+            Some(handler) => handler(value.timestamp())
+          }
+          flush_outputs()
+          save_checkpoint(
+            checkpoint_path,
+            assignment,
+            wal.write_offset(),
+            session.last_persisted_offset(),
+            session.last_applied_offset(),
+            frontier_digest(causal_log.frontier()),
+            match delta_wal {
+              Some(value) => value.write_offset()
+              None => 0L
+            },
+            state_schema,
+            watermark=session.watermark(),
+            operator_state?=match state_snapshot {
+              None => None
+              Some(snapshot) => Some(snapshot())
+            },
+          )
+        }
+        if state_watermark is Some(current) && current() >= 0L {
+          reported_watermark = current()
+          send_worker_progress(
+            connection,
+            outbound,
+            assignment.partition(),
+            assignment.epoch(),
+            session.last_persisted_offset(),
+            session.last_applied_offset(),
+            frontier_digest(causal_log.frontier()),
+            maximum_frame_bytes,
+            watermark=reported_watermark,
+          )
+        }
+      }
       @protocol.FrameKind::Seal => ()
       @protocol.FrameKind::DrainRequest => {
-        match output_barrier {
-          None => ()
-          Some(barrier) => barrier()
-        }
         let pending_events = causal_log.pending_count()
         if pending_events == 0 {
+          match watermark_handler {
+            None => ()
+            Some(handler) => {
+              if session.watermark() < 9223372036854775807L {
+                let record = WatermarkWalRecord::{
+                  kind: "watermark",
+                  watermark: @protocol.Watermark::new(
+                    assignment.partition(),
+                    assignment.epoch(),
+                    9223372036854775807L,
+                  ) catch {
+                    error => raise FrameIoError::Protocol(error)
+                  },
+                }
+                ignore(
+                  wal.append(@utf8.encode(@json.to_json(record).stringify())) catch {
+                    error => raise FrameIoError::Wal(error)
+                  },
+                )
+                session.restore_watermark(9223372036854775807L) catch {
+                  error => raise FrameIoError::Session(error)
+                }
+              }
+              handler(9223372036854775807L)
+            }
+          }
+          flush_outputs()
+          save_checkpoint(
+            checkpoint_path,
+            assignment,
+            wal.write_offset(),
+            session.last_persisted_offset(),
+            session.last_applied_offset(),
+            frontier_digest(causal_log.frontier()),
+            match delta_wal {
+              Some(value) => value.write_offset()
+              None => 0L
+            },
+            state_schema,
+            watermark=session.watermark(),
+            operator_state?=match state_snapshot {
+              None => None
+              Some(snapshot) => Some(snapshot())
+            },
+          )
           match drain_handler {
             None => ()
             Some(finish) => finish()

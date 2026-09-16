@@ -200,6 +200,19 @@ fn apply_journal_entry(
           error => raise CoordinatorStoreError::Coordinator(error)
         },
       )
+    "move" => {
+      let incarnation = decode_incarnation(entry.incarnation)
+      ignore(
+        state.move_partition(
+          entry.partition,
+          entry.worker_id,
+          incarnation,
+          entry.replacement_worker_id,
+        ) catch {
+          error => raise CoordinatorStoreError::Coordinator(error)
+        },
+      )
+    }
     "recover" => {
       let incarnation = decode_incarnation(entry.incarnation)
       ignore(
@@ -682,7 +695,13 @@ pub async fn CoordinatorStore::checkpoint_and_compact(
   ) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
+  @crash_boundary.hit("coordinator.checkpoint.staged", self.checkpoint_path) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
   @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  @crash_boundary.hit("coordinator.checkpoint.published", self.checkpoint_path) catch {
     error => raise CoordinatorStoreError::Io(@debug.to_string(error))
   }
   self.journal.rewrite([marker]) catch {
@@ -907,6 +926,45 @@ pub async fn CoordinatorStore::reassign(
   self.append_entry(entry)
   ignore(
     self.state.reassign(partition, worker_id, start_offset~) catch {
+      error => raise CoordinatorStoreError::Coordinator(error)
+    },
+  )
+  assignment
+}
+
+///|
+/// Move a live partition with a fresh fencing epoch. State transfer must be
+/// completed by the caller before the replacement session is admitted.
+pub async fn CoordinatorStore::move_partition(
+  self : CoordinatorStore,
+  partition : Int,
+  source_worker_id : String,
+  source_incarnation : @protocol.Incarnation,
+  replacement_worker_id : String,
+) -> @control.PartitionAssignment raise CoordinatorStoreError {
+  self.write_lock.acquire() catch {
+    error => raise CoordinatorStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  let preview = self.preview_state()
+  let assignment = preview.move_partition(
+    partition, source_worker_id, source_incarnation, replacement_worker_id,
+  ) catch {
+    error => raise CoordinatorStoreError::Coordinator(error)
+  }
+  let entry = empty_entry("move")
+  entry.partition = partition
+  entry.worker_id = source_worker_id
+  entry.incarnation = source_incarnation.value()
+  entry.replacement_worker_id = replacement_worker_id
+  self.append_entry(entry)
+  ignore(
+    self.state.move_partition(
+      partition,
+      entry.worker_id,
+      source_incarnation,
+      entry.replacement_worker_id,
+    ) catch {
       error => raise CoordinatorStoreError::Coordinator(error)
     },
   )

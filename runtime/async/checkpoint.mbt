@@ -20,6 +20,7 @@ pub(all) struct Checkpoint {
   frontier_digest : String
   state_schema : String
   operator_state : Json?
+  watermark : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -33,6 +34,7 @@ pub fn Checkpoint::new(
   delta_wal_offset? : Int64 = 0L,
   state_schema~ : String,
   operator_state? : Json,
+  watermark? : Int64,
 ) -> Checkpoint raise CheckpointError {
   if partition < 0 ||
     epoch < 0 ||
@@ -41,6 +43,7 @@ pub fn Checkpoint::new(
     persisted_offset < -1L ||
     applied_offset < -1L ||
     applied_offset > persisted_offset ||
+    watermark.unwrap_or(-1L) < -1L ||
     frontier_digest.is_empty() ||
     state_schema.is_empty() {
     raise CheckpointError::InvalidField
@@ -55,6 +58,7 @@ pub fn Checkpoint::new(
     frontier_digest,
     state_schema,
     operator_state,
+    watermark,
   }
 }
 
@@ -104,6 +108,11 @@ pub fn Checkpoint::operator_state(self : Checkpoint) -> Json? {
 }
 
 ///|
+pub fn Checkpoint::watermark(self : Checkpoint) -> Int64 {
+  self.watermark.unwrap_or(-1L)
+}
+
+///|
 fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
   Checkpoint::new(
     self.partition,
@@ -115,6 +124,7 @@ fn Checkpoint::validate(self : Checkpoint) -> Checkpoint raise CheckpointError {
     delta_wal_offset=self.delta_wal_offset,
     state_schema=self.state_schema,
     operator_state?=self.operator_state,
+    watermark?=self.watermark,
   )
 }
 

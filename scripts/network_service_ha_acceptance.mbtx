@@ -1,0 +1,580 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/async/io",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+}
+
+///|
+struct Status {
+  job_id : String
+  phase : String
+  accepted_events : Int64
+} derive(FromJson)
+
+///|
+struct Sum {
+  key : String
+  total : Int64
+} derive(Debug, Eq, FromJson)
+
+///|
+enum Output {
+  KeyedSum(Sum)
+} derive(Debug, Eq, FromJson)
+
+///|
+struct OutputRecord {
+  task_id : String
+  sequence : Int64
+  output : Output
+} derive(FromJson)
+
+///|
+struct NetworkGate {
+  server : @socket.TcpServer
+  target : String
+  mut enabled : Bool
+  mut next_connection : Int
+  connections : Map[Int, (@socket.Tcp, @socket.Tcp)]
+}
+
+///|
+fn NetworkGate::set_enabled(self : NetworkGate, enabled : Bool) -> Unit {
+  self.enabled = enabled
+  if !enabled {
+    for (source, target) in self.connections.values() {
+      source.close()
+      target.close()
+    }
+  }
+}
+
+///|
+async fn NetworkGate::serve(self : NetworkGate) -> Unit {
+  self.server.run_forever(allow_failure=true, max_connections=128) <| ((
+    source,
+    _,
+  ) => {
+    defer source.close()
+    if !self.enabled {
+      return
+    }
+    let target = @socket.Tcp::connect(@socket.Addr::parse(self.target))
+    defer target.close()
+    if !self.enabled {
+      return
+    }
+    self.next_connection += 1
+    let id = self.next_connection
+    self.connections[id] = (source, target)
+    defer self.connections.remove(id)
+    @async.with_task_group <| group => {
+      group.spawn_bg(no_wait=true) <| () => {
+        defer {
+          source.close()
+          target.close()
+        }
+        while self.enabled {
+          guard @io.Reader::read_some(source, max_len=65536) is Some(bytes) else {
+            return
+          }
+          @io.Writer::write(target, bytes)
+        }
+      }
+      while self.enabled {
+        guard @io.Reader::read_some(target, max_len=65536) is Some(bytes) else {
+          return
+        }
+        @io.Writer::write(source, bytes)
+      }
+    }
+  })
+}
+
+///|
+fn input(sequence : Int64, value : Int64) -> Json {
+  {
+    "record": {
+      "id": { "origin": "ha-input", "sequence": sequence.to_string() },
+      "parents": [],
+      "key": "store",
+      "payload": { "value": value.to_string() },
+    },
+  }
+}
+
+///|
+struct Remote {
+  binary : String
+  job_config : String
+  seeds : String
+  id : String
+}
+
+///|
+fn forget_pid(live : Array[Int], pid : Int) -> Unit {
+  match live.search_by(value => value == pid) {
+    Some(index) => ignore(live.remove(index))
+    None => ()
+  }
+}
+
+///|
+async fn signal_and_wait(pid : Int, signal : String) -> Unit {
+  // A coordinator may exit as a consequence of a completed drain before the
+  // cleanup pass reaches it. Only attach a wait handle when kill found a live
+  // process; wait_pid cannot open a handle for an already reaped PID.
+  let status = @process.run("/bin/kill", [signal, pid.to_string()])
+  if status == 0 {
+    ignore(@process.wait_pid(pid) catch { _ => 0 })
+  }
+}
+
+///|
+async fn Remote::command(
+  self : Remote,
+  command : String,
+  events? : Array[Json],
+) -> Status {
+  let args = [
+    "--endpoint",
+    self.seeds.split(",").to_array()[0].to_owned(),
+    "--coordinator-endpoints",
+    self.seeds,
+    "--cluster",
+    "service-ha",
+    "--coordinator",
+    "coordinator",
+    "--job-config",
+    self.job_config,
+    "--command",
+    command,
+    "--format",
+    "json",
+  ]
+  if events is Some(values) {
+    let path = self.job_config + ".events.json"
+    @fs.write_file(path, @json.to_json(values).stringify())
+    args.push_iter(["--events", path].iter())
+  }
+  let output = @shell.Cmd(self.binary, args).output(timeout_ms=30000)
+  if output.exit_code() != 0 {
+    println(
+      "COMMAND FAILED " +
+      command +
+      " STDERR=" +
+      output.stderr() +
+      " STDOUT=" +
+      output.stdout(),
+    )
+    fail(command + " " + self.id + ": " + output.stderr() + output.stdout())
+  }
+  let status : Status = @json.from_json(@json.parse(output.stdout()))
+  assert_eq(status.job_id, self.id)
+  status
+}
+
+///|
+async fn wait_port(endpoint : String) -> Unit {
+  @async.with_timeout(15000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(20)
+      } noraise {
+        connection => {
+          connection.close()
+          return
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn start_coordinator(
+  binary : String,
+  root : String,
+  node : String,
+  data : String,
+  driver : String,
+  ha : String,
+  ha_bind : String,
+  storage : String,
+  round : Int,
+) -> Int {
+  let log = @process.redirect_to_file(
+    root + "/" + node + "-" + round.to_string() + ".log",
+  )
+  defer log.close()
+  let pid = @process.spawn_orphan(
+    binary,
+    [
+      "--cluster", "service-ha", "--coordinator", "coordinator", "--bind", data,
+      "--advertise", data, "--driver-bind", driver, "--driver-advertise", driver,
+      "--storage", storage, "--workers", "worker@boot-worker", "--ha-node", node,
+      "--ha-nodes", ha, "--ha-bind", ha_bind,
+    ],
+    stdout=log,
+    stderr=log,
+  )
+  wait_port(driver)
+  pid
+}
+
+///|
+async fn start_worker(
+  binary : String,
+  root : String,
+  seeds : String,
+  config : String,
+  round : Int,
+) -> Int {
+  let log = @process.redirect_to_file(
+    root + "/worker-" + round.to_string() + ".log",
+  )
+  defer log.close()
+  let pid = @process.spawn_orphan(
+    binary,
+    [
+      "--cluster",
+      "service-ha",
+      "--coordinator",
+      "coordinator",
+      "--coordinator-endpoint",
+      seeds.split(",").to_array()[0].to_owned(),
+      "--coordinator-endpoints",
+      seeds,
+      "--worker",
+      "worker",
+      "--incarnation",
+      "boot-worker",
+      "--storage",
+      root + "/worker",
+      "--job-config",
+      config,
+      "--storage-budget-bytes",
+      "65536",
+    ],
+    stdout=log,
+    stderr=log,
+  )
+  pid
+}
+
+///|
+async fn wait_output(path : String, expected : Array[Int64]) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        let values : Array[Int64] = []
+        let known : Map[(String, Int64), Output] = Map([])
+        let snapshot = {
+          let lock = @fs.open(
+            path + ".lock",
+            mode=@fs.ReadWrite,
+            create_mode=@fs.OpenOrCreate,
+          )
+          defer lock.close()
+          lock.lock(@fs.Shared)
+          defer lock.unlock()
+          @fs.read_file(path).text()
+        }
+        for line in snapshot.split("\n") {
+          if line.trim().is_empty() {
+            continue
+          }
+          let value : Json = @json.parse(line)
+          let record : OutputRecord = @json.from_json(value)
+          let key = (record.task_id, record.sequence)
+          if known.get(key) is Some(previous) {
+            assert_eq(previous, record.output)
+            continue
+          }
+          known[key] = record.output
+          let KeyedSum(sum) = record.output
+          values.push(sum.total)
+        }
+        if values == expected {
+          return
+        }
+      }
+      @async.sleep(25)
+    }
+  })
+}
+
+///|
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-service-ha-")
+  println("Network service HA evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+    "--warn-list", "-a",
+  ]).run(timeout_ms=180000)
+  let coordinator_binary = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/coordinator/coordinator.exe",
+  )
+  let worker_binary = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/worker/worker.exe",
+  )
+  let driver_binary = @fs.realpath(
+    "_build/native/debug/build/moonweave/moonweave/cmd/driver/driver.exe",
+  )
+  let d0 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let d1 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let d2 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let c0 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let c1 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let c2 = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let driver0 = "127.0.0.1:" + d0.addr.port().to_string()
+  let driver1 = "127.0.0.1:" + d1.addr.port().to_string()
+  let driver2 = "127.0.0.1:" + d2.addr.port().to_string()
+  let data0 = "127.0.0.1:" + c0.addr.port().to_string()
+  let data1 = "127.0.0.1:" + c1.addr.port().to_string()
+  let data2 = "127.0.0.1:" + c2.addr.port().to_string()
+  d0.close()
+  d1.close()
+  d2.close()
+  c0.close()
+  c1.close()
+  c2.close()
+  let ha_ports = []
+  for _ in 0..<3 {
+    ha_ports.push(@socket.TcpServer(@socket.Addr::parse("127.0.0.1:0")))
+  }
+  let ha_binds = ha_ports.map(server => {
+    "127.0.0.1:" + server.addr.port().to_string()
+  })
+  for server in ha_ports {
+    server.close()
+  }
+  let gates : Map[(Int, Int), NetworkGate] = Map([])
+  for source in 0..<3 {
+    for target in 0..<3 {
+      if source != target {
+        gates[(source, target)] = {
+          server: @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0")),
+          target: ha_binds[target],
+          enabled: true,
+          next_connection: 0,
+          connections: Map([]),
+        }
+      }
+    }
+  }
+  let topologies = Array::makei(3, source => {
+    Array::makei(3, target => {
+      let endpoint = if source == target {
+        ha_binds[target]
+      } else {
+        "127.0.0.1:" + gates[(source, target)].server.addr.port().to_string()
+      }
+      "node-" +
+      target.to_string() +
+      "@" +
+      endpoint +
+      "@" +
+      root +
+      "/n" +
+      target.to_string()
+    }).join(",")
+  })
+  let seeds = data0 + "," + data1 + "," + data2
+  let driver_seeds = driver0 + "," + driver1 + "," + driver2
+  let definition : Json = {
+    "job_id": "service-ha-job",
+    "operator": { "id": "keyed-sum", "version": 1 },
+    "partition_count": 1,
+    "workers": ["worker"],
+    "routes": [],
+    "source": "Events",
+    "partitioning": "ByKey",
+    "sink": ["JsonLines", root + "/output.jsonl"],
+    "max_state_events": 128,
+  }
+  let definition_path = root + "/definition.json"
+  @fs.write_file(definition_path, definition.stringify())
+  let compiled = @shell.Cmd(driver_binary, [
+    "--command", "compile", "--job-config", definition_path, "--submission-id", "service-ha-submit",
+  ]).output(timeout_ms=10000)
+  if compiled.exit_code() != 0 {
+    fail("compile job: " + compiled.stderr())
+  }
+  let job_config = root + "/job.json"
+  @fs.write_file(job_config, compiled.stdout())
+  let live : Array[Int] = []
+  @async.with_task_group <| group => {
+    for gate in gates.values() {
+      group.spawn_bg(no_wait=true) <| () => { gate.serve() }
+    }
+    defer (for gate in gates.values() {
+      gate.server.close()
+      gate.set_enabled(false)
+    })
+    let node0 = start_coordinator(
+      coordinator_binary,
+      root,
+      "node-0",
+      data0,
+      driver0,
+      topologies[0],
+      ha_binds[0],
+      root + "/n0",
+      0,
+    )
+    live.push(node0)
+    let node1 = start_coordinator(
+      coordinator_binary,
+      root,
+      "node-1",
+      data1,
+      driver1,
+      topologies[1],
+      ha_binds[1],
+      root + "/n1",
+      0,
+    )
+    live.push(node1)
+    let node2 = start_coordinator(
+      coordinator_binary,
+      root,
+      "node-2",
+      data2,
+      driver2,
+      topologies[2],
+      ha_binds[2],
+      root + "/n2",
+      0,
+    )
+    live.push(node2)
+    // Let all three HA listeners observe one another before the first durable
+    // Driver operation. The client still retries transient quorum loss, but the
+    // fixture should exercise the steady service path after election.
+    @async.sleep(2000)
+    defer (@async.protect_from_cancel(() => {
+      for pid in live {
+        signal_and_wait(pid, "-KILL")
+      }
+    }) catch {
+      _ => ()
+    })
+    let remote = Remote::{
+      binary: driver_binary,
+      job_config,
+      seeds: driver_seeds,
+      id: "service-ha-job",
+    }
+    ignore(remote.command("submit"))
+    println("HA service submitted")
+    let worker = start_worker(worker_binary, root, seeds, job_config, 0)
+    live.push(worker)
+    assert_eq(
+      remote.command("input", events=[input(0L, 7L)]).accepted_events,
+      1L,
+    )
+    wait_output(root + "/output.jsonl", [7L])
+    println("HA service first output")
+    let prefix = Array::makei(33, index => 7L + index.to_int64())
+    assert_eq(
+      remote.command(
+        "input",
+        events=Array::makei(32, index => input(index.to_int64() + 1L, 1L)),
+      ).accepted_events,
+      33L,
+    )
+    wait_output(root + "/output.jsonl", prefix)
+    println("HA service confirmed 33 inputs before partition")
+    @async.sleep(1000)
+    // Cut both directions of the old leader's quorum links while its Driver
+    // and Worker ports remain reachable. This is a network partition, with no
+    // process pause or shared authority filesystem standing in for isolation.
+    for (source, target), gate in gates {
+      if source == 0 || target == 0 {
+        gate.set_enabled(false)
+      }
+    }
+    @async.sleep(2000)
+    @fs.write_file(
+      root + "/minority-input.json",
+      @json.to_json([input(33L, 500L)]).stringify(),
+    )
+    let minority = @shell.Cmd(driver_binary, [
+      "--endpoint",
+      driver0,
+      "--cluster",
+      "service-ha",
+      "--coordinator",
+      "coordinator",
+      "--job-config",
+      job_config,
+      "--command",
+      "input",
+      "--events",
+      root + "/minority-input.json",
+      "--format",
+      "json",
+    ]).output(timeout_ms=15000)
+    assert_true(minority.exit_code() != 0)
+    println("HA service isolated leader rejected the minority write")
+    assert_eq(
+      remote.command("input", events=[input(33L, 2L)]).accepted_events,
+      34L,
+    )
+    wait_output(root + "/output.jsonl", prefix + [41L])
+    println("HA service majority continued processing during partition")
+    for gate in gates.values() {
+      gate.set_enabled(true)
+    }
+    @async.sleep(2000)
+    assert_eq(remote.command("status").accepted_events, 34L)
+    // node-1 led the surviving majority. Remove that process and all its local
+    // files after node-0 rejoins; the next majority must retain the new input.
+    signal_and_wait(node1, "-KILL")
+    forget_pid(live, node1)
+    // The surviving nodes must restore exclusively from their own quorum WALs.
+    @fs.rmdir(root + "/n1", recursive=true)
+    @async.sleep(1000)
+    assert_eq(remote.command("status").accepted_events, 34L)
+    assert_eq(
+      remote.command("input", events=[input(0L, 7L)]).accepted_events,
+      34L,
+    )
+    assert_eq(
+      remote.command("input", events=[input(34L, 9L)]).accepted_events,
+      35L,
+    )
+    println("HA service accepted second input after disk loss")
+    assert_eq(remote.command("drain").phase, "Succeeded")
+    ignore(@process.wait_pid(worker) catch { _ => 0 })
+    forget_pid(live, worker)
+    wait_output(root + "/output.jsonl", prefix + [41L, 50L])
+    @fs.write_file(
+      root + "/result.json",
+      (
+        {
+          "confirmed_inputs": 35,
+          "failover": true,
+          "leader_storage_deleted": true,
+          "network_partition_and_recovery": true,
+          "minority_rejected": true,
+          "retired_input_retry": true,
+          "confirmed_input_loss": 0,
+          "output_mismatch": 0,
+        } : Json).stringify(),
+      sync=@fs.Full,
+    )
+    for pid in live {
+      signal_and_wait(pid, "-TERM")
+    }
+    live.clear()
+    println(
+      "PASS: real CoordinatorService HA failover restored Driver state and Worker processing",
+    )
+  }
+}

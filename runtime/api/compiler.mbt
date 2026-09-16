@@ -7,6 +7,7 @@ pub struct CompiledJob {
   spec : @plan.JobSpec
   descriptor : OperatorDescriptor
   plan_digest : String
+  graph_stages : Array[(String, CompiledJob)]
 }
 
 ///|
@@ -30,6 +31,35 @@ fn validate_source(source : SourceSpec) -> Unit raise ApiError {
       raise ApiError::Source("source path is required")
     SourceSpec::JsonLines(_) => ()
     SourceSpec::Kafka(spec) => spec.validate()
+    SourceSpec::Inputs(inputs) => {
+      if inputs.is_empty() {
+        raise ApiError::Source("at least one input is required")
+      }
+      let seen : Set[String] = Set([])
+      let file_paths : Set[String] = Set([])
+      let kafka_topics : Set[String] = Set([])
+      for input in inputs {
+        if !seen.add_and_check(input.input_id) {
+          raise ApiError::Source("duplicate input identity")
+        }
+        ignore(NamedSource::new(input.input_id, input.source))
+        match input.source {
+          JsonLines(path) =>
+            if !file_paths.add_and_check(path) {
+              raise ApiError::Source(
+                "named file inputs must own distinct cursor paths",
+              )
+            }
+          Kafka(spec) =>
+            if !kafka_topics.add_and_check(spec.topic()) {
+              raise ApiError::Source(
+                "named Kafka inputs must use distinct topics for unambiguous event identities",
+              )
+            }
+          _ => ()
+        }
+      }
+    }
   }
 }
 
@@ -50,18 +80,58 @@ pub fn JobDefinition::compile(
   self : JobDefinition,
   registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> CompiledJob raise ApiError {
+  let self = self.compile_graph(registry)
   self.operator.validate()
-  let descriptor = match self.artifact {
-    None => registry.resolve(self.operator)
-    Some(artifact) => {
-      if artifact.reference != self.operator {
-        raise ApiError::ArtifactMismatch(self.operator.id())
+  let descriptor = if self.transform is Some(_) {
+    transform_descriptor(self)
+  } else {
+    match self.artifact {
+      None => registry.resolve(self.operator)
+      Some(artifact) => {
+        if artifact.reference != self.operator {
+          raise ApiError::ArtifactMismatch(self.operator.id())
+        }
+        registry.resolve_artifact(artifact)
       }
-      registry.resolve_artifact(artifact)
     }
   }
+  if self.transform is Some(_) &&
+    self.artifact is Some(artifact) &&
+    !descriptor.artifact().identity_equal(artifact) {
+    raise ApiError::ArtifactMismatch("transform artifact")
+  }
   descriptor.validate()
+  match self.event_time_config {
+    None => ()
+    Some(config) => {
+      config.validate() catch {
+        error => raise ApiError::InvalidEvent(@debug.to_string(error))
+      }
+      if config.window_size_ms() > 0L &&
+        descriptor.operator_kind != @task.OperatorKind::KeyedSum {
+        raise ApiError::InvalidEvent("event-time windows require keyed-sum")
+      }
+    }
+  }
+  if self.watermark_idle_timeout_ms.unwrap_or(0L) < 0L {
+    raise ApiError::InvalidEvent("negative idle timeout")
+  }
   validate_source(self.source)
+  if self.source is SourceSpec::Inputs(inputs) &&
+    self.event_time_config is Some(config) {
+    let actual = inputs.map(input => input.input_id)
+    actual.sort()
+    let expected = if config.window_size_ms() > 0L {
+      ["main"]
+    } else {
+      ["left", "right"]
+    }
+    if actual != expected {
+      raise ApiError::Source(
+        "event-time input identities do not match the operator",
+      )
+    }
+  }
   validate_sink(self.sink)
   let routes = self.routes.copy()
   routes.sort()
@@ -81,6 +151,7 @@ pub fn JobDefinition::compile(
     canonical.partition_count,
     canonical.workers[:],
     canonical.routes[:],
+    parallelism=canonical.parallelism(),
   ) catch {
     error => raise ApiError::Plan(error)
   }
@@ -88,6 +159,13 @@ pub fn JobDefinition::compile(
     definition: canonical,
     spec,
     descriptor,
+    graph_stages: match canonical.graph {
+      None => []
+      Some(graph) =>
+        graph.stages.map(stage => {
+          (stage.id, stage.definition.compile(registry~))
+        })
+    },
     plan_digest: api_digest(
       Json::array([
         @json.to_json(canonical),

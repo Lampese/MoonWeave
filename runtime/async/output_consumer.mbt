@@ -78,15 +78,24 @@ pub async fn TaskOutputConsumer::open(
     epoch,
     record: None,
     compacted: None,
+    start_sequence: None,
   }
   let (journal, replay) = Wal::open(checkpoint_path, maximum_bytes?) catch {
     error => raise OutputConsumerError::Wal(error)
   }
   errdefer journal.close()
-  let next_sequence = replay_output_consumer(replay, log, binding)
+  let next_sequence = if replay.records().is_empty() {
+    log.retained_from(task_id)
+  } else {
+    replay_output_consumer(replay, log, binding)
+  }
   if replay.records().is_empty() {
     ignore(
-      journal.append(@utf8.encode(@json.to_json(binding).stringify())) catch {
+      journal.append(
+        @utf8.encode(
+          @json.to_json({ ..binding, start_sequence: Some(next_sequence), }).stringify(),
+        ),
+      ) catch {
         error => raise OutputConsumerError::Wal(error)
       },
     )
@@ -271,14 +280,21 @@ async fn TaskOutputConsumer::compact_unlocked(
   self : TaskOutputConsumer,
 ) -> Unit raise OutputConsumerError {
   self.check_open()
+  let acknowledged_prefix = self.next_sequence > 0L &&
+    self.log.is_trimmed(self.binding.task_id, self.next_sequence - 1L)
   let compacted_binding = OutputConsumerEntry::{
     ..self.binding,
     compacted: Some(true),
+    start_sequence: if acknowledged_prefix {
+      Some(self.next_sequence)
+    } else {
+      None
+    },
   }
   let entries : Array[Bytes] = [
     @utf8.encode(@json.to_json(compacted_binding).stringify()),
   ]
-  if self.next_sequence > 0L {
+  if self.next_sequence > 0L && !acknowledged_prefix {
     let latest = output_consumer_record(
       self.log,
       self.binding,
@@ -330,7 +346,9 @@ pub async fn TaskOutputConsumer::consume(
   for record in records {
     self.check_open()
     handler(record)
+    @crash_boundary.hit("worker.output.written", record.idempotency_key())
     self.commit_ack(record)
+    @crash_boundary.hit("worker.output.acked", record.idempotency_key())
   }
   records.length()
 }

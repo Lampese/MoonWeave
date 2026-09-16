@@ -103,6 +103,7 @@ pub async fn worker_handshake(
   maximum_frame_bytes? : Int = 4 * 1024 * 1024,
   requested_partition? : Int,
   auth_token? : String,
+  job_id? : String,
 ) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError {
   let session = @protocol.WorkerSession::new(
     cluster_id,
@@ -121,6 +122,7 @@ pub async fn worker_handshake(
     capabilities,
     requested_partition?,
     auth_token?,
+    job_id?,
   ) catch {
     error => raise FrameIoError::Protocol(error)
   }
@@ -215,6 +217,39 @@ pub async fn coordinator_send_delta(
   }
   write_frame(connection, frame, maximum_frame_bytes~)
   delta.delta_id()
+}
+
+///|
+/// Send a monotone event-time frontier after all source records in the
+/// corresponding delivery cut have been applied. Watermarks do not consume
+/// the source offset cursor, so they can be retried independently of batches.
+pub async fn coordinator_send_watermark(
+  connection : @socket.Tcp,
+  session : @protocol.CoordinatorSession,
+  outbound : @protocol.FrameBuilder,
+  partition : Int,
+  epoch : Int,
+  timestamp : Int64,
+  maximum_frame_bytes? : Int = 4 * 1024 * 1024,
+) -> Unit raise FrameIoError {
+  if timestamp < 0L {
+    raise FrameIoError::Protocol(@protocol.ProtocolError::InvalidFrameField)
+  }
+  let watermark = @protocol.Watermark::new(partition, epoch, timestamp) catch {
+    error => raise FrameIoError::Protocol(error)
+  }
+  ignore(
+    session.next_offset(partition, epoch) catch {
+      error => raise FrameIoError::Session(error)
+    },
+  )
+  let frame = outbound.build(
+    @protocol.FrameKind::Watermark,
+    watermark.to_payload(),
+  ) catch {
+    error => raise FrameIoError::Protocol(error)
+  }
+  write_frame(connection, frame, maximum_frame_bytes~)
 }
 
 ///|

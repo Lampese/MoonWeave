@@ -8,7 +8,82 @@ pub(all) struct TaskSpec {
   partition : Int
   epoch : Int
   start_offset : Int64
+  event_time_config : TaskEventTimeConfig?
 } derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// Configuration shared by the live event-time operators. A missing value
+/// keeps the legacy offset-driven operator behavior.
+pub(all) struct TaskEventTimeConfig {
+  window_size_ms : Int64
+  allowed_lateness_ms : Int64
+  join_before_ms : Int64
+  join_after_ms : Int64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn TaskEventTimeConfig::new(
+  window_size_ms? : Int64,
+  allowed_lateness_ms? : Int64 = 0L,
+  join_before_ms? : Int64,
+  join_after_ms? : Int64,
+) -> TaskEventTimeConfig raise TaskError {
+  let window = window_size_ms.unwrap_or(0L)
+  let before = join_before_ms.unwrap_or(0L)
+  let after = join_after_ms.unwrap_or(0L)
+  if window < 0L ||
+    allowed_lateness_ms < 0L ||
+    before < 0L ||
+    after < 0L ||
+    (window == 0L && join_before_ms is None && join_after_ms is None) ||
+    (window > 0L && (join_before_ms is Some(_) || join_after_ms is Some(_))) {
+    raise TaskError::Custom("invalid event-time configuration")
+  }
+  {
+    window_size_ms: window,
+    allowed_lateness_ms,
+    join_before_ms: before,
+    join_after_ms: after,
+  }
+}
+
+///|
+pub fn TaskEventTimeConfig::validate(
+  self : TaskEventTimeConfig,
+) -> Unit raise TaskError {
+  if self.window_size_ms < 0L ||
+    self.allowed_lateness_ms < 0L ||
+    self.join_before_ms < 0L ||
+    self.join_after_ms < 0L ||
+    (
+      self.window_size_ms > 0L &&
+      (self.join_before_ms != 0L || self.join_after_ms != 0L)
+    ) {
+    raise TaskError::Custom("invalid event-time configuration")
+  }
+}
+
+///|
+pub fn TaskEventTimeConfig::window_size_ms(self : TaskEventTimeConfig) -> Int64 {
+  self.window_size_ms
+}
+
+///|
+pub fn TaskEventTimeConfig::allowed_lateness_ms(
+  self : TaskEventTimeConfig,
+) -> Int64 {
+  self.allowed_lateness_ms
+}
+
+///|
+pub fn TaskEventTimeConfig::join_before_ms(self : TaskEventTimeConfig) -> Int64 {
+  self.join_before_ms
+}
+
+///|
+pub fn TaskEventTimeConfig::join_after_ms(self : TaskEventTimeConfig) -> Int64 {
+  self.join_after_ms
+}
 
 ///|
 pub fn OperatorKind::from_id(
@@ -45,6 +120,7 @@ pub fn TaskSpec::from_job(
     partition: assignment.partition(),
     epoch: assignment.epoch(),
     start_offset: assignment.start_offset(),
+    event_time_config: None,
   }
 }
 
@@ -81,4 +157,9 @@ pub fn TaskSpec::epoch(self : TaskSpec) -> Int {
 ///|
 pub fn TaskSpec::start_offset(self : TaskSpec) -> Int64 {
   self.start_offset
+}
+
+///|
+pub fn TaskSpec::event_time_config(self : TaskSpec) -> TaskEventTimeConfig? {
+  self.event_time_config
 }

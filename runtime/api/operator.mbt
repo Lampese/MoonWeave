@@ -389,9 +389,11 @@ fn OperatorDescriptor::create_task(
   epoch : Int,
   start_offset : Int64,
   max_state_events : Int,
+  event_time_config? : @task.TaskEventTimeConfig,
+  graph_input? : @task.TaskGraphConfig,
 ) -> @task.Task raise ApiError {
   self.validate()
-  match self.implementation {
+  let task = match self.implementation {
     None =>
       @task.Task::new(
         task_id,
@@ -414,6 +416,20 @@ fn OperatorDescriptor::create_task(
         start_offset~,
         max_state_events~,
       ) catch {
+        error => raise ApiError::TaskFailed(@debug.to_string(error))
+      }
+  }
+  let task = match event_time_config {
+    None => task
+    Some(config) =>
+      task.with_event_time(config) catch {
+        error => raise ApiError::TaskFailed(@debug.to_string(error))
+      }
+  }
+  match graph_input {
+    None => task
+    Some(config) =>
+      task.with_graph_input(config) catch {
         error => raise ApiError::TaskFailed(@debug.to_string(error))
       }
   }

@@ -9,11 +9,13 @@ pub struct SourceBackedExecution {
   job_store : @runtime.JobStore
   source : @runtime.SourceBackedJob
   output_manifest : @runtime.JobOutputManifest?
-  mut kafka_source : KafkaSource?
-  mut kafka_source_started : Bool
-  mut kafka_source_stopped : Bool
+  kafka_sources : Array[KafkaSource]
+  json_lines_sources : Array[JsonLinesSource]
+  mut active_source_pumps : Int
   mut kafka_stop_requested : Bool
   mut closed : Bool
+  mut confirm_authority : (async () -> Unit raise ApiError)?
+  mut active_migrations : NodeMigrationLog?
 }
 
 ///|
@@ -49,7 +51,11 @@ async fn CoordinatorListener::open_source_backed_execution(
   self : CoordinatorListener,
   job : CompiledJob,
   inputs : ArrayView[Event],
+  authority? : ExecutionAuthoritySnapshot,
 ) -> SourceBackedExecution raise ApiError {
+  if job.is_graph() {
+    raise ApiError::Cluster("a graph must be opened by CoordinatorService")
+  }
   validate_coordinator_workers(job, self.config)
   ensure_live_storage(self.config.storage_dir)
   let coordinator = @runtime.CoordinatorStore::open(
@@ -71,6 +77,30 @@ async fn CoordinatorListener::open_source_backed_execution(
     error => raise live_execution_error("open Job store", error)
   }
   errdefer job_store.close()
+  if authority is Some(snapshot) {
+    restore_migration_authority(self.config, snapshot.migrations)
+    coordinator.replace_snapshot(snapshot.live.coordinator) catch {
+      error =>
+        raise live_execution_error("restore Coordinator authority", error)
+    }
+    job_store.replace_authority_snapshot(snapshot.live.job) catch {
+      error => raise live_execution_error("restore Job authority", error)
+    }
+    // The imported pair was captured while reconciliation held neither
+    // store lock. A local transaction from a superseded authority must not
+    // be replayed over this replacement generation.
+    let (reconcile, _) = @runtime.Wal::open(
+      node_reconciliation_path(self.config),
+      maximum_bytes=self.config.storage_budget_bytes,
+    ) catch {
+      error => raise live_execution_error("open restored reconciliation", error)
+    }
+    defer reconcile.close()
+    reconcile.rewrite([]) catch {
+      error =>
+        raise live_execution_error("reset restored reconciliation", error)
+    }
+  }
   let capabilities = live_worker_capabilities(job)
   for worker in self.config.workers {
     let incarnation = @protocol.Incarnation::new(worker.incarnation()) catch {
@@ -142,32 +172,39 @@ async fn CoordinatorListener::open_source_backed_execution(
     job_store,
     required_capability=job.descriptor.capability(),
     maximum_bytes=self.config.storage_budget_bytes,
+    event_time_config?=job.definition.event_time_config,
+    watermark_inputs?=job.definition.graph_watermarks.map(_ => {
+      job.definition.source.watermark_input_ids()
+    }),
+    external_watermarks?=match job.definition.graph_watermarks {
+      Some(edges) if !edges.is_empty() => Some(edges)
+      _ => None
+    },
+    authority?=authority.map(snapshot => snapshot.live),
+    watermark_idle_timeout_ms=job.definition.watermark_idle_timeout_ms.unwrap_or(
+      0L,
+    ),
   ) catch {
     error => raise live_execution_error("open source-backed execution", error)
   }
   errdefer source.close()
-  match job.definition.source {
-    SourceSpec::Kafka(_) => {
-      if !inputs.is_empty() {
-        raise ApiError::InvalidDriverCommand(
-          "Kafka source Jobs do not accept Driver input",
-        )
-      }
-      source.refresh_work_plans() catch {
-        error =>
-          raise live_execution_error("recover Kafka source work plans", error)
-      }
+  for input in inputs {
+    if !job.definition.source.accepts_driver_input(input.input_id()) {
+      raise ApiError::InvalidDriverCommand(
+        "Driver input targets an external source",
+      )
     }
-    _ => {
-      source.ingest_all(inputs.map(event => event.record)) catch {
-        error => raise live_execution_error("bind source work plans", error)
-      }
-      if source.event_count() != inputs.length() {
-        raise ApiError::Cluster(
-          "SourceLog contains input absent from Driver intent",
-        )
-      }
-    }
+  }
+  source.ingest_all(inputs.map(event => event.record)) catch {
+    error => raise live_execution_error("recover source work plans", error)
+  }
+  // `ingest_all` is idempotent and may only encounter already present source
+  // identities. Rebuild the JobStore plans explicitly on every recovery so a
+  // failover cannot leave an empty append-only plan when the source WAL was
+  // already populated by the previous Coordinator.
+  source.refresh_work_plans() catch {
+    error =>
+      raise live_execution_error("refresh recovered source work plans", error)
   }
   ignore(
     @runtime.reconcile_job_coordinator(
@@ -212,6 +249,16 @@ async fn CoordinatorListener::open_source_backed_execution(
         },
       )
   }
+  if authority is Some(snapshot) {
+    match (output_manifest, snapshot.manifest) {
+      (Some(manifest), Some(saved)) =>
+        manifest.replace_snapshot(saved) catch {
+          error => raise live_execution_error("restore output authority", error)
+        }
+      (None, None) => ()
+      _ => raise ApiError::Cluster("output authority configuration mismatch")
+    }
+  }
   {
     listener: self,
     job,
@@ -219,11 +266,13 @@ async fn CoordinatorListener::open_source_backed_execution(
     job_store,
     source,
     output_manifest,
-    kafka_source: None,
-    kafka_source_started: false,
-    kafka_source_stopped: false,
+    kafka_sources: [],
+    json_lines_sources: [],
+    active_source_pumps: 0,
     kafka_stop_requested: false,
     closed: false,
+    confirm_authority: None,
+    active_migrations: None,
   }
 }
 
@@ -279,7 +328,7 @@ async fn SourceBackedExecution::sync_inputs(
 ) -> Unit raise ApiError {
   self.ensure_open()
   for event in events {
-    self.job.descriptor.validate_event(event)
+    self.job.validate_event(event)
   }
   let records = events.map(event => event.record)
   self.source.ingest_all(records[:]) catch {
@@ -311,7 +360,7 @@ async fn SourceBackedExecution::wait_for_kafka_source_stop(
   self : SourceBackedExecution,
   stage : String,
 ) -> Unit raise ApiError {
-  while self.kafka_source_started && !self.kafka_source_stopped {
+  while self.active_source_pumps > 0 {
     @async_runtime.sleep(1) catch {
       error => raise live_execution_error(stage, error)
     }
@@ -340,33 +389,62 @@ async fn SourceBackedExecution::cancel(
 /// delivery plans are durable in SourceLog/JobStore.
 async fn SourceBackedExecution::pump_kafka_source(
   self : SourceBackedExecution,
+  source : KafkaSource,
+  input_id : String?,
 ) -> Unit raise ApiError {
-  defer {
-    self.kafka_source_stopped = true
-  }
-  guard self.kafka_source is Some(source) else {
-    raise ApiError::Source("Kafka source pump has no connected consumer")
-  }
   while !self.kafka_stop_requested && self.phase() == JobRunPhase::Running {
-    let batch = source.poll(max_wait_ms=100) catch {
-      error => raise ApiError::Source(@debug.to_string(error))
-    }
+    let batch = source.poll(max_wait_ms=100)
     // Drain may have started while the broker poll was in flight. Leave the
     // batch uncommitted so the next execution can read it again.
     if self.kafka_stop_requested || self.phase() != JobRunPhase::Running {
       break
     }
-    for event in batch.events() {
-      self.job.descriptor.validate_event(event)
+    if self.job.definition.event_time_config is Some(_) ||
+      self.job.definition.graph_watermarks is Some(_) {
+      let origins = batch
+        .next_offsets()
+        .keys()
+        .to_array()
+        .map(partition => {
+          "kafka/" + source.topic() + "/" + partition.to_string()
+        })
+      let input_ids = match input_id {
+        Some(id) => [id]
+        None =>
+          if self.job.definition.event_time_config is Some(config) &&
+            config.window_size_ms() == 0L {
+            ["left", "right"]
+          } else {
+            self.job.definition.source.watermark_input_ids()
+          }
+      }
+      for id in input_ids {
+        self.source.assign_source_partitions(id, origins) catch {
+          error =>
+            raise live_execution_error("coordinate Kafka partitions", error)
+        }
+      }
     }
-    if !batch.events().is_empty() {
-      self.source.ingest_all(batch.events().map(event => event.record)) catch {
+    let events = batch
+      .events()
+      .map(event => {
+        match input_id {
+          None => event
+          Some(input_id) => event.bind_input(input_id)
+        }
+      })
+    for event in events {
+      self.job.validate_event(event)
+    }
+    if !events.is_empty() {
+      self.source.ingest_all(events.map(event => event.record)) catch {
         error => raise live_execution_error("persist Kafka source batch", error)
       }
     }
-    source.commit_offsets(batch.next_offsets()) catch {
-      error => raise ApiError::Source(@debug.to_string(error))
+    if self.confirm_authority is Some(confirm) {
+      confirm()
     }
+    source.commit_offsets(batch.next_offsets())
   }
 }
 
@@ -482,73 +560,71 @@ async fn SourceBackedExecution::recover_live_failures(
 async fn SourceBackedExecution::run(
   self : SourceBackedExecution,
 ) -> CoordinatorNodeSummary raise ApiError {
-  guard self.job.definition.source is SourceSpec::Kafka(spec) &&
-    self.phase() == JobRunPhase::Running &&
-    !self.kafka_stop_requested else {
+  // Cancellation of a previous supervisor stops its pollers. A new Running
+  // attempt must join the source again, including after an online rescale.
+  if self.phase() == JobRunPhase::Running {
+    self.kafka_stop_requested = false
+  }
+  let inputs = self.job.definition.source.kafka_inputs()
+  let file_inputs = self.job.definition.source.json_lines_inputs()
+  if (inputs.is_empty() && file_inputs.is_empty()) ||
+    self.phase() != JobRunPhase::Running ||
+    self.kafka_stop_requested {
     return self.run_source_supervisor()
   }
-  let source_config = self.listener.config.kafka_runtime
-    .unwrap_or(KafkaRuntimeConfig::new())
-    .source_config(spec)
+  let runtime = self.listener.config.kafka_runtime.unwrap_or(
+    KafkaRuntimeConfig::new(),
+  )
   let mut outcome : Result[CoordinatorNodeSummary, ApiError]? = None
   (@async_runtime.with_task_group <| group => {
-    let connected : Result[KafkaSource, ApiError] = Ok(
-      KafkaSource::connect(group~, source_config),
-    ) catch {
-      error => Err(error)
+    defer {
+      for source in self.kafka_sources {
+        source.close()
+      }
+      self.kafka_sources.clear()
+      for source in self.json_lines_sources {
+        source.close()
+      }
+      self.json_lines_sources.clear()
     }
-    match connected {
-      Err(error) => outcome = Some(Err(error))
-      Ok(source) => {
-        self.kafka_source = Some(source)
-        defer {
-          source.close()
-          self.kafka_source = None
-        }
-        let mut pump : @async_runtime.Task[Unit]? = None
-        if self.kafka_stop_requested || self.phase() != JobRunPhase::Running {
-          self.kafka_source_stopped = true
-        } else {
-          // Mark the pump before spawning it so drain/cancel cannot observe a
-          // transient "not started" state and seal ingress ahead of the poll.
-          self.kafka_source_started = true
-          self.kafka_source_stopped = false
-          pump = Some(
-            group.spawn(allow_failure=false) <| () => {
-              self.pump_kafka_source()
-            },
-          )
-        }
-        let supervisor_outcome : Result[CoordinatorNodeSummary, ApiError] = {
-          defer {
-            // A supervisor failure or early completion must not leave the
-            // Kafka poller keeping this structured task group alive.
-            self.kafka_stop_requested = true
-          }
-          Ok(self.run_source_supervisor()) catch {
-            error => Err(error)
-          }
-        }
-        let pump_outcome : Result[Unit, ApiError] = match pump {
-          None => Ok(())
-          Some(task) =>
-            Ok(task.wait()) catch {
-              error =>
-                Err(
-                  ApiError::Source(
-                    "Kafka source pump: " + @debug.to_string(error),
-                  ),
-                )
-            }
-        }
-        outcome = Some(
-          match pump_outcome {
-            Ok(_) => supervisor_outcome
-            Err(error) => Err(error)
-          },
-        )
+    let pumps : Array[@async_runtime.Task[Unit]] = []
+    for (input_id, path) in file_inputs {
+      let source = JsonLinesSource::open(path)
+      self.json_lines_sources.push(source)
+      if self.kafka_stop_requested || self.phase() != JobRunPhase::Running {
+        break
+      }
+      self.active_source_pumps += 1
+      pumps.push(
+        group.spawn(allow_failure=false) <| () => {
+          self.pump_json_lines_source(source, input_id)
+        },
+      )
+    }
+    for (input_id, spec) in inputs {
+      if self.kafka_stop_requested || self.phase() != JobRunPhase::Running {
+        break
+      }
+      // Account before spawn so a concurrent drain waits for every poller.
+      self.active_source_pumps += 1
+      pumps.push(
+        group.spawn(allow_failure=false) <| () => {
+          self.run_kafka_source(runtime.source_config(spec), input_id)
+        },
+      )
+    }
+    let supervisor_outcome : Result[CoordinatorNodeSummary, ApiError] = {
+      defer {
+        self.kafka_stop_requested = true
+      }
+      Ok(self.run_source_supervisor()) catch {
+        error => Err(error)
       }
     }
+    for pump in pumps {
+      pump.wait()
+    }
+    outcome = Some(supervisor_outcome)
   }) catch {
     error =>
       raise ApiError::Source("Kafka source runtime: " + @debug.to_string(error))
@@ -665,9 +741,11 @@ fn SourceBackedExecution::close(self : SourceBackedExecution) -> Unit {
   if !self.closed {
     self.closed = true
     self.kafka_stop_requested = true
-    match self.kafka_source {
-      Some(source) => source.close()
-      None => ()
+    for source in self.kafka_sources {
+      source.close()
+    }
+    for source in self.json_lines_sources {
+      source.close()
     }
     match self.output_manifest {
       Some(manifest) => manifest.close()

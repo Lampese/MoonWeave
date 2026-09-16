@@ -6,7 +6,7 @@ test "Kafka records become stable causal events" {
     [parent],
     "account-1",
     Json::object({ "value": Json::string("ok") }),
-  )
+  ).with_event_time(100L, input_id="left")
   let record : @moonkafka.Record = {
     offset: 12L,
     timestamp: 0L,
@@ -19,6 +19,8 @@ test "Kafka records become stable causal events" {
   assert_eq(event.parents(), [parent])
   assert_eq(event.key(), "account-1")
   assert_eq(event.payload(), Json::object({ "value": Json::string("ok") }))
+  assert_eq(event.event_time(), Some(100L))
+  assert_eq(event.input_id(), "left")
 }
 
 ///|

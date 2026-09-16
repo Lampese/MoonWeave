@@ -31,6 +31,8 @@ pub async fn coordinator_send_probe(@socket.Tcp, @protocol.CoordinatorSession, @
 
 pub async fn coordinator_send_seal(@socket.Tcp, @protocol.CoordinatorSession, @protocol.FrameBuilder, @protocol.Seal, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
+pub async fn coordinator_send_watermark(@socket.Tcp, @protocol.CoordinatorSession, @protocol.FrameBuilder, Int, Int, Int64, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
+
 pub async fn migrated_task_id(String) -> String? raise WorkerMigrationError
 
 pub async fn[R : @io.Reader] read_frame(R, maximum_frame_bytes? : Int) -> @protocol.Frame raise FrameIoError
@@ -79,7 +81,7 @@ pub async fn run_supervisor_with_retry(@socket.TcpServer, @control.CoordinatorSt
 
 pub async fn run_worker(@socket.Tcp, String, String, String, String, Array[String], String, (@protocol.EventBatch) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_handler? : (@protocol.DeltaBatch) -> Unit raise, delta_wal_path? : String, requested_partition? : Int, auth_token? : String) -> WorkerRunSummary raise FrameIoError
 
-pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64) -> WorkerRunSummary raise FrameIoError
+pub async fn run_worker_task(@socket.Tcp, String, String, String, String, Array[String], String, @task.Task, (@task.TaskOutput) -> Unit raise, checkpoint_path? : String, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, auth_token? : String, job_id? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64, execution_lane? : ExecutionLane) -> WorkerRunSummary raise FrameIoError
 
 pub async fn run_worker_task_set(Array[WorkerTaskWork], (String, Int, @task.TaskOutput) -> Unit raise) -> WorkerTaskSetSummary raise FrameIoError
 
@@ -89,7 +91,7 @@ pub fn task_snapshot_digest(@task.TaskSnapshot) -> String
 
 pub async fn validate_migration_target(String, String, String, String, String, Int, String) -> Unit raise WorkerMigrationError
 
-pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int, auth_token? : String) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
+pub async fn worker_handshake(@socket.Tcp, String, String, String, String, Array[String], maximum_frame_bytes? : Int, requested_partition? : Int, auth_token? : String, job_id? : String) -> (@protocol.WorkerSession, @protocol.FrameBuilder) raise FrameIoError
 
 pub async fn[W : @io.Writer] write_frame(W, @protocol.Frame, maximum_frame_bytes? : Int) -> Unit raise FrameIoError
 
@@ -241,6 +243,22 @@ pub(all) suberror JsonLinesSinkError {
   Io(String)
   OutputLog(String)
   Consumer(String)
+  IndexLimit(Int)
+  RecordTooLarge(Int)
+  Closed
+} derive(Eq, @debug.Debug)
+
+pub(all) suberror NetworkHaError {
+  InvalidConfig
+  InvalidPeer(String)
+  DuplicatePeer(String)
+  Closed
+  NotLeader(expected~ : String, actual~ : String)
+  NoQuorum(required~ : Int, available~ : Int)
+  StaleTerm(expected~ : Int64, actual~ : Int64)
+  CommitGap(expected~ : Int64, actual~ : Int64)
+  Malformed
+  Io(String)
 } derive(Eq, @debug.Debug)
 
 pub(all) suberror OutboxError {
@@ -395,19 +413,21 @@ pub(all) struct Checkpoint {
   frontier_digest : String
   state_schema : String
   operator_state : Json?
+  watermark : Int64?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Checkpoint::applied_offset(Self) -> Int64
 pub fn Checkpoint::delta_wal_offset(Self) -> Int64
 pub fn Checkpoint::epoch(Self) -> Int
 pub fn Checkpoint::frontier_digest(Self) -> String
 pub async fn Checkpoint::load(String) -> Self? raise CheckpointError
-pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, state_schema~ : String, operator_state? : Json) -> Self raise CheckpointError
+pub fn Checkpoint::new(Int, Int, Int64, Int64, Int64, String, delta_wal_offset? : Int64, state_schema~ : String, operator_state? : Json, watermark? : Int64) -> Self raise CheckpointError
 pub fn Checkpoint::operator_state(Self) -> Json?
 pub fn Checkpoint::partition(Self) -> Int
 pub fn Checkpoint::persisted_offset(Self) -> Int64
 pub async fn Checkpoint::save(Self, String) -> Unit raise CheckpointError
 pub fn Checkpoint::state_schema(Self) -> String
 pub fn Checkpoint::wal_offset(Self) -> Int64
+pub fn Checkpoint::watermark(Self) -> Int64
 
 pub struct CoordinatorHa {
   cluster_id : String
@@ -543,6 +563,7 @@ pub fn CoordinatorStore::journal_generation(Self) -> Int64
 pub fn CoordinatorStore::journal_offset(Self) -> Int64
 pub fn CoordinatorStore::journal_path(Self) -> String
 pub async fn CoordinatorStore::mark_suspect(Self, String) -> Unit raise CoordinatorStoreError
+pub async fn CoordinatorStore::move_partition(Self, Int, String, @protocol.Incarnation, String) -> @control.PartitionAssignment raise CoordinatorStoreError
 pub async fn CoordinatorStore::open(String, String, String, checkpoint_path? : String, maximum_bytes? : Int64) -> Self raise CoordinatorStoreError
 pub async fn CoordinatorStore::reassign(Self, Int, String, start_offset? : Int64) -> @control.PartitionAssignment raise CoordinatorStoreError
 pub async fn CoordinatorStore::record_batch_sent(Self, Int, String, @protocol.Incarnation, Int, Int64, Int64) -> Int64 raise CoordinatorStoreError
@@ -556,6 +577,8 @@ pub async fn CoordinatorStore::set_suspect(Self, String) -> Unit raise Coordinat
 pub fn CoordinatorStore::snapshot(Self) -> @control.CoordinatorSnapshot
 
 type CoordinatorStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type DeltaOrderWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type DeltaWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
@@ -598,6 +621,8 @@ pub async fn DurableExchangeOutbox::try_push(Self, @protocol.DeltaBatch) -> Bool
 
 type DurableOutboxEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+type EmbeddedDeltaRecord derive(ToJson, @json.FromJson)
+
 pub struct ExchangeOutbox {
   queue : @aqueue.Queue[@protocol.DeltaBatch]
   capacity : Int
@@ -619,6 +644,22 @@ pub struct ExchangeRunSummary {
 }
 pub fn ExchangeRunSummary::acked_deltas(Self) -> Int
 pub fn ExchangeRunSummary::sent_deltas(Self) -> Int
+
+pub struct ExecutionLane {
+  id : Int
+  mutex : @moonbitlang/async.Mutex
+  mut admissions : Int64
+}
+pub async fn ExecutionLane::acquire(Self) -> ExecutionPermit raise FrameIoError
+pub fn ExecutionLane::admissions(Self) -> Int64
+pub fn ExecutionLane::id(Self) -> Int
+pub fn ExecutionLane::new(Int) -> Self raise FrameIoError
+
+pub struct ExecutionPermit {
+  lane : ExecutionLane
+  mut held : Bool
+}
+pub fn ExecutionPermit::release(Self) -> Unit
 
 pub struct IngressDispatch {
   ingress : RoutedIngress
@@ -648,6 +689,13 @@ pub fn IngressRouter::register_outbox(Self, Int, ExchangeOutbox) -> Unit raise S
 pub async fn IngressRouter::route(Self, @protocol.EventRecord) -> RoutedIngress raise SourceLogError
 pub fn IngressRouter::supervisor_work(Self, Int, String, maximum_batch_events? : Int, probe? : @protocol.Probe) -> SupervisorWork raise SourceLogError
 pub fn IngressRouter::supervisor_works(Self, String, maximum_batch_events? : Int) -> Array[SupervisorWork] raise SourceLogError
+
+pub(all) struct InputWatermark {
+  input_id : String
+  source_id : String?
+  maximum_timestamp : Int64
+  last_activity : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type JobExecutionPlan derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
@@ -698,11 +746,12 @@ pub struct JobOutputManifest {
   job_id : String
   operator_id : String
   partition_count : Int
-  partitions : Map[Int, JobOutputPartitionSummary]
-  consumers : Map[String, JobOutputConsumerSummary]
+  mut partitions : Map[Int, JobOutputPartitionSummary]
+  mut consumers : Map[String, JobOutputConsumerSummary]
   mut certificate : JobOutputCertificate?
   write_lock : @moonbitlang/async.Mutex
 }
+pub async fn JobOutputManifest::authority_snapshot(Self) -> JobOutputManifestSnapshot raise JobOutputManifestError
 pub fn JobOutputManifest::certificate(Self) -> JobOutputCertificate?
 pub fn JobOutputManifest::close(Self) -> Unit
 pub async fn JobOutputManifest::compact_partition_for_retention(Self, Int, TaskOutputLog) -> Unit raise JobOutputManifestError
@@ -726,6 +775,7 @@ pub async fn JobOutputManifest::publish_verified_certificate(Self, String, JobOu
 pub async fn JobOutputManifest::record_job_partition(Self, JobStore, Int, String, TaskOutputLog, String, String, Bool) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition(Self, Int, String, String, Int, TaskOutputLog, String, String, Bool, applied_offset? : Int64) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::record_partition_summary(Self, Int, String, String, Int, Int64, String, String, String, Bool, applied_offset? : Int64, consumer_id? : String, acked_sequence? : Int64, retained_from? : Int64) -> Unit raise JobOutputManifestError
+pub async fn JobOutputManifest::replace_snapshot(Self, JobOutputManifestSnapshot) -> Unit raise JobOutputManifestError
 pub async fn JobOutputManifest::seal_partition_for_retention(Self, Int, TaskOutputLog) -> TaskOutputRetentionBarrier raise JobOutputManifestError
 pub fn JobOutputManifest::snapshot(Self) -> JobOutputManifestSnapshot
 pub async fn JobOutputManifest::sync_consumer(Self, TaskOutputConsumer) -> Unit raise JobOutputManifestError
@@ -799,7 +849,7 @@ pub fn JobOutputTaskProof::snapshot(Self) -> @task.TaskSnapshot
 pub fn JobOutputTaskProof::task_id(Self) -> String
 
 pub struct JobStore {
-  state : @control.JobState
+  mut state : @control.JobState
   journal_path : String
   checkpoint_path : String
   journal : Wal
@@ -809,7 +859,9 @@ pub struct JobStore {
   mut work_plans : Map[Int, JobExecutionPlan]
   supervisor_lock : @moonbitlang/async.Mutex
 }
+pub async fn JobStore::allow_worker(Self, String) -> Unit raise JobStoreError
 pub async fn JobStore::assign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
+pub fn JobStore::authority_snapshot(Self) -> JobStoreAuthoritySnapshot
 pub async fn JobStore::cancel(Self) -> Unit raise JobStoreError
 pub async fn JobStore::checkpoint(Self) -> Unit raise JobStoreError
 pub async fn JobStore::checkpoint_and_compact(Self) -> Unit raise JobStoreError
@@ -824,30 +876,60 @@ pub fn JobStore::job_id(Self) -> String
 pub fn JobStore::journal_generation(Self) -> Int64
 pub fn JobStore::journal_offset(Self) -> Int64
 pub fn JobStore::journal_path(Self) -> String
+pub async fn JobStore::move_partition(Self, Int, String, Int, String) -> @control.JobPartition raise JobStoreError
 pub async fn JobStore::open(@plan.JobSpec, String, checkpoint_path? : String, maximum_bytes? : Int64) -> Self raise JobStoreError
 pub fn JobStore::phase(Self) -> @control.JobPhase
 pub async fn JobStore::reassign(Self, Int, String, Int, Int64) -> @control.JobPartition raise JobStoreError
 pub async fn JobStore::reassign_many(Self, ArrayView[@control.JobReassignment]) -> Array[@control.JobPartition] raise JobStoreError
 pub async fn JobStore::record_batch_sent(Self, Int, String, Int, Int64, Int64) -> Int64 raise JobStoreError
 pub async fn JobStore::record_progress(Self, Int, String, Int, Int64, Int64) -> Unit raise JobStoreError
+pub async fn JobStore::replace_authority_snapshot(Self, JobStoreAuthoritySnapshot) -> Unit raise JobStoreError
 pub fn JobStore::snapshot(Self) -> @control.JobSnapshot
 pub async fn JobStore::start(Self) -> Unit raise JobStoreError
 pub async fn JobStore::stop_partition(Self, Int, String, Int, Int) -> Unit raise JobStoreError
+
+pub(all) struct JobStoreAuthoritySnapshot {
+  version : Int
+  snapshot : @control.JobSnapshot
+  work_plans : Array[Json]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type JobStoreCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct JsonLinesSink {
   path : String
   known : Map[String, TaskOutputRecord]
+  sizes : Map[String, Int]
+  mut known_bytes : Int
+  mut ranges : Array[@causal.EventRange]
+  mut count : Int64
+  maximum_index_ranges : Int
+  maximum_record_bytes : Int
+  owner : @fs.File
+  mut next_offset : Int64
+  mut closed : Bool
   write_lock : @moonbitlang/async.Mutex
 }
 pub fn JsonLinesSink::close(Self) -> Unit
 pub async fn JsonLinesSink::consume(Self, TaskOutputConsumer, maximum_records? : Int) -> Int raise JsonLinesSinkError
 pub fn JsonLinesSink::contains(Self, String) -> Bool
-pub async fn JsonLinesSink::open(String) -> Self raise JsonLinesSinkError
+pub async fn JsonLinesSink::open(String, maximum_index_ranges? : Int, maximum_record_bytes? : Int) -> Self raise JsonLinesSinkError
 pub fn JsonLinesSink::path(Self) -> String
 pub async fn JsonLinesSink::write(Self, TaskOutputRecord) -> Unit raise JsonLinesSinkError
-pub fn JsonLinesSink::written_count(Self) -> Int
+pub fn JsonLinesSink::written_count(Self) -> Int64
+
+pub(all) struct LiveJobAuthoritySnapshot {
+  version : Int
+  coordinator : @control.CoordinatorSnapshot
+  job : JobStoreAuthoritySnapshot
+  source : SourceLogSnapshot
+  watermark : SourceWatermarkSnapshot?
+  graph_watermark : SourceWatermarkSnapshot?
+  confirmed_watermarks : Array[(Int, Int64)]
+  acknowledged_cuts : Array[(Int, Array[Int64])]
+  retirement : @causal.CausalRetirement?
+  retirement_acks : Array[(Int, String)]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 type LiveJobControl
 
@@ -868,6 +950,8 @@ pub fn LiveSupervisorSummary::recoverable_failures(Self) -> Bool
 pub fn LiveSupervisorSummary::sent_batches(Self) -> Int
 pub fn LiveSupervisorSummary::sent_deltas(Self) -> Int
 
+type LiveWorkCut
+
 pub struct LivenessPolicy {
   heartbeat_timeout_ms : Int64
   scan_interval_ms : Int
@@ -877,6 +961,101 @@ pub fn LivenessPolicy::heartbeat_timeout_ms(Self) -> Int64
 pub fn LivenessPolicy::new(Int64, Int, ArrayView[String]) -> Self raise FrameIoError
 pub fn LivenessPolicy::replacement_workers(Self) -> ArrayView[String]
 pub fn LivenessPolicy::scan_interval_ms(Self) -> Int
+
+pub struct NetworkHaClient {
+  cluster_id : String
+  coordinator_id : String
+  seeds : Array[NetworkHaPeer]
+}
+pub fn NetworkHaClient::new(String, String, ArrayView[NetworkHaPeer]) -> Self raise NetworkHaError
+pub async fn NetworkHaClient::propose(Self, Json) -> Unit raise NetworkHaError
+pub async fn NetworkHaClient::read(Self) -> Json? raise NetworkHaError
+
+type NetworkHaCommand derive(Eq, ToJson, @json.FromJson)
+
+pub(all) struct NetworkHaConfig {
+  cluster_id : String
+  coordinator_id : String
+  node_id : String
+  bind : NetworkHaEndpoint
+  peers : Array[NetworkHaPeer]
+  storage_dir : String
+  lease_ms : Int64
+  maximum_bytes : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NetworkHaConfig::bind(Self) -> NetworkHaEndpoint
+pub fn NetworkHaConfig::cluster_id(Self) -> String
+pub fn NetworkHaConfig::coordinator_id(Self) -> String
+pub fn NetworkHaConfig::lease_ms(Self) -> Int64
+pub fn NetworkHaConfig::new(String, String, String, NetworkHaEndpoint, ArrayView[NetworkHaPeer], String, lease_ms? : Int64, maximum_bytes? : Int64) -> Self raise NetworkHaError
+pub fn NetworkHaConfig::node_id(Self) -> String
+pub fn NetworkHaConfig::peers(Self) -> ArrayView[NetworkHaPeer]
+pub fn NetworkHaConfig::storage_dir(Self) -> String
+
+pub(all) struct NetworkHaEndpoint {
+  host : String
+  port : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NetworkHaEndpoint::host(Self) -> String
+pub fn NetworkHaEndpoint::new(String, Int) -> Self raise NetworkHaError
+pub fn NetworkHaEndpoint::port(Self) -> Int
+
+type NetworkHaMeta derive(Eq, ToJson, @json.FromJson)
+
+pub struct NetworkHaNode {
+  config : NetworkHaConfig
+  server : @socket.TcpServer
+  wal : Wal
+  mut term : Int64
+  mut leader : String
+  mut commit_index : Int64
+  mut lease_until : Int64
+  mut state : Json?
+  mut state_term : Int64
+  mut voted_for : String
+  mut closed : Bool
+  state_lock : @moonbitlang/async.Mutex
+  reachable : @set.Set[String]
+}
+pub fn NetworkHaNode::close(Self) -> Unit
+pub fn NetworkHaNode::commit_index(Self) -> Int64
+pub fn NetworkHaNode::endpoint(Self) -> NetworkHaEndpoint
+pub fn NetworkHaNode::node_id(Self) -> String
+pub async fn NetworkHaNode::open(NetworkHaConfig) -> Self raise NetworkHaError
+pub async fn NetworkHaNode::propose(Self, Json, expected_index? : Int64, expected_term? : Int64) -> Unit raise NetworkHaError
+pub async fn NetworkHaNode::serve(Self) -> Unit raise NetworkHaError
+pub fn NetworkHaNode::state(Self) -> Json?
+pub fn NetworkHaNode::state_term(Self) -> Int64
+pub async fn NetworkHaNode::tick(Self) -> NetworkHaStatus raise NetworkHaError
+
+pub(all) struct NetworkHaPeer {
+  node_id : String
+  endpoint : NetworkHaEndpoint
+  storage_dir : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NetworkHaPeer::endpoint(Self) -> NetworkHaEndpoint
+pub fn NetworkHaPeer::new(String, NetworkHaEndpoint, String) -> Self raise NetworkHaError
+pub fn NetworkHaPeer::node_id(Self) -> String
+pub fn NetworkHaPeer::storage_dir(Self) -> String
+
+type NetworkHaReply derive(Eq, ToJson, @json.FromJson)
+
+type NetworkHaRequest derive(Eq, ToJson, @json.FromJson)
+
+pub(all) struct NetworkHaStatus {
+  node_id : String
+  term : Int64
+  leader : String
+  commit_index : Int64
+  available_peers : Int
+  quorum : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn NetworkHaStatus::available_peers(Self) -> Int
+pub fn NetworkHaStatus::commit_index(Self) -> Int64
+pub fn NetworkHaStatus::leader(Self) -> String
+pub fn NetworkHaStatus::node_id(Self) -> String
+pub fn NetworkHaStatus::quorum(Self) -> Int
+pub fn NetworkHaStatus::term(Self) -> Int64
 
 type OutputConsumerEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
@@ -927,39 +1106,60 @@ pub fn RoutedIngress::worker_id(Self) -> String
 
 pub struct SourceBackedJob {
   source : SourceLog
+  watermark_store : SourceWatermarkStore?
+  external_watermark_store : SourceWatermarkStore?
+  confirmed_watermarks : Map[Int, Int64]
   plan : @plan.JobSpec
   coordinator : CoordinatorStore
   job_store : JobStore
   required_capability : String?
   ingress_lock : @moonbitlang/async.Mutex
+  ingress_gate : @moonbitlang/async.Mutex
+  acknowledged_cuts : Map[Int, Array[Int64]]
+  mut retirement : @causal.CausalRetirement?
+  retirement_acks : Map[Int, String]
   lifecycle : LiveJobControl
   mut failed : Bool
   mut closed : Bool
   mut session_sequence : Int64
+  mut supervising : Bool
+  mut authority_barrier : (async () -> Unit raise FrameIoError)?
+  mut published_cut : (Array[Int64], Int64, Int64)?
 }
+pub async fn SourceBackedJob::advance_graph_watermark(Self, String, Int64) -> Unit raise FrameIoError
+pub async fn SourceBackedJob::assign_source_partitions(Self, String, ArrayView[String]) -> Unit raise FrameIoError
+pub async fn SourceBackedJob::authority_snapshot(Self) -> LiveJobAuthoritySnapshot raise FrameIoError
 pub async fn SourceBackedJob::cancel(Self) -> Unit raise FrameIoError
 pub fn SourceBackedJob::close(Self) -> Unit
 pub async fn SourceBackedJob::compact_completed_source(Self) -> Unit raise FrameIoError
+pub fn SourceBackedJob::confirmed_watermark(Self) -> Int64
 pub fn SourceBackedJob::coordinator(Self) -> CoordinatorStore
 pub fn SourceBackedJob::event_count(Self) -> Int
 pub async fn SourceBackedJob::ingest(Self, @protocol.EventRecord) -> Int64 raise FrameIoError
 pub async fn SourceBackedJob::ingest_all(Self, ArrayView[@protocol.EventRecord]) -> Unit raise FrameIoError
 pub fn SourceBackedJob::job_store(Self) -> JobStore
-pub async fn SourceBackedJob::open(String, @plan.JobSpec, CoordinatorStore, JobStore, required_capability? : String, maximum_bytes? : Int64) -> Self raise FrameIoError
+pub async fn SourceBackedJob::open(String, @plan.JobSpec, CoordinatorStore, JobStore, required_capability? : String, maximum_bytes? : Int64, event_time_config? : @task.TaskEventTimeConfig, watermark_idle_timeout_ms? : Int64, watermark_inputs? : Array[String], external_watermarks? : Array[String], authority? : LiveJobAuthoritySnapshot) -> Self raise FrameIoError
+pub async fn SourceBackedJob::pause(Self) -> Unit raise FrameIoError
 pub fn SourceBackedJob::plan(Self) -> @plan.JobSpec
 pub async fn SourceBackedJob::refresh_work_plans(Self) -> Unit raise FrameIoError
+pub async fn SourceBackedJob::resume(Self) -> Unit raise FrameIoError
+pub fn SourceBackedJob::retired_inputs(Self) -> Array[@causal.EventRange]
 pub async fn SourceBackedJob::seal(Self) -> Unit raise FrameIoError
+pub fn SourceBackedJob::set_authority_barrier(Self, async () -> Unit raise FrameIoError) -> Unit
 
 type SourceEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type SourceIdentityRetirement derive(ToJson, @json.FromJson)
 
 type SourceLocation
 
 pub struct SourceLog {
   wal : Wal
-  entries : Map[Int, Array[SourceEntry]]
-  locations : Map[@causal.EventId, SourceLocation]
-  next_offsets : Map[Int, Int64]
-  retention : Map[Int, SourceRetentionMarker]
+  mut entries : Map[Int, Array[SourceEntry]]
+  mut locations : Map[@causal.EventId, SourceLocation]
+  mut next_offsets : Map[Int, Int64]
+  mut retention : Map[Int, SourceRetentionMarker]
+  mut retired : Array[@causal.EventRange]
   maximum_entries : Int
   write_lock : @moonbitlang/async.Mutex
 }
@@ -971,7 +1171,37 @@ pub fn SourceLog::contains(Self, @causal.EventId) -> Bool
 pub fn SourceLog::event_count(Self) -> Int
 pub fn SourceLog::next_offset(Self, Int) -> Int64?
 pub async fn SourceLog::open(String, maximum_bytes? : Int64, maximum_entries? : Int) -> Self raise SourceLogError
+pub async fn SourceLog::replace_snapshot(Self, SourceLogSnapshot) -> Unit raise SourceLogError
 pub fn SourceLog::retention_barrier(Self, Int, Int64) -> SourceRetentionBarrier raise SourceLogError
+pub fn SourceLog::snapshot(Self) -> SourceLogSnapshot
+
+pub(all) struct SourceLogEntrySnapshot {
+  partition : Int
+  offset : Int64
+  event : @protocol.EventRecord
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct SourceLogOffsetSnapshot {
+  partition : Int
+  next_offset : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct SourceLogRetentionSnapshot {
+  partition : Int
+  retain_from : Int64
+  covered_to : Int64
+  event_count : Int
+  event_digest : String
+  event_hash : UInt64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct SourceLogSnapshot {
+  version : Int
+  entries : Array[SourceLogEntrySnapshot]
+  offsets : Array[SourceLogOffsetSnapshot]
+  retention : Array[SourceLogRetentionSnapshot]
+  retired : Array[@causal.EventRange]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct SourceRetentionBarrier {
   partition : Int
@@ -990,6 +1220,26 @@ pub fn SourceRetentionBarrier::partition(Self) -> Int
 pub fn SourceRetentionBarrier::retain_from(Self) -> Int64
 
 type SourceRetentionMarker derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct SourceWatermarkSnapshot {
+  inputs : Array[InputWatermark]
+  watermark : Int64
+  idle_timeout_ms : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type SourceWatermarkStore
+
+pub struct SourceWatermarks {
+  inputs : Array[InputWatermark]
+  mut watermark : Int64
+  idle_timeout_ms : Int64
+}
+pub fn SourceWatermarks::advance(Self, Int64) -> Int64 raise FrameIoError
+pub fn SourceWatermarks::assign_partitions(Self, String, ArrayView[String], Int64) -> Unit raise FrameIoError
+pub fn SourceWatermarks::new(ArrayView[String], Int64, idle_timeout_ms? : Int64) -> Self raise FrameIoError
+pub fn SourceWatermarks::observe(Self, String, Int64, Int64, source_id? : String) -> Unit raise FrameIoError
+pub fn SourceWatermarks::restore(SourceWatermarkSnapshot) -> Self raise FrameIoError
+pub fn SourceWatermarks::snapshot(Self) -> SourceWatermarkSnapshot
 
 pub(all) struct SupervisorFailure {
   worker_id : String
@@ -1070,7 +1320,7 @@ pub struct TaskOutputLog {
 }
 pub async fn TaskOutputLog::append(Self, String, Int, Int, Int64, ArrayView[@task.TaskOutput]) -> Unit raise OutputLogError
 pub fn TaskOutputLog::close(Self) -> Unit
-pub async fn TaskOutputLog::compact(Self, TaskOutputRetentionBarrier) -> Unit raise OutputLogError
+pub async fn TaskOutputLog::compact(Self, TaskOutputRetentionBarrier, continuing? : Bool) -> Unit raise OutputLogError
 pub fn TaskOutputLog::is_trimmed(Self, String, Int64) -> Bool
 pub fn TaskOutputLog::next_sequence(Self, String) -> Int64
 pub async fn TaskOutputLog::open(String, maximum_bytes? : Int64) -> Self raise OutputLogError
@@ -1173,6 +1423,10 @@ pub fn WalStats::physical_bytes(Self) -> Int64
 pub fn WalStats::record_count(Self) -> Int
 pub fn WalStats::repaired_tail_bytes(Self) -> Int64
 
+type WatermarkWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+type WorkerJournalCheckpoint derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub struct WorkerMigration {
   version : Int
   identity : WorkerMigrationIdentity
@@ -1181,7 +1435,9 @@ pub struct WorkerMigration {
   delta_records : Int
   batches : Array[@protocol.EventBatch]
   deltas : Array[@protocol.DeltaBatch]
+  journal : Array[WorkerWalRecord]?
   outputs : Array[TaskOutputRecord]?
+  output_retention : OutputRetentionMarker?
   digest : String
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub async fn WorkerMigration::capture(WorkerMigrationIdentity, WorkerStoragePaths) -> Self raise WorkerMigrationError
@@ -1195,6 +1451,7 @@ pub async fn[R : @io.Reader] WorkerMigration::receive(R, maximum_bundle_bytes? :
 pub async fn WorkerMigration::save(Self, String) -> Unit raise WorkerMigrationError
 pub async fn[W : @io.Writer] WorkerMigration::send(Self, W, maximum_bundle_bytes? : Int) -> Unit raise WorkerMigrationError
 pub fn WorkerMigration::task_id(Self) -> String
+pub fn WorkerMigration::task_snapshot(Self) -> @task.TaskSnapshot
 pub fn WorkerMigration::to_bytes(Self) -> Bytes raise WorkerMigrationError
 
 type WorkerMigrationCursorEntry derive(Eq, ToJson, @debug.Debug, @json.FromJson)
@@ -1299,15 +1556,18 @@ pub struct WorkerTaskWork {
   initial_credit_bytes : Int64
   heartbeat_interval_ms : Int
   auth_token : String?
+  job_id : String?
   output_delivery : (async (TaskOutputRecord) -> Unit)?
   output_consumer_checkpoint_prefix : String?
   output_consumer_id : String?
   storage_budget_bytes : Int64?
 }
-pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, auth_token? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64) -> Self
+pub fn WorkerTaskWork::new(@socket.Tcp, String, String, String, String, ArrayView[String], String, @task.Task, checkpoint_path? : String, delta_wal_path? : String, output_log_path? : String, dynamic_assignment? : Bool, maximum_frame_bytes? : Int, initial_credit_events? : Int64, initial_credit_bytes? : Int64, heartbeat_interval_ms? : Int, auth_token? : String, job_id? : String, output_delivery? : async (TaskOutputRecord) -> Unit, output_consumer_checkpoint_prefix? : String, output_consumer_id? : String, storage_budget_bytes? : Int64) -> Self
 pub fn WorkerTaskWork::partition(Self) -> Int
 pub fn WorkerTaskWork::task(Self) -> @task.Task
 pub fn WorkerTaskWork::task_id(Self) -> String
+
+type WorkerWalRecord derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 // Type aliases
 

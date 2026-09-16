@@ -37,6 +37,7 @@ pub struct CausalLog[T] {
   admitted : Map[EventId, Event[T]]
   pending : Map[EventId, Event[T]]
   frontier : Set[EventId]
+  mut retired : Array[EventRange]
   maximum_pending : Int
 }
 
@@ -47,7 +48,13 @@ pub fn[T] CausalLog::new(
   if maximum_pending < 0 {
     raise CausalError::InvalidPendingLimit(maximum_pending)
   }
-  { admitted: {}, pending: {}, frontier: Set([]), maximum_pending, }
+  {
+    admitted: {},
+    pending: {},
+    frontier: Set([]),
+    retired: [],
+    maximum_pending,
+  }
 }
 
 ///|
@@ -65,12 +72,12 @@ pub fn[T] CausalLog::pending_count(self : CausalLog[T]) -> Int {
 /// missing parent. Runtime memory budgets use this total rather than only the
 /// admitted frontier.
 pub fn[T] CausalLog::state_count(self : CausalLog[T]) -> Int {
-  self.admitted.length() + self.pending.length()
+  self.admitted.length() + self.pending.length() + self.retired.length()
 }
 
 ///|
 pub fn[T] CausalLog::contains(self : CausalLog[T], id : EventId) -> Bool {
-  self.admitted.contains(id)
+  self.admitted.contains(id) || self.retired.any(range => range.contains(id))
 }
 
 ///|
@@ -80,7 +87,8 @@ pub fn[T] CausalLog::event(self : CausalLog[T], id : EventId) -> Event[T]? {
 
 ///|
 pub fn[T] CausalLog::frontier(self : CausalLog[T]) -> Frontier {
-  Frontier::from_set(self.frontier.copy())
+  let frontier = Frontier::from_set(self.frontier.copy())
+  { ..frontier, retired: ReadOnlyArray::from_array(self.retired.copy()), }
 }
 
 ///|
@@ -116,6 +124,7 @@ pub fn[T] CausalLog::copy(self : CausalLog[T]) -> CausalLog[T] {
     admitted: Map(self.admitted.to_array()),
     pending: Map(self.pending.to_array()),
     frontier: self.frontier.copy(),
+    retired: self.retired.copy(),
     maximum_pending: self.maximum_pending,
   }
 }
@@ -125,9 +134,7 @@ fn[T] CausalLog::missing_parents(
   self : CausalLog[T],
   event : Event[T],
 ) -> Array[EventId] {
-  let missing = event
-    .parents()
-    .filter(parent => !self.admitted.contains(parent))
+  let missing = event.parents().filter(parent => !self.contains(parent))
   missing.sort()
   missing
 }
@@ -154,9 +161,7 @@ fn[T] CausalLog::drain_ready(
   for ;; {
     let ready = self.pending
       .values()
-      .filter(event => {
-        event.parents().all(parent => self.admitted.contains(parent))
-      })
+      .filter(event => event.parents().all(parent => self.contains(parent)))
       .to_array()
     ready.sort_by((left, right) => Compare::compare(left.id(), right.id()))
     if ready.is_empty() {
@@ -180,6 +185,13 @@ pub fn[T : Eq] CausalLog::submit(
   event : Event[T],
 ) -> Admission[T] raise CausalError {
   let id = event.id()
+  if self.retired.any(range => range.contains(id)) {
+    return {
+      status: Duplicate,
+      admitted: ReadOnlyArray::from_array([]),
+      missing: ReadOnlyArray::from_array([]),
+    }
+  }
   match self.admitted.get(id) {
     Some(existing) =>
       if existing == event {
@@ -235,7 +247,7 @@ fn[T] CausalLog::is_ancestor_or_equal(
   descendant : EventId,
 ) -> Bool {
   if ancestor == descendant {
-    return self.admitted.contains(ancestor)
+    return self.contains(ancestor)
   }
   let stack = [descendant]
   let visited : Set[EventId] = Set([])
@@ -264,9 +276,11 @@ pub fn[T] CausalLog::frontier_covers(
   newer : Frontier,
   older : Frontier,
 ) -> Bool {
+  older.retired.all(range => range_is_covered(newer.retired[:], range)) &&
   older
   .ids()
   .all(old_id => {
+    newer.retired.any(range => range.contains(old_id)) ||
     newer.ids().any(new_id => self.is_ancestor_or_equal(old_id, new_id))
   })
 }

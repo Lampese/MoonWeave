@@ -12,6 +12,7 @@ struct JobExecutionPlan {
   probe : @protocol.Probe?
   required_capability : String?
   append_only : Bool?
+  retained_from : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -56,7 +57,12 @@ fn validate_job_work_plan(
     raise JobStoreError::PlanMismatch(plan.partition)
   }
   let batches = []
-  let mut next_offset = plan.start_offset
+  let retained_from = plan.retained_from.unwrap_or(plan.start_offset)
+  if retained_from < plan.start_offset ||
+    retained_from > current.applied_offset() + 1L {
+    raise JobStoreError::PlanMismatch(plan.partition)
+  }
+  let mut next_offset = retained_from
   for raw in plan.batches {
     let batch = @protocol.EventBatch::from_payload(raw.to_payload()) catch {
       _ => raise JobStoreError::PlanMismatch(plan.partition)
@@ -147,6 +153,7 @@ fn JobExecutionPlan::is_append_only_prefix_of(
     self.worker_id != next.worker_id ||
     self.epoch != next.epoch ||
     self.start_offset != next.start_offset ||
+    self.retained_from != next.retained_from ||
     self.required_capability != next.required_capability ||
     self.probe != next.probe ||
     self.batches.length() > next.batches.length() ||
@@ -190,19 +197,23 @@ fn JobStore::check_work(
     } else {
       None
     },
+    retained_from: match self.work_plans.get(work.partition()) {
+      Some(plan) => plan.retained_from
+      None => None
+    },
   }
   let plan = validate_job_work_plan(self.state, candidate)
   let preview = self.work_plans.copy()
   install_job_work_plan(self.state, preview, plan)
   let next_offset = match plan.batches.last() {
     Some(batch) => batch.end_offset() + 1L
-    None => plan.start_offset
+    None => plan.retained_from.unwrap_or(plan.start_offset)
   }
   if partition.next_offset() > next_offset {
     raise JobStoreError::PlanMismatch(plan.partition)
   }
   // A previously persisted reservation must end at a complete batch boundary.
-  if partition.next_offset() != plan.start_offset &&
+  if partition.next_offset() != plan.retained_from.unwrap_or(plan.start_offset) &&
     !plan.batches.any(batch => {
       batch.end_offset() + 1L == partition.next_offset()
     }) {

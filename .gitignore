@@ -6,7 +6,6 @@ target
 .repos/
 .moonagent/
 
-# Keep documentation local until it is ready for publication.
-*.md
+# Keep all Markdown documentation local.
+*.[mM][dD]
 docs/
-!PRODUCTION_READINESS.md

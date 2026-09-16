@@ -230,12 +230,61 @@ pub fn TaskSet::start(self : TaskSet) -> Unit raise TaskSetError {
 
 ///|
 pub fn TaskSet::drain(self : TaskSet) -> Unit raise TaskSetError {
-  self.validate_phase(TaskPhase::Running)
+  ignore(self.drain_at(9223372036854775807L))
+}
+
+///|
+/// Flush every event-time buffer at end-of-input, then enter the normal
+/// draining phase.  The returned dispatches are ordered by partition so the
+/// transport adapter can append them to its existing output log barrier.
+pub fn TaskSet::drain_at(
+  self : TaskSet,
+  watermark : Int64,
+) -> Array[TaskDispatch] raise TaskSetError {
+  let dispatches = self.advance_watermark(watermark)
   for task in self.tasks.values() {
     task.drain() catch {
       error => raise TaskSetError::Task(partition=task.partition(), error~)
     }
   }
+  dispatches
+}
+
+///|
+/// Advance every hosted partition atomically with respect to validation.
+/// Partitions retain their Running phase.
+pub fn TaskSet::advance_watermark(
+  self : TaskSet,
+  watermark : Int64,
+) -> Array[TaskDispatch] raise TaskSetError {
+  if watermark < 0L {
+    raise TaskSetError::Task(
+      partition=0,
+      error=TaskError::InvalidOffset(watermark),
+    )
+  }
+  self.validate_phase(TaskPhase::Running)
+  for task in self.tasks.values() {
+    task.validate_watermark(watermark) catch {
+      error => raise TaskSetError::Task(partition=task.partition(), error~)
+    }
+  }
+  let dispatches : Array[TaskDispatch] = []
+  for task in self.tasks.values() {
+    let outputs = task.process_watermark(watermark) catch {
+      error => raise TaskSetError::Task(partition=task.partition(), error~)
+    }
+    dispatches.push({
+      task_id: task.task_id(),
+      partition: task.partition(),
+      epoch: task.epoch(),
+      outputs,
+    })
+  }
+  dispatches.sort_by((left, right) => {
+    left.partition().compare(right.partition())
+  })
+  dispatches
 }
 
 ///|

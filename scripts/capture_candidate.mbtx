@@ -1,0 +1,87 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/shell",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+}
+
+///|
+async fn output(program : String, args : Array[String]) -> String {
+  let result = @shell.Cmd(program, args).output(timeout_ms=120000)
+  if result.exit_code() != 0 {
+    fail(result.stderr())
+  }
+  result.stdout()
+}
+
+///|
+async fn main {
+  let args = @env.args()
+  if args.length() != 2 {
+    fail("expected evidence directory")
+  }
+  let root = @fs.realpath(args[1])
+  let files = output("git", [
+    "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.mbt",
+    "*.mbtx", "*.mbti", "moon.mod", "moon.pkg", "moon.work", "**/moon.mod", "**/moon.pkg",
+    "*.c", "*.h",
+  ])
+  let existing : Array[String] = []
+  for path in files.split("\u0000") {
+    if !path.is_empty() && @fs.exists(path.to_owned()) {
+      existing.push(path.to_owned())
+    }
+  }
+  @fs.write_file(
+    root + "/source-files.list",
+    existing.join("\u0000") + "\u0000",
+  )
+  @fs.write_file(root + "/source.sha256", output("sha256sum", existing))
+  @shell.Cmd("tar", [
+    "-cf",
+    root + "/source.tar",
+    "--null",
+    "--verbatim-files-from",
+    "-T",
+    root + "/source-files.list",
+  ]).run(timeout_ms=120000)
+  let base = "_build/native/debug/build/moonweave/moonweave/cmd/"
+  @fs.mkdir(root + "/bin", recursive=true)
+  let binaries : Array[String] = []
+  for role in ["coordinator", "worker", "driver"] {
+    let target = root + "/bin/" + role
+    @shell.Cmd("cp", [
+      "--preserve=mode",
+      base + role + "/" + role + ".exe",
+      target,
+    ]).run()
+    binaries.push(target)
+  }
+  @fs.write_file(
+    root + "/candidate.diff",
+    output("git", ["diff", "HEAD", "--binary"]),
+  )
+  @fs.write_file(
+    root + "/candidate-status.txt",
+    output("git", ["status", "--short"]),
+  )
+  @fs.write_file(
+    root + "/candidate.json",
+    (
+      {
+        "revision": output("git", ["rev-parse", "HEAD"]).trim().to_owned(),
+        "toolchain": output("moon", ["version", "--all"]),
+        "source_archive": output("sha256sum", [root + "/source.tar"]),
+        "binary_hashes": output("sha256sum", binaries),
+        "tracked_and_untracked_source_files": existing.length(),
+        "hardware": output("uname", ["-a"]),
+        "cpu_count": output("nproc", []).trim().to_owned(),
+        "memory": output("free", ["-b"]),
+        "storage": output("df", ["-B1", root]),
+      } : Json).stringify(),
+    sync=@fs.Full,
+  )
+  println("Candidate source and binaries: " + root)
+}

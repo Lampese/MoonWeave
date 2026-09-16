@@ -22,11 +22,13 @@ pub(all) suberror SecurityError {
 pub struct Engine {
   mut log : @causal.CausalLog[SecurityEvent]
   state : SecurityState
+  mut witnesses : Array[SecurityWitness]
 }
 pub fn Engine::alert_count(Self) -> Int
 pub fn Engine::alerts(Self) -> Array[SecurityAlert]
 pub fn Engine::apply(Self, @causal.Event[SecurityEvent]) -> Array[SecurityAlert] raise SecurityError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[SecurityAlert] raise SecurityError
+pub fn Engine::compact(Self, @causal.CausalRetirement) -> Unit raise @causal.CausalError
 pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
 pub fn Engine::events(Self) -> Array[@causal.Event[SecurityEvent]]
@@ -34,6 +36,16 @@ pub fn Engine::frontier(Self) -> @causal.Frontier
 pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
 pub fn Engine::pending_count(Self) -> Int
 pub fn Engine::pending_events(Self) -> Array[@causal.Event[SecurityEvent]]
+pub fn Engine::restore(EngineSnapshot) -> Self raise SecurityError
+pub fn Engine::snapshot(Self) -> EngineSnapshot
+pub fn Engine::state_count(Self) -> Int
+
+pub(all) struct EngineSnapshot {
+  causal : @causal.CausalLogSnapshot[SecurityEvent]
+  stages : Array[SecurityStageSnapshot]
+  alerts : Array[SecurityAlert]
+  witnesses : Array[SecurityWitness]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct SecurityAlert {
   user_id : String
@@ -61,6 +73,11 @@ pub(all) struct SecurityPayload {
   kind : String
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
+pub(all) struct SecurityStageSnapshot {
+  user_id : String
+  kinds : Array[SecurityEventKind]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub struct SecurityState {
   stages : Map[String, @set.Set[SecurityEventKind]]
   alerts : @set.Set[String]
@@ -69,6 +86,12 @@ pub fn SecurityState::alerts(Self) -> Array[SecurityAlert]
 pub fn SecurityState::apply(Self, SecurityEvent) -> Array[SecurityAlert]
 pub fn SecurityState::copy(Self) -> Self
 pub fn SecurityState::new() -> Self
+
+pub(all) struct SecurityWitness {
+  user_id : String
+  kind : SecurityEventKind
+  identities : Array[@causal.EventRange]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 // Type aliases
 

@@ -227,10 +227,35 @@ pub fn JobSnapshot::failure_reason(self : JobSnapshot) -> String? {
 /// Mutable Coordinator-side lifecycle state. All methods are synchronous and
 /// deterministic; async adapters supply transport and durable barriers.
 pub struct JobState {
-  spec : @plan.JobSpec
+  mut spec : @plan.JobSpec
   mut phase : JobPhase
   partitions : Map[Int, JobPartition]
   mut failure_reason : String?
+}
+
+///|
+/// Authorize an additional placement target without changing key routing.
+pub fn JobState::allow_worker(
+  self : JobState,
+  worker_id : String,
+) -> Unit raise JobError {
+  if self.phase != Created && self.phase != Running {
+    raise JobError::InvalidTransition(expected=Running, actual=self.phase)
+  }
+  if self.spec.workers().contains(worker_id) {
+    return
+  }
+  let workers = self.spec.workers().to_owned()
+  workers.push(worker_id)
+  self.spec = @plan.JobSpec::new(
+    self.spec.job_id(),
+    self.spec.operator_id(),
+    self.spec.partition_count(),
+    workers[:],
+    self.spec.routes(),
+  ) catch {
+    error => raise JobError::Plan(error)
+  }
 }
 
 ///|
@@ -712,6 +737,39 @@ pub fn JobState::reassign(
   }
   self.partitions[partition] = replacement
   replacement
+}
+
+///|
+/// Move one live partition during an online rebalance. The partition is
+/// fenced through a failed intermediate state, then reopened at the next
+/// epoch; a migration bundle subsequently restores its durable cursors/state.
+pub fn JobState::move_partition(
+  self : JobState,
+  partition : Int,
+  source_worker_id : String,
+  source_epoch : Int,
+  replacement_worker_id : String,
+) -> JobPartition raise JobError {
+  let current = self.checked_partition(partition)
+  if current.worker_id != source_worker_id || current.epoch != source_epoch {
+    raise JobError::WorkerMismatch(
+      expected=source_worker_id,
+      actual=current.worker_id,
+    )
+  }
+  if current.phase != JobPartitionPhase::Running &&
+    current.phase != JobPartitionPhase::Draining {
+    raise JobError::PartitionNotRunning(partition)
+  }
+  self.fail_partition(
+    partition, source_worker_id, source_epoch, "online rebalance",
+  )
+  self.reassign(
+    partition,
+    replacement_worker_id,
+    source_epoch + 1,
+    current.start_offset,
+  )
 }
 
 ///|

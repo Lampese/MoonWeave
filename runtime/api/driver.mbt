@@ -7,6 +7,7 @@ pub(all) struct DriverConfig {
   coordinator_id : String
   driver_id : String
   endpoint : NodeEndpoint
+  coordinator_endpoints : Array[NodeEndpoint]
   incarnation : String
   auth_token : String?
 } derive(Eq)
@@ -32,9 +33,36 @@ pub fn DriverConfig::new(
     coordinator_id,
     driver_id,
     endpoint,
+    coordinator_endpoints: [endpoint],
     incarnation: "driver-" + driver_id,
     auth_token: None,
   }
+}
+
+///|
+/// Configure ordered Coordinator seeds used for reconnect and leader
+/// discovery. The first reachable endpoint is selected for each retry.
+pub fn DriverConfig::with_coordinator_endpoints(
+  self : DriverConfig,
+  endpoints : ArrayView[NodeEndpoint],
+) -> DriverConfig raise ApiError {
+  if endpoints.is_empty() || endpoints.any(endpoint => endpoint.port() == 0) {
+    raise ApiError::InvalidEndpoint(
+      "Coordinator endpoint list is empty or invalid",
+    )
+  }
+  {
+    ..self,
+    coordinator_endpoints: endpoints.to_owned(),
+    endpoint: endpoints[0],
+  }
+}
+
+///|
+pub fn DriverConfig::coordinator_endpoints(
+  self : DriverConfig,
+) -> ArrayView[NodeEndpoint] {
+  self.coordinator_endpoints[:]
 }
 
 ///|
@@ -91,18 +119,61 @@ pub fn DriverConfig::auth_token(self : DriverConfig) -> String? {
 }
 
 ///|
+async fn connect_driver_seed(
+  config : DriverConfig,
+  start : Int,
+) -> (@socket.Tcp, Int) raise ApiError {
+  let endpoints = config.coordinator_endpoints
+  let mut last_error = "no Coordinator endpoint"
+  for offset in 0..<endpoints.length() {
+    let index = (start + offset) % endpoints.length()
+    let endpoint = endpoints[index]
+    try
+      @socket.Tcp::connect_to_host(endpoint.host(), port=endpoint.port())
+    catch {
+      error => {
+        last_error = @debug.to_string(error)
+        continue
+      }
+    } noraise {
+      connection => return (connection, index)
+    }
+  }
+  raise ApiError::Cluster("connect Driver: " + last_error)
+}
+
+///|
+async fn connect_driver_seed_bounded(
+  config : DriverConfig,
+  start : Int,
+) -> (@socket.Tcp, Int)? noraise {
+  try
+    @async_runtime.with_timeout_opt(2000, () => {
+      connect_driver_seed(config, start)
+    })
+  catch {
+    _ => None
+  } noraise {
+    value => value
+  }
+}
+
+///|
 /// Persistent client-side control session. Every command waits for a matching
 /// status frame, so a completed command is never reported before its response
 /// crossed the async socket boundary.
 pub struct DriverClient {
   config : DriverConfig
   registry : OperatorRegistry
-  connection : @socket.Tcp
-  outbound : @protocol.FrameBuilder
-  session : @protocol.DriverClientSession
+  mut connection : @socket.Tcp
+  mut outbound : @protocol.FrameBuilder
+  mut session : @protocol.DriverClientSession
   mut closed : Bool
   operation_lock : @async_runtime.Mutex
   mut submitted : JobSubmission?
+  mut pending_update : JobSubmission?
+  mut endpoint_index : Int
+  mut connected : Bool
 }
 
 ///|
@@ -110,12 +181,9 @@ pub async fn DriverClient::connect(
   config : DriverConfig,
   registry? : OperatorRegistry = OperatorRegistry::builtins(),
 ) -> DriverClient raise ApiError {
-  let connection = @socket.Tcp::connect_to_host(
-    config.endpoint.host,
-    port=config.endpoint.port,
-  ) catch {
-    error =>
-      raise ApiError::Cluster("connect Driver: " + @debug.to_string(error))
+  guard connect_driver_seed_bounded(config, 0)
+    is Some((connection, endpoint_index)) else {
+    raise ApiError::Cluster("connect Driver: no Coordinator endpoint available")
   }
   let outbound = @protocol.FrameBuilder::new(
     config.cluster_id,
@@ -150,6 +218,9 @@ pub async fn DriverClient::connect(
     closed: false,
     operation_lock: @async_runtime.Mutex::Mutex(),
     submitted: None,
+    pending_update: None,
+    endpoint_index,
+    connected: true,
   }
 }
 
@@ -175,6 +246,10 @@ fn driver_command_name(command : JobCommand) -> String {
     JobCommand::Submit(_) => "submit"
     JobCommand::Input(_) => "input"
     JobCommand::Status => "status"
+    JobCommand::Pause => "pause"
+    JobCommand::Resume => "resume"
+    JobCommand::Rescale(_) => "rescale"
+    JobCommand::Update(_) => "update"
     JobCommand::Drain => "drain"
     JobCommand::Cancel => "cancel"
   }
@@ -185,9 +260,13 @@ fn driver_command_payload(command : JobCommand) -> Json? {
   match command {
     JobCommand::Submit(_)
     | JobCommand::Status
+    | JobCommand::Pause
+    | JobCommand::Resume
     | JobCommand::Drain
     | JobCommand::Cancel => None
     JobCommand::Input(events) => Some(@json.to_json(events))
+    JobCommand::Rescale(workers) => Some(@json.to_json(workers))
+    JobCommand::Update(submission) => Some(@json.to_json(submission))
   }
 }
 
@@ -218,11 +297,13 @@ fn driver_status_to_api(
     accepted_events: status.accepted_events(),
     failure: status.failure(),
     idempotent_sink_required,
+    paused: status.is_paused(),
+    parallelism: status.parallelism,
   }
 }
 
 ///|
-async fn DriverClient::exchange(
+async fn DriverClient::exchange_once(
   self : DriverClient,
   kind : @protocol.FrameKind,
   payload : String,
@@ -234,13 +315,15 @@ async fn DriverClient::exchange(
   }
   @runtime.write_frame(self.connection, frame) catch {
     error => {
-      self.close()
+      self.connection.close()
+      self.connected = false
       raise ApiError::Cluster("write Driver frame: " + @debug.to_string(error))
     }
   }
   let response = @runtime.read_frame(self.connection) catch {
     error => {
-      self.close()
+      self.connection.close()
+      self.connected = false
       raise ApiError::Cluster("read Driver status: " + @debug.to_string(error))
     }
   }
@@ -267,15 +350,37 @@ async fn DriverClient::exchange(
   }
   let status = match reply.result {
     Ok(value) => value
+    Err(reason) if reason.contains("network quorum leader") ||
+      reason.contains("Coordinator quorum is unavailable") ||
+      reason.contains("NoQuorum") ||
+      reason.contains("NotLeader") ||
+      reason.contains("quorum") => {
+      self.connection.close()
+      self.connected = false
+      raise ApiError::Cluster(reason)
+    }
     Err(reason) => raise ApiError::InvalidDriverCommand(reason)
   }
-  let idempotent_sink_required = match self.submitted {
+  // An update response carries the new plan while the client still keeps the
+  // previous submission as the reconnect envelope. Validate the response
+  // against the in-flight update, but validate a replayed DriverSubmit
+  // against the old envelope used to bind the new session.
+  let expected_submission : JobSubmission? = if kind ==
+    @protocol.FrameKind::DriverSubmit {
+    self.submitted
+  } else {
+    match self.pending_update {
+      Some(value) => Some(value)
+      None => self.submitted
+    }
+  }
+  let idempotent_sink_required = match expected_submission {
     Some(submission) =>
       submission.job().definition().sink().requires_idempotent_consumer()
     None => true
   }
   let converted = driver_status_to_api(status, idempotent_sink_required)
-  match self.submitted {
+  match expected_submission {
     Some(submission) if converted.submission_id != submission.submission_id ||
       converted.job_id != submission.job.definition.job_id ||
       converted.plan_digest != submission.job.plan_digest =>
@@ -283,6 +388,164 @@ async fn DriverClient::exchange(
     _ => ()
   }
   converted
+}
+
+///|
+/// Exchange a command with reconnect and ordered endpoint failover. A
+/// transport failure is retried by establishing a fresh Driver session and
+/// replaying the durable submission before the original command.
+async fn DriverClient::exchange(
+  self : DriverClient,
+  kind : @protocol.FrameKind,
+  payload : String,
+) -> JobRunStatus raise ApiError {
+  self.ensure_open()
+  // Failover elections and quorum catch-up may outlive one heartbeat period.
+  // Keep retrying within the CLI's bounded command timeout so a transient
+  // leader handoff is not surfaced as a permanent Driver failure.
+  let attempts = self.config.coordinator_endpoints.length() * 10
+  let mut last_error = "Coordinator connection failed"
+  for _ in 0..<attempts {
+    if !self.connected {
+      let next = (self.endpoint_index + 1) %
+        self.config.coordinator_endpoints.length()
+      guard connect_driver_seed_bounded(self.config, next)
+        is Some((connection, index)) else {
+        last_error = "Coordinator reconnect timed out"
+        @async_runtime.sleep(100) catch {
+          error => raise driver_error("backoff Driver reconnect", error)
+        }
+        continue
+      }
+      self.connection = connection
+      self.endpoint_index = index
+      self.connected = true
+      self.session = @protocol.DriverClientSession::new(
+        self.config.cluster_id,
+        self.config.coordinator_id,
+        self.config.driver_id,
+      ) catch {
+        error => {
+          self.connection.close()
+          self.connected = false
+          last_error = @debug.to_string(error)
+          continue
+        }
+      }
+      self.outbound = @protocol.FrameBuilder::new(
+        self.config.cluster_id,
+        self.config.driver_id,
+        self.config.incarnation,
+      ) catch {
+        error => {
+          self.connection.close()
+          self.connected = false
+          last_error = @debug.to_string(error)
+          continue
+        }
+      }
+      // The server binds a connection only after Submit. Replay it before a
+      // command so a new leader can reconstruct the same Driver session.
+      let expected_submission : JobSubmission? = self.submitted
+      match expected_submission {
+        Some(submission) => {
+          let submit_payload = @protocol.DriverSubmit::new(
+            submission.submission_id(),
+            driver_submit_payload(submission),
+            auth_token?=self.config.auth_token,
+          ).to_payload() catch {
+            error => raise ApiError::Cluster(@debug.to_string(error))
+          }
+          let mut replayed = try
+            @async_runtime.with_timeout_opt(5000, () => {
+              self.exchange_once(
+                @protocol.FrameKind::DriverSubmit,
+                submit_payload,
+              )
+            })
+          catch {
+            error => {
+              last_error = "Coordinator replay: " + @debug.to_string(error)
+              None
+            }
+          } noraise {
+            value => value
+          }
+          if replayed is None && self.pending_update is Some(candidate) {
+            // The update may have been committed after the old replay was
+            // received but before its reply was lost. In that case the old
+            // envelope is rejected by the durable store; retry the candidate
+            // envelope so the new session can bind to the installed plan.
+            let previous_submission = self.submitted
+            self.submitted = Some(candidate)
+            let candidate_payload = @protocol.DriverSubmit::new(
+              candidate.submission_id(),
+              driver_submit_payload(candidate),
+              auth_token?=self.config.auth_token,
+            ).to_payload() catch {
+              error => raise ApiError::Cluster(@debug.to_string(error))
+            }
+            let candidate_replayed = try
+              @async_runtime.with_timeout_opt(5000, () => {
+                self.exchange_once(
+                  @protocol.FrameKind::DriverSubmit,
+                  candidate_payload,
+                )
+              })
+            catch {
+              error => {
+                last_error = "Coordinator candidate replay: " +
+                  @debug.to_string(error)
+                None
+              }
+            } noraise {
+              value => value
+            }
+            if candidate_replayed is Some(_) {
+              replayed = candidate_replayed
+            } else {
+              self.submitted = previous_submission
+            }
+          }
+          guard replayed is Some(replayed_status) else {
+            self.connection.close()
+            self.connected = false
+            if !last_error.has_prefix("Coordinator replay:") {
+              last_error = "Coordinator replay timed out"
+            }
+            @async_runtime.sleep(100) catch {
+              error => raise driver_error("backoff Driver replay", error)
+            }
+            continue
+          }
+          // Rebinding already completes an in-flight submit. A second submit
+          // on the now-running session violates the Driver protocol.
+          if kind == @protocol.FrameKind::DriverSubmit {
+            return replayed_status
+          }
+        }
+        None => ()
+      }
+    }
+    try self.exchange_once(kind, payload) catch {
+      error =>
+        match error {
+          ApiError::Cluster(reason) => {
+            self.connection.close()
+            self.connected = false
+            last_error = reason
+            @async_runtime.sleep(100) catch {
+              error => raise driver_error("backoff Driver reconnect", error)
+            }
+            continue
+          }
+          _ => raise error
+        }
+    } noraise {
+      status => return status
+    }
+  }
+  raise ApiError::Cluster(last_error)
 }
 
 ///|
@@ -329,6 +592,17 @@ pub async fn DriverClient::command(
     error => raise driver_error("lock Driver", error)
   }
   defer self.operation_lock.release()
+  self.command_locked(command)
+}
+
+///|
+/// Execute a command while the client operation lock is already held. This
+/// lets Update keep its pending submission state coherent across reconnects
+/// without attempting to acquire the same non-reentrant lock twice.
+async fn DriverClient::command_locked(
+  self : DriverClient,
+  command : JobCommand,
+) -> JobRunStatus raise ApiError {
   self.ensure_open()
   if self.submitted is None {
     raise ApiError::UnknownSubmission("submit first")
@@ -348,6 +622,43 @@ pub async fn DriverClient::command(
 }
 
 ///|
+/// Replace a paused submission after the Coordinator validates state-schema
+/// compatibility and recreates the live Worker execution.
+pub async fn DriverClient::update(
+  self : DriverClient,
+  submission : JobSubmission,
+) -> JobRunStatus raise ApiError {
+  self.operation_lock.acquire() catch {
+    error => raise driver_error("lock Driver update", error)
+  }
+  defer self.operation_lock.release()
+  self.ensure_open()
+  guard self.submitted is Some(previous) else {
+    raise ApiError::UnknownSubmission("submit first")
+  }
+  if previous.submission_id() != submission.submission_id() {
+    raise ApiError::RequestConflict(submission.submission_id())
+  }
+  self.pending_update = Some(submission)
+  let result = Ok(self.command_locked(JobCommand::update(submission))) catch {
+    error => Err(error)
+  }
+  // A rejected or exhausted update must not leave the new submission as a
+  // reconnect hint. The next call should retry from the durable old plan.
+  self.pending_update = None
+  let status = match result {
+    Ok(value) => value
+    Err(error) => raise error
+  }
+  // Keep the previous envelope during the command so reconnect replay still
+  // binds the session to the installed submission. Replace it only after the
+  // Coordinator has durably accepted the update.
+  self.submitted = Some(submission)
+  self.pending_update = None
+  status
+}
+
+///|
 pub async fn DriverClient::input(
   self : DriverClient,
   events : ArrayView[Event],
@@ -360,6 +671,31 @@ pub async fn DriverClient::status(
   self : DriverClient,
 ) -> JobRunStatus raise ApiError {
   self.command(JobCommand::status())
+}
+
+///|
+/// Pause/resume are durable operational controls and may be retried safely.
+pub async fn DriverClient::pause(
+  self : DriverClient,
+) -> JobRunStatus raise ApiError {
+  self.command(JobCommand::pause())
+}
+
+///|
+pub async fn DriverClient::resume(
+  self : DriverClient,
+) -> JobRunStatus raise ApiError {
+  self.command(JobCommand::resume())
+}
+
+///|
+/// Request a repartition across statically registered Worker identities.
+pub async fn DriverClient::rescale(
+  self : DriverClient,
+  workers : ArrayView[String],
+  parallelism? : Int,
+) -> JobRunStatus raise ApiError {
+  self.command(JobCommand::rescale(workers, parallelism?))
 }
 
 ///|
@@ -524,6 +860,30 @@ fn driver_command_from_wire(
           JobCommand::Input(events)
         }
         "status" if value.payload() is None => JobCommand::Status
+        "pause" if value.payload() is None => JobCommand::Pause
+        "resume" if value.payload() is None => JobCommand::Resume
+        "rescale" => {
+          guard value.payload() is Some(payload) else {
+            raise ApiError::InvalidDriverCommand(
+              "rescale requires a worker list",
+            )
+          }
+          let request : RescaleRequest = @json.from_json(payload) catch {
+            _ =>
+              raise ApiError::InvalidDriverCommand("malformed rescale payload")
+          }
+          JobCommand::Rescale(request)
+        }
+        "update" => {
+          guard value.payload() is Some(payload) else {
+            raise ApiError::InvalidDriverCommand("update requires a submission")
+          }
+          let submission : JobSubmission = @json.from_json(payload) catch {
+            _ =>
+              raise ApiError::InvalidDriverCommand("malformed update payload")
+          }
+          JobCommand::Update(submission)
+        }
         "drain" if value.payload() is None => JobCommand::Drain
         "cancel" if value.payload() is None => JobCommand::Cancel
         _ => raise ApiError::InvalidDriverCommand(value.command())
@@ -552,6 +912,8 @@ fn driver_status_from_api(status : JobRunStatus) -> @protocol.DriverStatus {
     driver_phase_name(status.phase()),
     status.accepted_events(),
     status.failure(),
+    paused=status.is_paused(),
+    parallelism=status.parallelism(),
   )
 }
 
@@ -559,7 +921,7 @@ fn driver_status_from_api(status : JobRunStatus) -> @protocol.DriverStatus {
 async fn serve_driver_connection(
   connection : @socket.Tcp,
   listener : DriverControlListener,
-  handler : async (JobCommand) -> Result[JobRunStatus, String],
+  handler : async (String, JobCommand) -> Result[JobRunStatus, String],
 ) -> Unit {
   defer connection.close()
   let cluster_id = listener.config.cluster_id
@@ -595,7 +957,27 @@ async fn serve_driver_connection(
         )
       }
       if submit.auth_token() != Some(expected) {
-        raise ApiError::Cluster("Driver authentication failed")
+        // Authentication is a permanent rejection, not a broken transport.
+        // Return a validated reply so reconnect logic cannot mistake it for
+        // a leader failure and retry the same credentials indefinitely.
+        let outbound = @protocol.FrameBuilder::new(
+          cluster_id,
+          coordinator_id,
+          first.worker_incarnation(),
+          session_id=session.session_id(),
+        )
+        let rejected : @protocol.DriverReply = {
+          request_id: first.message_id(),
+          result: Err("Driver authentication failed"),
+        }
+        @runtime.write_frame(
+          connection,
+          outbound.build(
+            @protocol.FrameKind::DriverStatus,
+            rejected.to_payload(),
+          ),
+        )
+        return
       }
     }
   }
@@ -615,6 +997,7 @@ async fn serve_driver_connection(
     "not handled",
   )
   let mut bound = false
+  let mut bound_submission = ""
   let mut frame = first
   let mut inbound_value = inbound
   for ;; {
@@ -631,10 +1014,18 @@ async fn serve_driver_connection(
           if !bound && !(command is JobCommand::Submit(_)) {
             raise ApiError::UnknownSubmission("submit first")
           }
-          match handler(command) {
+          let submission_id = match inbound_value {
+            @protocol.DriverInbound::Submit(value) => value.submission_id()
+            @protocol.DriverInbound::Command(_) => bound_submission
+          }
+          if bound && submission_id != bound_submission {
+            raise ApiError::RequestConflict(submission_id)
+          }
+          match handler(submission_id, command) {
             Ok(status) => {
               if command is JobCommand::Submit(_) {
                 bound = true
+                bound_submission = submission_id
               }
               Ok(driver_status_from_api(status))
             }
@@ -703,7 +1094,9 @@ pub async fn DriverControlListener::run(
   self.server.run_forever(max_connections~, allow_failure=true) <| ((
     connection,
     _,
-  ) => serve_driver_connection(connection, self, handler))
+  ) => {
+    serve_driver_connection(connection, self, (_, command) => handler(command))
+  })
 }
 
 ///|
@@ -714,7 +1107,7 @@ pub async fn DriverControlListener::run_once(
   handler : async (JobCommand) -> Result[JobRunStatus, String],
 ) -> Unit {
   let (connection, _) = self.server.accept()
-  serve_driver_connection(connection, self, handler)
+  serve_driver_connection(connection, self, (_, command) => handler(command))
 }
 
 ///|

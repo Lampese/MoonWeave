@@ -1,0 +1,170 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/shell",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/core/string",
+}
+
+///|
+struct Step {
+  name : String
+  args : Array[String]
+  timeout_ms : Int
+}
+
+///|
+async fn main {
+  let args = @env.args()
+  let duration = if args.length() > 1 { @string.parse_int(args[1]) } else { 0 }
+  if duration < 0 || duration > 172800000 {
+    fail("invalid soak duration")
+  }
+  let root = @fs.tmpdir(prefix="moonweave-final-acceptance-")
+  println("Final acceptance evidence: " + root)
+  let started = @async.now()
+  let steps = [
+    Step::{
+      name: "check",
+      args: ["check", "--target", "native", "--warn-list", "-a"],
+      timeout_ms: 180000,
+    },
+    Step::{
+      name: "build",
+      args: [
+        "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+        "cmd/performance_fixture", "cmd/coordinator_network_ha_fixture", "--warn-list",
+        "-a",
+      ],
+      timeout_ms: 600000,
+    },
+    Step::{
+      name: "test",
+      args: ["test", "--target", "native", "--warn-list", "-a"],
+      timeout_ms: 600000,
+    },
+    Step::{
+      name: "info",
+      args: ["info", "--target", "native"],
+      timeout_ms: 180000,
+    },
+    Step::{
+      name: "candidate",
+      args: ["run", "scripts/capture_candidate.mbtx", root],
+      timeout_ms: 120000,
+    },
+    Step::{
+      name: "rescale",
+      args: ["run", "scripts/rescale_acceptance.mbtx"],
+      timeout_ms: 180000,
+    },
+    Step::{
+      name: "kafka-graph",
+      args: ["run", "scripts/graph_kafka_acceptance.mbtx"],
+      timeout_ms: 300000,
+    },
+    Step::{
+      name: "network-service-ha",
+      args: ["run", "scripts/network_service_ha_acceptance.mbtx"],
+      timeout_ms: 180000,
+    },
+    Step::{
+      name: "crash-boundaries",
+      args: ["run", "scripts/crash_boundary_acceptance.mbtx"],
+      timeout_ms: 300000,
+    },
+    Step::{
+      name: "multi-job",
+      args: ["run", "scripts/multi_job_acceptance.mbtx", "0"],
+      timeout_ms: 180000,
+    },
+    Step::{
+      name: "signal",
+      args: ["run", "scripts/signal_acceptance.mbtx"],
+      timeout_ms: 180000,
+    },
+  ]
+  if duration > 0 {
+    steps.push({
+      name: "soak",
+      args: [
+        "run",
+        "scripts/multi_job_acceptance.mbtx",
+        duration.to_string(),
+        "60000",
+      ],
+      timeout_ms: duration + 300000,
+    })
+  }
+  let results : Array[Json] = []
+  for step in steps {
+    @fs.write_file(
+      root + "/progress.json",
+      (
+        {
+          "state": "running",
+          "current_step": step.name,
+          "completed": results,
+          "elapsed_ms": (@async.now() - started).to_string(),
+          "required_soak_ms": duration,
+        } : Json).stringify(),
+      sync=@fs.Full,
+    )
+    println("START: " + step.name)
+    let before = @async.now()
+    let log = @fs.open(
+      root + "/" + step.name + ".log",
+      mode=@fs.WriteOnly,
+      create_mode=@fs.CreateOrTruncate,
+    )
+    let exit_code = @shell.Cmd("moon", step.args).each_line(
+      line => {
+        log.write(line + "\n")
+        println(line)
+      },
+      timeout_ms=step.timeout_ms,
+    ) catch {
+      error => {
+        log.close()
+        @fs.write_file(
+          root + "/progress.json",
+          ({ "state": "failed", "step": step.name, "completed": results } : Json).stringify(),
+          sync=@fs.Full,
+        )
+        raise error
+      }
+    }
+    log.sync()
+    log.close()
+    results.push({
+      "name": step.name,
+      "exit_code": exit_code,
+      "elapsed_ms": (@async.now() - before).to_string(),
+    })
+    if exit_code != 0 {
+      @fs.write_file(
+        root + "/progress.json",
+        ({ "state": "failed", "step": step.name, "completed": results } : Json).stringify(),
+        sync=@fs.Full,
+      )
+      fail("acceptance failed: " + step.name + "; evidence " + root)
+    }
+    println("PASS: " + step.name)
+  }
+  @shell.Cmd("sha256sum", ["--check", "--quiet", root + "/source.sha256"]).run()
+  let report : Json = {
+    "passed": true,
+    "passed_24_hours": duration >= 86400000,
+    "steps": results,
+    "elapsed_ms": (@async.now() - started).to_string(),
+    "required_soak_ms": duration,
+  }
+  @fs.write_file(root + "/result.json", report.stringify(), sync=@fs.Full)
+  @fs.write_file(root + "/progress.json", report.stringify(), sync=@fs.Full)
+  println(
+    "PASS: final candidate checks; 24-hour gate=" +
+    (duration >= 86400000).to_string(),
+  )
+}

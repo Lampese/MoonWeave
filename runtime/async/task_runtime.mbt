@@ -26,10 +26,12 @@ pub async fn run_worker_task(
   output_log_path? : String,
   dynamic_assignment? : Bool = false,
   auth_token? : String,
+  job_id? : String,
   output_delivery? : async (TaskOutputRecord) -> Unit,
   output_consumer_checkpoint_prefix? : String,
   output_consumer_id? : String,
   storage_budget_bytes? : Int64,
+  execution_lane? : ExecutionLane,
 ) -> WorkerRunSummary raise FrameIoError {
   let canonical_wal_path = wal_path
   if !dynamic_assignment {
@@ -156,10 +158,19 @@ pub async fn run_worker_task(
   let terminal_barrier : async () -> Unit raise FrameIoError = () => {
     match (output_log, output_consumer) {
       (Some(log), Some(consumer)) => {
+        if consumer.next_sequence() > 0L &&
+          !log.is_trimmed(task.task_id(), consumer.next_sequence() - 1L) {
+          consumer.compact() catch {
+            error => raise FrameIoError::Handler(@debug.to_string(error))
+          }
+        }
         let barrier = consumer.retention_barrier() catch {
           error => raise FrameIoError::Handler(@debug.to_string(error))
         }
-        log.compact(barrier) catch {
+        log.compact(
+          barrier,
+          continuing=task.phase() == @task.TaskPhase::Running,
+        ) catch {
           error => raise FrameIoError::OutputLog(error)
         }
         output_retention_barrier = Some(barrier)
@@ -175,6 +186,12 @@ pub async fn run_worker_task(
   }
   let delta_handler : (@protocol.DeltaBatch) -> Unit raise = delta => {
     let outputs = task.process_delta(delta) catch {
+      error => raise FrameIoError::Task(error)
+    }
+    emit(outputs[:])
+  }
+  let watermark_handler : (Int64) -> Unit raise FrameIoError = watermark => {
+    let outputs = task.process_watermark(watermark) catch {
       error => raise FrameIoError::Task(error)
     }
     emit(outputs[:])
@@ -224,6 +241,7 @@ pub async fn run_worker_task(
       initial_credit_bytes~,
       heartbeat_interval_ms~,
       storage_budget_bytes?,
+      execution_lane?,
       delta_handler~,
       delta_wal_path?,
       assignment_validator=assignment => {
@@ -248,9 +266,12 @@ pub async fn run_worker_task(
       },
       state_restore~,
       state_snapshot~,
+      watermark_handler~,
+      state_watermark=() => task.watermark(),
       output_barrier~,
       requested_partition=task.partition(),
       auth_token?,
+      job_id?,
       storage_prepare=assignment => {
         storage_owner = Some(
           migration_lock(canonical_wal_path + ".migration") catch {
@@ -359,6 +380,12 @@ pub async fn run_worker_task(
       terminal_barrier~,
       causal_state_limit=task.max_state_events(),
       operator_state_count=() => task.state_memory_count(),
+      state_compact=certificate => {
+        task.compact(certificate) catch {
+          error => raise FrameIoError::Task(error)
+        }
+      },
+      reclamation_barrier=terminal_barrier,
       primary_admission_validator=batch => {
         task.validate_batch(batch) catch {
           error => raise FrameIoError::Task(error)

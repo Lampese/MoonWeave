@@ -11,6 +11,7 @@ struct OutputConsumerEntry {
   // Set only on a compacted header/ack pair. Keeping this optional preserves
   // replay of checkpoints written before consumer WAL compaction existed.
   compacted : Bool?
+  start_sequence : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -71,7 +72,8 @@ fn replay_output_consumer(
     if entry.version != 1 {
       raise OutputConsumerError::UnsupportedVersion(entry.version)
     }
-    if { ..entry, record: None, compacted: None, } != binding {
+    if { ..entry, record: None, compacted: None, start_sequence: None, } !=
+      binding {
       raise OutputConsumerError::IdentityMismatch
     }
     if index == 0 {
@@ -82,6 +84,11 @@ fn replay_output_consumer(
         None => false
         Some(value) => value
       }
+      let start = entry.start_sequence.unwrap_or(0L)
+      if start < 0L || start > log.retained_from(binding.task_id) {
+        raise OutputConsumerError::Malformed
+      }
+      next_sequence = start
       continue
     }
     if compacted {

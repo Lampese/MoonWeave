@@ -1,0 +1,403 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+}
+
+///|
+struct Status {
+  job_id : String
+  phase : String
+  accepted_events : Int64
+  paused : Bool
+  parallelism : Int
+} derive(FromJson)
+
+///|
+struct Sum {
+  key : String
+  total : Int64
+} derive(Debug, Eq, FromJson)
+
+///|
+enum Output {
+  KeyedSum(Sum)
+} derive(Debug, Eq, FromJson)
+
+///|
+struct Record {
+  task_id : String
+  sequence : Int64
+  output : Output
+} derive(FromJson)
+
+///|
+struct Remote {
+  binary : String
+  endpoint : String
+  job_config : String
+}
+
+///|
+fn input(sequence : Int64) -> Json {
+  {
+    "record": {
+      "id": { "origin": "rescale-input", "sequence": sequence.to_string() },
+      "parents": [],
+      "key": "key-" + (sequence % 8L).to_string(),
+      "payload": { "value": "1" },
+    },
+  }
+}
+
+///|
+async fn signal_and_wait(pid : Int, signal : String) -> Unit {
+  let status = @process.run("/bin/kill", [signal, pid.to_string()])
+  if status == 0 {
+    ignore(@process.wait_pid(pid) catch { _ => 0 })
+  }
+}
+
+///|
+async fn Remote::command(
+  self : Remote,
+  command : String,
+  events? : Array[Json],
+  workers? : String,
+  parallelism? : Int,
+) -> Status {
+  let args = [
+    "--endpoint",
+    self.endpoint,
+    "--cluster",
+    "rescale",
+    "--coordinator",
+    "coordinator",
+    "--job-config",
+    self.job_config,
+    "--command",
+    command,
+    "--format",
+    "json",
+  ]
+  if events is Some(values) {
+    let path = self.job_config + ".events.json"
+    @fs.write_file(path, @json.to_json(values).stringify())
+    args.push_iter(["--events", path].iter())
+  }
+  if workers is Some(value) {
+    args.push_iter(["--workers", value].iter())
+  }
+  if parallelism is Some(value) {
+    args.push_iter(["--parallelism", value.to_string()].iter())
+  }
+  let output = @shell.Cmd(self.binary, args).output(timeout_ms=60000)
+  if output.exit_code() != 0 {
+    fail(command + ": " + output.stderr() + output.stdout())
+  }
+  @json.from_json(@json.parse(output.stdout()))
+}
+
+///|
+async fn wait_port(endpoint : String) -> Unit {
+  @async.with_timeout(15000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(20)
+      } noraise {
+        connection => {
+          connection.close()
+          return
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn start_worker(
+  binary : String,
+  root : String,
+  endpoint : String,
+  job_config : String,
+  worker : String,
+  round : Int,
+) -> Int {
+  let log = @process.redirect_to_file(
+    root + "/" + worker + "-" + round.to_string() + ".log",
+  )
+  defer log.close()
+  @process.spawn_orphan(
+    binary,
+    [
+      "--cluster",
+      "rescale",
+      "--coordinator",
+      "coordinator",
+      "--coordinator-endpoint",
+      endpoint,
+      "--worker",
+      worker,
+      "--incarnation",
+      "boot-" + worker,
+      "--managed",
+      "true",
+      "--storage",
+      root + "/worker-" + worker,
+      "--job-config",
+      job_config,
+      "--storage-budget-bytes",
+      "65536",
+    ],
+    stdout=log,
+    stderr=log,
+  )
+}
+
+///|
+async fn wait_outputs(path : String, count : Int) -> Unit {
+  @async.with_timeout(30000, () => {
+    for ;; {
+      if @fs.exists(path) {
+        let mut seen = 0
+        for line in @fs.read_file(path).text().split("\n") {
+          if !line.trim().is_empty() {
+            seen += 1
+          }
+        }
+        if seen >= count {
+          return
+        }
+      }
+      @async.sleep(25)
+    }
+  })
+}
+
+///|
+async fn verify_output(path : String, expected : Int) -> Unit {
+  let identities : Map[(String, Int64), Output] = Map([])
+  let totals : Map[String, Set[Int64]] = Map([])
+  for line in @fs.read_file(path).text().split("\n") {
+    if line.trim().is_empty() {
+      continue
+    }
+    let record : Record = @json.from_json(@json.parse(line))
+    let key = (record.task_id, record.sequence)
+    match identities.get(key) {
+      Some(previous) => assert_eq(previous, record.output)
+      None => {
+        identities[key] = record.output
+        let KeyedSum(sum) = record.output
+        let values = totals.get_or_init(sum.key, () => Set([]))
+        assert_true(values.add_and_check(sum.total))
+      }
+    }
+  }
+  assert_eq(identities.length(), expected)
+  assert_eq(totals.length(), 8)
+  for values in totals.values() {
+    assert_eq(values.length(), expected / 8)
+    for total in 1..<=(expected / 8) {
+      assert_true(values.contains(total.to_int64()))
+    }
+  }
+}
+
+///|
+async fn main {
+  let root = @fs.tmpdir(prefix="moonweave-rescale-")
+  println("Rescale evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+    "--warn-list", "-a",
+  ]).run(timeout_ms=180000)
+  let binaries = "_build/native/debug/build/moonweave/moonweave/cmd/"
+  let coordinator_binary = @fs.realpath(
+    binaries + "coordinator/coordinator.exe",
+  )
+  let worker_binary = @fs.realpath(binaries + "worker/worker.exe")
+  let driver_binary = @fs.realpath(binaries + "driver/driver.exe")
+  let data_socket = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let driver_socket = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+  let data = "127.0.0.1:" + data_socket.addr.port().to_string()
+  let control = "127.0.0.1:" + driver_socket.addr.port().to_string()
+  data_socket.close()
+  driver_socket.close()
+  let definition : Json = {
+    "job_id": "rescale-job",
+    "operator": { "id": "keyed-sum", "version": 1 },
+    "partition_count": 4,
+    "parallelism": 2,
+    "workers": ["a", "b"],
+    "routes": [],
+    "source": "Events",
+    "partitioning": "ByKey",
+    "sink": ["JsonLines", root + "/output.jsonl"],
+    "max_state_events": 128,
+  }
+  let definition_path = root + "/definition.json"
+  @fs.write_file(definition_path, definition.stringify())
+  let compiled = @shell.Cmd(driver_binary, [
+    "--command", "compile", "--job-config", definition_path, "--submission-id", "rescale-submit",
+  ]).output(timeout_ms=10000)
+  if compiled.exit_code() != 0 {
+    fail(compiled.stderr())
+  }
+  let job_config = root + "/job.json"
+  @fs.write_file(job_config, compiled.stdout())
+  // Coordinator has no Worker filesystem locations. Every bundle must pass
+  // through the authenticated Worker allocation transport.
+  let workers = "a@boot-a,b@boot-b,c@boot-c,d@boot-d"
+  let coordinator_log = @process.redirect_to_file(root + "/coordinator.log")
+  defer coordinator_log.close()
+  let coordinator_args = [
+    "--cluster",
+    "rescale",
+    "--coordinator",
+    "coordinator",
+    "--bind",
+    data,
+    "--advertise",
+    data,
+    "--driver-bind",
+    control,
+    "--driver-advertise",
+    control,
+    "--storage",
+    root + "/coordinator",
+    "--workers",
+    workers,
+    "--storage-budget-bytes",
+    "65536",
+  ]
+  let mut coordinator = @process.spawn_orphan(
+    coordinator_binary,
+    coordinator_args,
+    stdout=coordinator_log,
+    stderr=coordinator_log,
+  )
+  wait_port(control)
+  let running : Set[Int] = Set([coordinator])
+  defer (@async.protect_from_cancel(() => {
+    for pid in running {
+      signal_and_wait(pid, "-KILL")
+    }
+  }) catch {
+    _ => ()
+  })
+  let remote = Remote::{ binary: driver_binary, endpoint: control, job_config, }
+  assert_eq(remote.command("submit").job_id, "rescale-job")
+  assert_eq(remote.command("status").parallelism, 2)
+  for worker in ["a", "b"] {
+    let pid = start_worker(worker_binary, root, data, job_config, worker, 0)
+    running.add(pid)
+  }
+  let first_events = Array::makei(8, index => input(index.to_int64()))
+  assert_eq(remote.command("input", events=first_events).accepted_events, 8L)
+  wait_outputs(root + "/output.jsonl", 8)
+  let replacements : Array[Int] = []
+  for worker in ["c", "d"] {
+    let pid = start_worker(worker_binary, root, data, job_config, worker, 0)
+    replacements.push(pid)
+    running.add(pid)
+  }
+  let barrier = @fs.open(
+    root + "/coordinator/jobs/job-0/rescale-p2-e1.json.lock",
+    mode=@fs.ReadWrite,
+    create_mode=@fs.OpenOrCreate,
+  )
+  defer barrier.close()
+  barrier.lock(@fs.Exclusive)
+  @async.with_task_group <| group => {
+    let request = group.spawn(allow_failure=true) <| () => {
+      remote.command("rescale", workers="a,b,c,d", parallelism=4)
+    }
+    @async.with_timeout(10000, () => {
+      let intent = root + "/coordinator/jobs/job-0/node-migrations.wal"
+      for ;; {
+        if @fs.exists(intent) && @fs.read_file(intent).binary().length() > 0 {
+          break
+        }
+        @async.sleep(10)
+      }
+    })
+    signal_and_wait(coordinator, "-KILL")
+    running.remove(coordinator)
+    barrier.unlock()
+    coordinator = @process.spawn_orphan(
+      coordinator_binary,
+      coordinator_args,
+      stdout=coordinator_log,
+      stderr=coordinator_log,
+    )
+    running.add(coordinator)
+    wait_port(control)
+    ignore(
+      request.wait() catch {
+        _ => remote.command("rescale", workers="a,b,c,d", parallelism=4)
+      },
+    )
+  }
+  assert_eq(remote.command("status").phase, "Running")
+  assert_eq(remote.command("status").parallelism, 4)
+  let second_events = Array::makei(8, index => input((8 + index).to_int64()))
+  assert_eq(remote.command("input", events=second_events).accepted_events, 16L)
+  wait_outputs(root + "/output.jsonl", 16)
+  assert_eq(
+    remote.command("rescale", workers="a,b", parallelism=2).phase,
+    "Running",
+  )
+  assert_eq(remote.command("status").parallelism, 2)
+  for pid in replacements {
+    signal_and_wait(pid, "-KILL")
+    running.remove(pid)
+  }
+  let third_events = Array::makei(8, index => input((16 + index).to_int64()))
+  assert_eq(remote.command("input", events=third_events).accepted_events, 24L)
+  wait_outputs(root + "/output.jsonl", 24)
+  assert_eq(remote.command("input", events=first_events).accepted_events, 24L)
+  assert_true(remote.command("pause").paused)
+  signal_and_wait(coordinator, "-KILL")
+  running.remove(coordinator)
+  coordinator = @process.spawn_orphan(
+    coordinator_binary,
+    coordinator_args,
+    stdout=coordinator_log,
+    stderr=coordinator_log,
+  )
+  running.add(coordinator)
+  wait_port(control)
+  assert_true(remote.command("status").paused)
+  assert_eq(remote.command("status").parallelism, 2)
+  assert_false(remote.command("resume").paused)
+  assert_eq(remote.command("drain").phase, "Succeeded")
+  verify_output(root + "/output.jsonl", 24)
+  let report : Json = {
+    "worker_sets": [["a", "b"], ["a", "b", "c", "d"], ["a", "b"]],
+    "partition_count": 4,
+    "parallelism": [2, 4, 2],
+    "migrations": 4,
+    "migration_interruption_recovered": true,
+    "migration_transport": "tcp",
+    "coordinator_has_worker_paths": false,
+    "pause_restart_recovered": true,
+    "confirmed_inputs": 24,
+    "output_mismatch": 0,
+    "input_loss": 0,
+  }
+  @fs.write_file(root + "/result.json", report.stringify(), sync=@fs.Full)
+  for pid in running {
+    signal_and_wait(pid, "-TERM")
+  }
+  running.clear()
+  println(
+    "PASS: Worker reassignment and return preserved inputs and idempotent outputs",
+  )
+}

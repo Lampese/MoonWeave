@@ -44,7 +44,7 @@ pub fn CoordinationObligation::reason(Self) -> String
 pub struct Edge {
   source : String
   target : String
-} derive(Compare, Eq, Hash, @debug.Debug)
+} derive(Compare, Eq, Hash, ToJson, @debug.Debug, @json.FromJson)
 pub fn Edge::from_json(Json) -> Self raise ReachabilityError
 pub fn Edge::new(String, String) -> Self raise ReachabilityError
 pub fn Edge::source(Self) -> String
@@ -67,6 +67,7 @@ pub struct Engine {
 pub fn Engine::apply(Self, @causal.Event[Edge]) -> Array[Reachable] raise @causal.CausalError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[Reachable] raise EngineError
 pub fn Engine::certificate(Self, String, ArrayView[@causal.EventId]) -> ResultCertificate raise QueryError
+pub fn Engine::compact(Self, @causal.CausalRetirement) -> Unit raise @causal.CausalError
 pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
 pub fn Engine::events(Self) -> Array[@causal.Event[Edge]]
@@ -77,8 +78,17 @@ pub fn Engine::new(maximum_pending? : Int) -> Self raise @causal.CausalError
 pub fn Engine::pending_count(Self) -> Int
 pub fn Engine::pending_events(Self) -> Array[@causal.Event[Edge]]
 pub fn Engine::query(Self) -> Query?
+pub fn Engine::restore(EngineSnapshot) -> Self raise EngineError
 pub fn Engine::set_query(Self, Query) -> Unit
+pub fn Engine::snapshot(Self) -> EngineSnapshot
+pub fn Engine::state_count(Self) -> Int
 pub fn Engine::verify_certificate(Self, ResultCertificate) -> Bool
+
+pub(all) struct EngineSnapshot {
+  causal : @causal.CausalLogSnapshot[Edge]
+  edges : Array[Edge]
+  query : QuerySnapshot?
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub struct Query {
   query_id : String
@@ -100,6 +110,16 @@ pub fn Query::query_id(Self) -> String
 pub fn Query::source(Self) -> String
 pub fn Query::status(Self) -> QueryStatus
 pub fn Query::target(Self) -> String
+
+pub(all) struct QuerySnapshot {
+  query_id : String
+  source : String
+  target : String
+  reason : String
+  matched : Bool
+  obligations : Array[Int]
+  open : Array[Int]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) enum QueryStatus {
   Tentative

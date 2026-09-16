@@ -28,6 +28,31 @@ test "hello and welcome payloads round trip" {
 }
 
 ///|
+test "JSON event decoding applies constructor defaults and validates explicit input ids" {
+  let json : Json = {
+    "id": { "origin": "events", "sequence": "0" },
+    "parents": [],
+    "key": "k",
+    "payload": { "value": "2" },
+  }
+  let event : @protocol.EventRecord = @json.from_json(json)
+  assert_eq(event.input_id(), "main")
+  assert_eq(event.event_time(), None)
+  let invalid : Json = {
+    "id": { "origin": "events", "sequence": "0" },
+    "parents": [],
+    "key": "k",
+    "payload": { "value": "2" },
+    "input_id": "",
+  }
+  try @json.from_json(invalid) catch {
+    @json.JsonDecodeError(_) => ()
+  } noraise {
+    (_ : @protocol.EventRecord) => fail("empty input identity accepted")
+  }
+}
+
+///|
 test "driver submit preserves its optional authentication token" {
   let submit = @protocol.DriverSubmit::new(
     "submission-1",

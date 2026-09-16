@@ -564,6 +564,39 @@ pub fn CoordinatorState::reassign(
 }
 
 ///|
+/// Move one live lease to another active Worker while advancing its fencing
+/// epoch. The old session becomes stale immediately; its durable state must
+/// be transferred before the replacement is started.
+pub fn CoordinatorState::move_partition(
+  self : CoordinatorState,
+  partition : Int,
+  source_worker_id : String,
+  source_incarnation : @protocol.Incarnation,
+  replacement_worker_id : String,
+) -> PartitionAssignment raise CoordinatorError {
+  let replacement = self.checked_worker(replacement_worker_id)
+  if replacement.lifecycle != WorkerLifecycle::Active {
+    raise CoordinatorError::WorkerNotActive(replacement_worker_id)
+  }
+  guard self.assignments.get(partition) is Some(current) else {
+    raise CoordinatorError::UnknownPartition(partition)
+  }
+  if current.worker_id() != source_worker_id ||
+    current.incarnation() != source_incarnation {
+    raise CoordinatorError::IncarnationMismatch
+  }
+  if source_worker_id == replacement_worker_id {
+    raise CoordinatorError::AssignmentConflict(partition)
+  }
+  self.assignments.remove(partition)
+  self.assign(
+    partition,
+    replacement_worker_id,
+    start_offset=current.start_offset(),
+  )
+}
+
+///|
 /// Fence a failed Worker and reassign all of its leases to one active
 /// replacement. Reassignment replays from each lease's original start offset;
 /// at-least-once delivery and operator idempotence make this conservative.

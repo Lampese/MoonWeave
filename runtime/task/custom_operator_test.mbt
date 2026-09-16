@@ -84,3 +84,49 @@ test "custom operator preserves causally pending inputs" {
   assert_eq(task.process(1L, TaskInput::new(root)).length(), 2)
   assert_eq(task.pending_count(), 0)
 }
+
+///|
+test "custom descendants retain their own event-time and input metadata across restart" {
+  let operator = CustomOperator::new(
+    "metadata",
+    1,
+    "metadata:v1",
+    "metadata-state:v1",
+    "event:v1",
+    "event:v1",
+    "moonweave-task-json-v1",
+    "test-deps-v1",
+    true,
+    false,
+    _ => (),
+    input => [@json.to_json(input.event())],
+  )
+  let original = Task::new_custom("metadata-task", "metadata", operator, 0, 0)
+  original.start()
+  let parent = @protocol.EventRecord::new(
+    @causal.EventId::new("meta", 0L),
+    [],
+    "k",
+    Json::null(),
+    event_time=10L,
+    input_id="left",
+  )
+  let child = @protocol.EventRecord::new(
+    @causal.EventId::new("meta", 1L),
+    [parent.id()],
+    "k",
+    Json::null(),
+    event_time=20L,
+    input_id="right",
+  )
+  assert_eq(original.process(0L, TaskInput::new(child)), [])
+  let recovered = Task::new_custom("metadata-task", "metadata", operator, 0, 0)
+  recovered.start()
+  recovered.restore(original.snapshot())
+  let expected = [
+    TaskOutput::Custom(@json.to_json(parent)),
+    TaskOutput::Custom(@json.to_json(child)),
+  ]
+  assert_eq(original.process(1L, TaskInput::new(parent)), expected)
+  assert_eq(recovered.process(1L, TaskInput::new(parent)), expected)
+}

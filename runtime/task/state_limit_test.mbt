@@ -16,7 +16,8 @@ test "task state limit fails closed before committing a batch" {
   catch {
     TaskError::StateLimitExceeded(limit~, actual~) => {
       assert_eq(limit, 1)
-      assert_eq(actual, 2)
+      // Causal payload, materialized edge, and derived fact are retained.
+      assert_eq(actual, 3)
       assert_eq(task.offset(), -1L)
       assert_eq(task.event_count(), 0)
     }

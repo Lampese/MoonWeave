@@ -141,6 +141,7 @@ pub fn SecurityState::apply(
 pub struct Engine {
   mut log : @causal.CausalLog[SecurityEvent]
   state : SecurityState
+  mut witnesses : Array[SecurityWitness]
 }
 
 ///|
@@ -150,12 +151,17 @@ pub fn Engine::new(
   {
     log: @causal.CausalLog::new(maximum_pending~),
     state: SecurityState::new(),
+    witnesses: [],
   }
 }
 
 ///|
 pub fn Engine::copy(self : Engine) -> Engine {
-  { log: self.log.copy(), state: self.state.copy(), }
+  {
+    log: self.log.copy(),
+    state: self.state.copy(),
+    witnesses: self.witnesses.copy(),
+  }
 }
 
 ///|
@@ -209,7 +215,7 @@ pub fn Engine::apply(
     error => raise SecurityError::Causal(error)
   }
   for admitted in admission.admitted() {
-    validate_transition(candidate, admitted)
+    validate_transition(candidate, self.witnesses, admitted)
   }
   for admitted in admission.admitted() {
     alerts.push_iter(self.state.apply(admitted.payload()).iter())
@@ -225,6 +231,7 @@ pub fn Engine::apply(
 /// causal attack sequence merely because their kinds coexist in state.
 fn validate_transition(
   log : @causal.CausalLog[SecurityEvent],
+  witnesses : Array[SecurityWitness],
   event : @causal.Event[SecurityEvent],
 ) -> Unit raise SecurityError {
   let required_parent = match event.payload().kind() {
@@ -242,7 +249,12 @@ fn validate_transition(
             Some(parent) =>
               parent.payload().user_id() == event.payload().user_id() &&
               parent.payload().kind() == required
-            None => false
+            None =>
+              witnesses.any(witness => {
+                witness.user_id == event.payload().user_id() &&
+                witness.kind == required &&
+                witness.identities.any(range => range.contains(parent_id))
+              })
           }
         })
       if !valid {

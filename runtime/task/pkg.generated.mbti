@@ -4,6 +4,7 @@ package "moonweave/moonweave/runtime/task"
 import {
   "moonbitlang/core/debug",
   "moonbitlang/core/json",
+  "moonbitlang/core/set",
   "moonweave/moonweave/causal",
   "moonweave/moonweave/operator/aggregation",
   "moonweave/moonweave/operator/reachability",
@@ -13,6 +14,9 @@ import {
 }
 
 // Values
+pub fn graph_skip_payload() -> Json
+
+pub fn is_graph_skip(Json) -> Bool
 
 // Errors
 pub(all) suberror TaskError {
@@ -70,6 +74,8 @@ pub fn CustomOperator::supports_proof(Self) -> Bool
 pub fn CustomOperator::validate_payload(Self, Json) -> Unit raise TaskError
 pub fn CustomOperator::version(Self) -> Int
 
+type CustomStateSnapshot derive(ToJson, @json.FromJson)
+
 pub(all) enum OperatorKind {
   KeyedSum
   Reachability
@@ -106,11 +112,23 @@ pub struct Task {
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
   custom_operator : CustomOperator?
-  mut custom_log : @causal.CausalLog[Json]?
+  mut custom_log : @causal.CausalLog[TaskEventPayload]?
   mut custom_outputs : Array[Json]
   max_state_events : Int
+  mut event_time_config : TaskEventTimeConfig?
+  mut event_time_log : @causal.CausalLog[TaskEventPayload]?
+  mut watermark : Int64
+  mut watermark_requested : Int64
+  mut late_events : Int
+  mut window_buckets : Array[TaskWindowBucket]
+  mut join_left : Array[@protocol.EventRecord]
+  mut join_right : Array[@protocol.EventRecord]
+  mut join_emitted : @set.Set[(@causal.EventId, @causal.EventId)]
+  mut graph_config : TaskGraphConfig?
+  mut graph_log : @causal.CausalLog[TaskEventPayload]?
 }
 pub fn Task::adopt_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
+pub fn Task::compact(Self, @causal.CausalRetirement) -> Unit raise TaskError
 pub fn Task::drain(Self) -> Unit raise TaskError
 pub fn Task::epoch(Self) -> Int
 pub fn Task::event_count(Self) -> Int
@@ -118,6 +136,7 @@ pub fn Task::fail(Self) -> Unit
 pub fn Task::from_assignment(String, String, OperatorKind, @protocol.AssignmentSpec) -> Self raise TaskError
 pub fn Task::from_spec(TaskSpec) -> Self raise TaskError
 pub fn Task::frontier(Self) -> @causal.Frontier
+pub fn Task::late_events(Self) -> Int
 pub fn Task::max_state_events(Self) -> Int
 pub fn Task::new(String, String, OperatorKind, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
 pub fn Task::new_custom(String, String, CustomOperator, Int, Int, start_offset? : Int64, max_state_events? : Int) -> Self raise TaskError
@@ -131,6 +150,7 @@ pub fn Task::phase(Self) -> TaskPhase
 pub fn Task::process(Self, Int64, TaskInput) -> Array[TaskOutput] raise TaskError
 pub fn Task::process_batch(Self, @protocol.EventBatch) -> Array[TaskOutput] raise TaskError
 pub fn Task::process_delta(Self, @protocol.DeltaBatch) -> Array[TaskOutput] raise TaskError
+pub fn Task::process_watermark(Self, Int64) -> Array[TaskOutput] raise TaskError
 pub fn Task::progress(Self) -> TaskProgress
 pub fn Task::restore(Self, TaskSnapshot) -> Unit raise TaskError
 pub fn Task::snapshot(Self) -> TaskSnapshot raise TaskError
@@ -143,6 +163,10 @@ pub fn Task::task_id(Self) -> String
 pub fn Task::validate_assignment(Self, @protocol.Assignment) -> Unit raise TaskError
 pub fn Task::validate_batch(Self, @protocol.EventBatch) -> Int raise TaskError
 pub fn Task::validate_delta(Self, @protocol.DeltaBatch) -> Int raise TaskError
+pub fn Task::validate_watermark(Self, Int64) -> Unit raise TaskError
+pub fn Task::watermark(Self) -> Int64
+pub fn Task::with_event_time(Self, TaskEventTimeConfig) -> Self raise TaskError
+pub fn Task::with_graph_input(Self, TaskGraphConfig) -> Self raise TaskError
 
 pub(all) struct TaskDispatch {
   task_id : String
@@ -155,6 +179,32 @@ pub fn TaskDispatch::outputs(Self) -> ArrayView[TaskOutput]
 pub fn TaskDispatch::partition(Self) -> Int
 pub fn TaskDispatch::task_id(Self) -> String
 
+type TaskEventPayload derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct TaskEventTimeConfig {
+  window_size_ms : Int64
+  allowed_lateness_ms : Int64
+  join_before_ms : Int64
+  join_after_ms : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn TaskEventTimeConfig::allowed_lateness_ms(Self) -> Int64
+pub fn TaskEventTimeConfig::join_after_ms(Self) -> Int64
+pub fn TaskEventTimeConfig::join_before_ms(Self) -> Int64
+pub fn TaskEventTimeConfig::new(window_size_ms? : Int64, allowed_lateness_ms? : Int64, join_before_ms? : Int64, join_after_ms? : Int64) -> Self raise TaskError
+pub fn TaskEventTimeConfig::validate(Self) -> Unit raise TaskError
+pub fn TaskEventTimeConfig::window_size_ms(Self) -> Int64
+
+pub(all) struct TaskGraphConfig {
+  partition_count : Int
+  emit_packets : Bool
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct TaskGraphPacket {
+  graph_packet : Bool
+  input : @protocol.EventRecord
+  outputs : Array[TaskOutput]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub(all) struct TaskInput {
   event : @protocol.EventRecord
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
@@ -162,6 +212,7 @@ pub fn TaskInput::event(Self) -> @protocol.EventRecord
 pub fn TaskInput::new(@protocol.EventRecord) -> Self
 
 pub(all) enum TaskOutput {
+  WindowedSum(WindowedSum)
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
@@ -201,7 +252,9 @@ pub struct TaskSet {
   task_ids : Map[String, Int]
 }
 pub fn TaskSet::add(Self, Task) -> Unit raise TaskSetError
+pub fn TaskSet::advance_watermark(Self, Int64) -> Array[TaskDispatch] raise TaskSetError
 pub fn TaskSet::drain(Self) -> Unit raise TaskSetError
+pub fn TaskSet::drain_at(Self, Int64) -> Array[TaskDispatch] raise TaskSetError
 pub fn TaskSet::fail(Self) -> Unit
 pub fn TaskSet::from_job(@plan.JobSpec, ArrayView[@protocol.AssignmentSpec]) -> Self raise TaskSetError
 pub fn TaskSet::job_id(Self) -> String
@@ -239,11 +292,27 @@ pub(all) struct TaskSnapshot {
   emitted_outputs : Int
   events : Array[@protocol.EventRecord]
   operator_capability : String
+  materialized_state : Json?
+  graph_config : TaskGraphConfig?
+  graph_state : Json?
+  watermark : Int64?
+  watermark_requested : Int64?
+  late_events : Int?
+  event_time_config : TaskEventTimeConfig?
+  window_buckets : Array[TaskWindowBucket]?
+  join_left : Array[@protocol.EventRecord]?
+  join_right : Array[@protocol.EventRecord]?
+  join_emitted : Array[(@causal.EventId, @causal.EventId)]?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn TaskSnapshot::emitted_outputs(Self) -> Int
 pub fn TaskSnapshot::epoch(Self) -> Int
+pub fn TaskSnapshot::event_time_config(Self) -> TaskEventTimeConfig?
 pub fn TaskSnapshot::events(Self) -> ArrayView[@protocol.EventRecord]
 pub fn TaskSnapshot::frontier_digest(Self) -> String
+pub fn TaskSnapshot::join_emitted(Self) -> ArrayView[(@causal.EventId, @causal.EventId)]
+pub fn TaskSnapshot::join_left(Self) -> ArrayView[@protocol.EventRecord]
+pub fn TaskSnapshot::join_right(Self) -> ArrayView[@protocol.EventRecord]
+pub fn TaskSnapshot::late_events(Self) -> Int
 pub fn TaskSnapshot::offset(Self) -> Int64
 pub fn TaskSnapshot::operator(Self) -> OperatorKind
 pub fn TaskSnapshot::operator_capability(Self) -> String
@@ -252,6 +321,10 @@ pub fn TaskSnapshot::partition(Self) -> Int
 pub fn TaskSnapshot::rebind(Self, String, Int) -> Self raise TaskError
 pub fn TaskSnapshot::state_schema(Self) -> String
 pub fn TaskSnapshot::task_id(Self) -> String
+pub fn TaskSnapshot::validate_transfer(Self, Int64) -> Unit raise TaskError
+pub fn TaskSnapshot::watermark(Self) -> Int64
+pub fn TaskSnapshot::watermark_requested(Self) -> Int64
+pub fn TaskSnapshot::window_buckets(Self) -> ArrayView[TaskWindowBucket]
 
 pub(all) struct TaskSpec {
   job_id : String
@@ -261,8 +334,10 @@ pub(all) struct TaskSpec {
   partition : Int
   epoch : Int
   start_offset : Int64
+  event_time_config : TaskEventTimeConfig?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn TaskSpec::epoch(Self) -> Int
+pub fn TaskSpec::event_time_config(Self) -> TaskEventTimeConfig?
 pub fn TaskSpec::from_job(@plan.JobSpec, @protocol.AssignmentSpec) -> Self raise TaskError
 pub fn TaskSpec::job_id(Self) -> String
 pub fn TaskSpec::operator(Self) -> OperatorKind
@@ -270,6 +345,23 @@ pub fn TaskSpec::operator_id(Self) -> String
 pub fn TaskSpec::partition(Self) -> Int
 pub fn TaskSpec::start_offset(Self) -> Int64
 pub fn TaskSpec::task_id(Self) -> String
+
+pub(all) struct TaskWindowBucket {
+  key : String
+  start_ms : Int64
+  total : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub(all) struct WindowedSum {
+  key : String
+  start_ms : Int64
+  end_ms : Int64
+  total : Int64
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn WindowedSum::end_ms(Self) -> Int64
+pub fn WindowedSum::key(Self) -> String
+pub fn WindowedSum::start_ms(Self) -> Int64
+pub fn WindowedSum::total(Self) -> Int64
 
 // Type aliases
 

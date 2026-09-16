@@ -13,7 +13,39 @@ pub(all) struct EventRecord {
   parents : Array[@causal.EventId]
   key : String
   payload : Json
-} derive(Debug, Eq, ToJson, FromJson)
+  /// Event-time in milliseconds. `None` is retained for legacy operators;
+  /// event-time operators reject records without a timestamp.
+  event_time : Int64?
+  /// Logical input identity used by multi-input operators. Ordinary records
+  /// use `main`; join inputs use explicit identities such as `left`/`right`.
+  input_id : String
+} derive(Debug, Eq, ToJson)
+
+///|
+struct EventRecordJson {
+  id : @causal.EventId
+  parents : Array[@causal.EventId]
+  key : String
+  payload : Json
+  event_time : Int64?
+  input_id : String?
+} derive(FromJson)
+
+///|
+/// JSON uses the same default logical input as the public constructor.
+pub impl @json.FromJson for EventRecord with fn from_json(json, path) {
+  let value : EventRecordJson = @json.from_json(json, path~)
+  EventRecord::new(
+    value.id,
+    value.parents,
+    value.key,
+    value.payload,
+    event_time?=value.event_time,
+    input_id=value.input_id.unwrap_or("main"),
+  ) catch {
+    error => raise @json.JsonDecodeError((path, @debug.to_string(error)))
+  }
+}
 
 ///|
 pub fn EventRecord::new(
@@ -21,7 +53,16 @@ pub fn EventRecord::new(
   parents : ArrayView[@causal.EventId],
   key : String,
   payload : Json,
+  event_time? : Int64,
+  input_id? : String = "main",
 ) -> EventRecord raise ProtocolError {
+  if input_id.is_empty() {
+    raise ProtocolError::InvalidFrameField
+  }
+  match event_time {
+    Some(value) if value < 0L => raise ProtocolError::InvalidOffset(value)
+    _ => ()
+  }
   let event = @causal.Event::new(id, parents, key, payload) catch {
     error => raise ProtocolError::Causal(error)
   }
@@ -30,6 +71,8 @@ pub fn EventRecord::new(
     parents: event.parents().to_owned(),
     key: event.key(),
     payload: event.payload(),
+    event_time,
+    input_id,
   }
 }
 
@@ -155,6 +198,8 @@ pub(all) struct DriverStatus {
   phase : String
   accepted_events : Int64
   failure : String?
+  paused : Bool
+  parallelism : Int
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -165,8 +210,24 @@ pub fn DriverStatus::new(
   phase : String,
   accepted_events : Int64,
   failure : String?,
+  paused? : Bool = false,
+  parallelism? : Int = 1,
 ) -> DriverStatus {
-  { submission_id, job_id, plan_digest, phase, accepted_events, failure, }
+  {
+    submission_id,
+    job_id,
+    plan_digest,
+    phase,
+    accepted_events,
+    failure,
+    paused,
+    parallelism,
+  }
+}
+
+///|
+pub fn DriverStatus::is_paused(self : DriverStatus) -> Bool {
+  self.paused
 }
 
 ///|
@@ -272,6 +333,16 @@ pub fn EventRecord::payload(self : EventRecord) -> Json {
 }
 
 ///|
+pub fn EventRecord::event_time(self : EventRecord) -> Int64? {
+  self.event_time
+}
+
+///|
+pub fn EventRecord::input_id(self : EventRecord) -> String {
+  self.input_id
+}
+
+///|
 pub fn EventRecord::to_event(
   self : EventRecord,
 ) -> @causal.Event[Json] raise ProtocolError {
@@ -283,6 +354,7 @@ pub fn EventRecord::to_event(
 ///|
 pub(all) struct Hello {
   worker_id : String
+  job_id : String?
   incarnation : String
   capabilities : Array[String]
   last_session_id : String?
@@ -296,6 +368,7 @@ pub impl @debug.Debug for Hello with fn to_repr(self) {
   @debug.Repr::record(
     Map([
       ("worker_id", Repr(self.worker_id)),
+      ("job_id", Repr(self.job_id)),
       ("incarnation", Repr(self.incarnation)),
       ("capabilities", Repr(self.capabilities)),
       ("last_session_id", Repr(self.last_session_id)),
@@ -313,12 +386,16 @@ pub fn Hello::new(
   last_session_id? : String,
   requested_partition? : Int,
   auth_token? : String,
+  job_id? : String,
 ) -> Hello raise ProtocolError {
   if worker_id.is_empty() {
     raise ProtocolError::EmptyWorkerId
   }
   if incarnation.is_empty() {
     raise ProtocolError::EmptyIncarnation
+  }
+  if job_id == Some("") {
+    raise ProtocolError::InvalidFrameField
   }
   match requested_partition {
     Some(partition) if partition < 0 => raise ProtocolError::UnknownAssignment
@@ -330,6 +407,7 @@ pub fn Hello::new(
   }
   {
     worker_id,
+    job_id,
     incarnation,
     capabilities,
     last_session_id,
@@ -341,6 +419,11 @@ pub fn Hello::new(
 ///|
 pub fn Hello::worker_id(self : Hello) -> String {
   self.worker_id
+}
+
+///|
+pub fn Hello::job_id(self : Hello) -> String? {
+  self.job_id
 }
 
 ///|
@@ -614,6 +697,43 @@ pub fn DeltaBatch::events(self : DeltaBatch) -> ArrayView[EventRecord] {
 }
 
 ///|
+/// A monotone event-time frontier for one assignment. Watermarks are control
+/// records, not source offsets, and therefore do not consume the input offset
+/// cursor. `Int64::MAX` is the end-of-input flush marker.
+pub(all) struct Watermark {
+  partition : Int
+  epoch : Int
+  timestamp : Int64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+pub fn Watermark::new(
+  partition : Int,
+  epoch : Int,
+  timestamp : Int64,
+) -> Watermark raise ProtocolError {
+  if partition < 0 || epoch < 0 || timestamp < 0L {
+    raise ProtocolError::InvalidFrameField
+  }
+  { partition, epoch, timestamp, }
+}
+
+///|
+pub fn Watermark::partition(self : Watermark) -> Int {
+  self.partition
+}
+
+///|
+pub fn Watermark::epoch(self : Watermark) -> Int {
+  self.epoch
+}
+
+///|
+pub fn Watermark::timestamp(self : Watermark) -> Int64 {
+  self.timestamp
+}
+
+///|
 pub(all) struct Credit {
   partition : Int
   epoch : Int
@@ -781,6 +901,7 @@ pub(all) struct Progress {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
+  watermark : Int64?
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -790,16 +911,25 @@ pub fn Progress::new(
   persisted_offset : Int64,
   applied_offset : Int64,
   frontier_digest : String,
+  watermark? : Int64,
 ) -> Progress raise ProtocolError {
   if partition < 0 ||
     epoch < 0 ||
     persisted_offset < -1L ||
     applied_offset < -1L ||
     applied_offset > persisted_offset ||
-    frontier_digest.is_empty() {
+    frontier_digest.is_empty() ||
+    watermark.unwrap_or(-1L) < -1L {
     raise ProtocolError::InvalidFrameField
   }
-  { partition, epoch, persisted_offset, applied_offset, frontier_digest, }
+  {
+    partition,
+    epoch,
+    persisted_offset,
+    applied_offset,
+    frontier_digest,
+    watermark,
+  }
 }
 
 ///|
@@ -1020,7 +1150,14 @@ fn protocol_error(error : ProtocolError) -> MessageError {
 
 ///|
 fn validate_event_record(value : EventRecord) -> EventRecord raise MessageError {
-  EventRecord::new(value.id, value.parents[:], value.key, value.payload) catch {
+  EventRecord::new(
+    value.id,
+    value.parents[:],
+    value.key,
+    value.payload,
+    event_time?=value.event_time,
+    input_id?=Some(value.input_id),
+  ) catch {
     error => raise protocol_error(error)
   }
 }
@@ -1040,6 +1177,7 @@ pub fn Hello::from_payload(text : String) -> Hello raise MessageError {
     last_session_id?=value.last_session_id,
     requested_partition?=value.requested_partition,
     auth_token?=value.auth_token,
+    job_id?=value.job_id,
   ) catch {
     error => raise protocol_error(error)
   }
@@ -1141,6 +1279,19 @@ pub fn DeltaBatch::from_payload(text : String) -> DeltaBatch raise MessageError 
 }
 
 ///|
+pub fn Watermark::to_payload(self : Watermark) -> String {
+  encode_payload(self)
+}
+
+///|
+pub fn Watermark::from_payload(text : String) -> Watermark raise MessageError {
+  let value : Watermark = decode_payload(text)
+  Watermark::new(value.partition, value.epoch, value.timestamp) catch {
+    error => raise protocol_error(error)
+  }
+}
+
+///|
 pub fn Credit::to_payload(self : Credit) -> String {
   encode_payload(self)
 }
@@ -1213,6 +1364,7 @@ pub fn Progress::from_payload(text : String) -> Progress raise MessageError {
     value.persisted_offset,
     value.applied_offset,
     value.frontier_digest,
+    watermark?=value.watermark,
   ) catch {
     error => raise protocol_error(error)
   }

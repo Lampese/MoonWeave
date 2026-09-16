@@ -50,6 +50,7 @@ pub(all) suberror SessionError {
   MessageRegression(expected_at_least~ : Int64, actual~ : Int64)
   MessageGap(expected~ : Int64, actual~ : Int64)
   MessageIdConflict(String)
+  WatermarkRegression(expected_at_least~ : Int64, actual~ : Int64)
   Frame(ProtocolError)
   Payload(MessageError)
   Assignment(ProtocolError)
@@ -283,12 +284,15 @@ pub(all) struct DriverStatus {
   phase : String
   accepted_events : Int64
   failure : String?
+  paused : Bool
+  parallelism : Int
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn DriverStatus::accepted_events(Self) -> Int64
 pub fn DriverStatus::failure(Self) -> String?
 pub fn DriverStatus::from_payload(String) -> Self raise MessageError
+pub fn DriverStatus::is_paused(Self) -> Bool
 pub fn DriverStatus::job_id(Self) -> String
-pub fn DriverStatus::new(String, String, String, String, Int64, String?) -> Self
+pub fn DriverStatus::new(String, String, String, String, Int64, String?, paused? : Bool, parallelism? : Int) -> Self
 pub fn DriverStatus::phase(Self) -> String
 pub fn DriverStatus::plan_digest(Self) -> String
 pub fn DriverStatus::submission_id(Self) -> String
@@ -327,13 +331,20 @@ pub(all) struct EventRecord {
   parents : Array[@causal.EventId]
   key : String
   payload : Json
-} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+  event_time : Int64?
+  input_id : String
+} derive(Eq, ToJson, @debug.Debug)
+pub fn EventRecord::event_time(Self) -> Int64?
 pub fn EventRecord::id(Self) -> @causal.EventId
+pub fn EventRecord::input_id(Self) -> String
 pub fn EventRecord::key(Self) -> String
-pub fn EventRecord::new(@causal.EventId, ArrayView[@causal.EventId], String, Json) -> Self raise ProtocolError
+pub fn EventRecord::new(@causal.EventId, ArrayView[@causal.EventId], String, Json, event_time? : Int64, input_id? : String) -> Self raise ProtocolError
 pub fn EventRecord::parents(Self) -> ArrayView[@causal.EventId]
 pub fn EventRecord::payload(Self) -> Json
 pub fn EventRecord::to_event(Self) -> @causal.Event[Json] raise ProtocolError
+pub impl @json.FromJson for EventRecord
+
+type EventRecordJson derive(@json.FromJson)
 
 pub struct Frame {
   version : Int
@@ -387,6 +398,8 @@ pub(all) enum FrameKind {
   DriverCommand
   DriverStatus
   Welcome
+  WorkerAssignments
+  WorkerMigrationResult
   Assign
   Revoke
   Drain
@@ -395,6 +408,9 @@ pub(all) enum FrameKind {
   Resume
   EventBatch
   DeltaBatch
+  Watermark
+  Retire
+  RetireAck
   DeltaAck
   Credit
   AckReceived
@@ -423,6 +439,7 @@ pub fn Heartbeat::to_payload(Self) -> String
 
 pub(all) struct Hello {
   worker_id : String
+  job_id : String?
   incarnation : String
   capabilities : Array[String]
   last_session_id : String?
@@ -433,8 +450,9 @@ pub fn Hello::auth_token(Self) -> String?
 pub fn Hello::capabilities(Self) -> ArrayView[String]
 pub fn Hello::from_payload(String) -> Self raise MessageError
 pub fn Hello::incarnation(Self) -> String
+pub fn Hello::job_id(Self) -> String?
 pub fn Hello::last_session_id(Self) -> String?
-pub fn Hello::new(String, String, Array[String], last_session_id? : String, requested_partition? : Int, auth_token? : String) -> Self raise ProtocolError
+pub fn Hello::new(String, String, Array[String], last_session_id? : String, requested_partition? : Int, auth_token? : String, job_id? : String) -> Self raise ProtocolError
 pub fn Hello::requested_partition(Self) -> Int?
 pub fn Hello::to_payload(Self) -> String
 pub fn Hello::worker_id(Self) -> String
@@ -482,12 +500,13 @@ pub(all) struct Progress {
   persisted_offset : Int64
   applied_offset : Int64
   frontier_digest : String
+  watermark : Int64?
 } derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Progress::applied_offset(Self) -> Int64
 pub fn Progress::epoch(Self) -> Int
 pub fn Progress::from_payload(String) -> Self raise MessageError
 pub fn Progress::frontier_digest(Self) -> String
-pub fn Progress::new(Int, Int, Int64, Int64, String) -> Self raise ProtocolError
+pub fn Progress::new(Int, Int, Int64, Int64, String, watermark? : Int64) -> Self raise ProtocolError
 pub fn Progress::partition(Self) -> Int
 pub fn Progress::persisted_offset(Self) -> Int64
 pub fn Progress::to_payload(Self) -> String
@@ -503,6 +522,24 @@ pub fn Resume::new(Int, Int, Int64) -> Self raise ProtocolError
 pub fn Resume::partition(Self) -> Int
 pub fn Resume::persisted_offset(Self) -> Int64
 pub fn Resume::to_payload(Self) -> String
+
+pub(all) struct Retire {
+  partition : Int
+  epoch : Int
+  offset : Int64
+  certificate : @causal.CausalRetirement
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Retire::from_payload(String) -> Self raise MessageError
+pub fn Retire::to_payload(Self) -> String
+
+pub(all) struct RetireAck {
+  partition : Int
+  epoch : Int
+  offset : Int64
+  checkpoint_id : String
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn RetireAck::from_payload(String) -> Self raise MessageError
+pub fn RetireAck::to_payload(Self) -> String
 
 pub(all) struct Seal {
   query_id : String
@@ -527,6 +564,18 @@ pub(all) enum SessionPhase {
   Draining
 } derive(Eq, @debug.Debug)
 
+pub(all) struct Watermark {
+  partition : Int
+  epoch : Int
+  timestamp : Int64
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn Watermark::epoch(Self) -> Int
+pub fn Watermark::from_payload(String) -> Self raise MessageError
+pub fn Watermark::new(Int, Int, Int64) -> Self raise ProtocolError
+pub fn Watermark::partition(Self) -> Int
+pub fn Watermark::timestamp(Self) -> Int64
+pub fn Watermark::to_payload(Self) -> String
+
 pub(all) struct Welcome {
   session_id : String
   assignment : AssignmentSpec?
@@ -549,6 +598,7 @@ pub struct WorkerSession {
   mut last_received_offset : Int64
   mut last_persisted_offset : Int64
   mut last_applied_offset : Int64
+  mut watermark : Int64
   state : WorkerState
 }
 pub fn WorkerSession::accept_frame(Self, Frame) -> Unit raise SessionError
@@ -562,8 +612,10 @@ pub fn WorkerSession::new(String, String, String, coordinator_id? : String) -> S
 pub fn WorkerSession::next_sequence(Self) -> Int64
 pub fn WorkerSession::phase(Self) -> SessionPhase
 pub fn WorkerSession::restore_progress(Self, Int64, Int64, Int64) -> Unit raise SessionError
+pub fn WorkerSession::restore_watermark(Self, Int64) -> Unit raise SessionError
 pub fn WorkerSession::session_id(Self) -> String
 pub fn WorkerSession::state(Self) -> WorkerState
+pub fn WorkerSession::watermark(Self) -> Int64
 
 pub struct WorkerState {
   worker_id : String

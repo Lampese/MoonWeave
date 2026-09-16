@@ -29,6 +29,11 @@ pub async fn CompiledJob::run_local_cluster(
   config : ClusterConfig,
   events : ArrayView[Event],
 ) -> ClusterRunSummary raise ApiError {
+  if self.is_graph() {
+    raise ApiError::Cluster(
+      "graph jobs require CoordinatorService and run_graph_worker",
+    )
+  }
   let mut outcome : Result[ClusterRunSummary, ApiError]? = None
   (@async_runtime.with_task_group <| group => {
     outcome = Some(
@@ -55,10 +60,21 @@ async fn CompiledJob::run_local_cluster_in_group(
   events : ArrayView[Event],
 ) -> ClusterRunSummary raise ApiError {
   let kafka_runtime = config.kafka_runtime.unwrap_or(KafkaRuntimeConfig::new())
+  let named_kafka : Array[(KafkaSource, Map[Int, Int64])] = []
+  let named_files : Array[JsonLinesSource] = []
+  defer {
+    for (source, _) in named_kafka {
+      source.close()
+    }
+    for source in named_files {
+      source.close()
+    }
+  }
   let external_source : JsonLinesSource? = match self.definition.source {
     SourceSpec::Events => None
     SourceSpec::JsonLines(path) => Some(JsonLinesSource::open(path))
     SourceSpec::Kafka(_) => None
+    SourceSpec::Inputs(_) => None
   }
   let kafka_source : KafkaSource? = match self.definition.source {
     SourceSpec::Kafka(spec) =>
@@ -84,7 +100,51 @@ async fn CompiledJob::run_local_cluster_in_group(
   })
   let (input_events, kafka_next_offsets) : (Array[Event], Map[Int, Int64]?) = match
     (external_source, kafka_source) {
-    (None, None) => (events.to_owned(), None)
+    (None, None) =>
+      match self.definition.source {
+        SourceSpec::Inputs(inputs) => {
+          let collected : Array[Event] = []
+          for input in inputs {
+            let batch : Array[Event] = match input.source {
+              SourceSpec::Events =>
+                events.filter(event => event.input_id() == input.input_id)
+              SourceSpec::Kafka(spec) => {
+                let source = KafkaSource::connect(
+                  group~,
+                  kafka_runtime.source_config(spec),
+                )
+                errdefer source.close()
+                let batch = source.poll()
+                named_kafka.push((source, batch.next_offsets()))
+                batch.events().to_owned()
+              }
+              SourceSpec::JsonLines(path) => {
+                let source = JsonLinesSource::open(path)
+                named_files.push(source)
+                let result : Array[Event] = []
+                for ;; {
+                  let before = source.polled_offset()
+                  let (batch, next) = source.poll_with_offset(
+                    maximum_events=128,
+                  )
+                  result.push_iter(batch.iter())
+                  if next == before {
+                    break
+                  }
+                }
+                result
+              }
+              SourceSpec::Inputs(_) =>
+                raise ApiError::Source("nested input sources")
+            }
+            for event in batch {
+              collected.push(event.bind_input(input.input_id))
+            }
+          }
+          (collected, None)
+        }
+        _ => (events.to_owned(), None)
+      }
     (Some(source), None) => {
       let result : Array[Event] = []
       let mut finished = false
@@ -108,7 +168,7 @@ async fn CompiledJob::run_local_cluster_in_group(
     _ => raise ApiError::Cluster("multiple external sources")
   }
   for event in input_events {
-    self.descriptor.validate_event(event)
+    self.validate_event(event)
   }
   let storage_exists = @fs.exists(config.storage_dir) catch {
     error => raise cluster_error_at("check storage", error)
@@ -312,6 +372,8 @@ async fn CompiledJob::run_local_cluster_in_group(
         assignment.epoch(),
         assignment.start_offset(),
         self.definition.max_state_events.unwrap_or(DEFAULT_RUNTIME_STATE_LIMIT),
+        event_time_config?=self.definition.event_time_config,
+        graph_input?=self.definition.graph_input,
       ) catch {
         error => raise ApiError::TaskFailed(@debug.to_string(error))
       }
@@ -453,6 +515,12 @@ async fn CompiledJob::run_local_cluster_in_group(
     _ => ()
   }
   if summary.failed_workers() == 0 {
+    for (source, offsets) in named_kafka {
+      source.commit_offsets(offsets)
+    }
+    for source in named_files {
+      source.commit(source.polled_offset())
+    }
     match (external_source, kafka_source, kafka_next_offsets) {
       (Some(source), _, _) => source.commit(source.polled_offset())
       (_, Some(source), Some(next_offsets)) =>

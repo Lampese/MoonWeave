@@ -29,6 +29,7 @@ struct JobJournalEntry {
   applied_offset : Int64
   pending_events : Int
   reason : String
+  replacement_worker_id : String
   reassignments : Array[@control.JobReassignment]?
   work_plan : JobExecutionPlan?
 } derive(Debug, Eq, ToJson, FromJson)
@@ -39,6 +40,16 @@ struct JobStoreCheckpoint {
   snapshot : @control.JobSnapshot
   work_plans : Array[JobExecutionPlan]
   journal_generation : Int64
+} derive(Debug, Eq, ToJson, FromJson)
+
+///|
+/// Complete logical JobStore authority carried by Coordinator quorum. Work
+/// plans are encoded as JSON here so the internal execution-plan type does not
+/// become part of the public runtime API.
+pub(all) struct JobStoreAuthoritySnapshot {
+  version : Int
+  snapshot : @control.JobSnapshot
+  work_plans : Array[Json]
 } derive(Debug, Eq, ToJson, FromJson)
 
 ///|
@@ -55,7 +66,7 @@ struct JobJournalGenerationMarker {
 ///|
 /// Async durable wrapper around the synchronous JobState machine.
 pub struct JobStore {
-  state : @control.JobState
+  mut state : @control.JobState
   journal_path : String
   checkpoint_path : String
   journal : Wal
@@ -69,6 +80,20 @@ pub struct JobStore {
 ///|
 pub fn JobStore::snapshot(self : JobStore) -> @control.JobSnapshot {
   self.state.snapshot()
+}
+
+///|
+/// Export Job lifecycle state and every outstanding durable delivery plan.
+pub fn JobStore::authority_snapshot(
+  self : JobStore,
+) -> JobStoreAuthoritySnapshot {
+  let plans = self.work_plans.values().to_array()
+  plans.sort_by((left, right) => left.partition.compare(right.partition))
+  {
+    version: 1,
+    snapshot: self.state.snapshot(),
+    work_plans: plans.map(plan => @json.to_json(plan)),
+  }
 }
 
 ///|
@@ -130,6 +155,7 @@ fn empty_job_entry(kind : String) -> JobJournalEntry {
     applied_offset: -1L,
     pending_events: -1,
     reason: "",
+    replacement_worker_id: "",
     reassignments: None,
     work_plan: None,
   }
@@ -156,6 +182,10 @@ fn apply_job_entry(
         },
       )
     "start" => state.start() catch { error => raise JobStoreError::Job(error) }
+    "allow_worker" =>
+      state.allow_worker(entry.worker_id) catch {
+        error => raise JobStoreError::Job(error)
+      }
     "batch_sent" =>
       ignore(
         state.record_batch_sent(
@@ -208,6 +238,17 @@ fn apply_job_entry(
           entry.worker_id,
           entry.epoch,
           entry.start_offset,
+        ) catch {
+          error => raise JobStoreError::Job(error)
+        },
+      )
+    "move" =>
+      ignore(
+        state.move_partition(
+          entry.partition,
+          entry.worker_id,
+          entry.epoch,
+          entry.replacement_worker_id,
         ) catch {
           error => raise JobStoreError::Job(error)
         },
@@ -391,7 +432,7 @@ fn same_job_spec(spec : @plan.JobSpec, snapshot : @control.JobSnapshot) -> Bool 
   spec.job_id() == snapshot.job_id() &&
   spec.operator_id() == snapshot.operator_id() &&
   spec.partition_count() == snapshot.partition_count() &&
-  spec.workers() == snapshot.workers() &&
+  spec.workers().all(worker => snapshot.workers().contains(worker)) &&
   spec.routes() == snapshot.routes()
 }
 
@@ -634,6 +675,15 @@ pub async fn JobStore::checkpoint_and_compact(
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
   defer self.write_lock.release()
+  self.checkpoint_plans_and_compact(self.work_plans)
+}
+
+///|
+async fn JobStore::checkpoint_plans_and_compact(
+  self : JobStore,
+  plans : Map[Int, JobExecutionPlan],
+  state? : @control.JobState = self.state,
+) -> Unit raise JobStoreError {
   self.journal.check_writable() catch {
     error => raise JobStoreError::Wal(error)
   }
@@ -655,11 +705,11 @@ pub async fn JobStore::checkpoint_and_compact(
   }
   let candidate_offset = candidate.write_offset()
   candidate.close()
-  let work_plans = self.work_plans.values().to_array()
+  let work_plans = plans.values().to_array()
   work_plans.sort_by((left, right) => left.partition.compare(right.partition))
   let checkpoint = JobStoreCheckpoint::{
     journal_offset: candidate_offset,
-    snapshot: self.state.snapshot(),
+    snapshot: state.snapshot(),
     work_plans,
     journal_generation: generation,
   }
@@ -672,15 +722,67 @@ pub async fn JobStore::checkpoint_and_compact(
   ) catch {
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
+  @crash_boundary.hit("job.checkpoint.staged", self.checkpoint_path) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
   @fs.rename(temporary, self.checkpoint_path, replace=true) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  @crash_boundary.hit("job.checkpoint.published", self.checkpoint_path) catch {
     error => raise JobStoreError::Io(@debug.to_string(error))
   }
   self.journal.rewrite([marker]) catch {
     error => raise JobStoreError::Wal(error)
   }
+  @crash_boundary.hit("job.checkpoint.rotated", self.checkpoint_path) catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
   self.journal_generation = generation
   self.journal_offset = self.journal.write_offset()
+  self.state = state
+  self.work_plans = plans
   cleanup_job_candidate(candidate_path)
+}
+
+///|
+/// The live supervisor holds ingress at this cut and has received durable
+/// application progress and every exchange ACK from all participating Tasks.
+/// Publish all replay boundaries together before deleting any source payload.
+async fn JobStore::retire_live_work(
+  self : JobStore,
+  cuts : Array[Int64],
+) -> Unit raise JobStoreError {
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  if self.phase() != @control.JobPhase::Running ||
+    cuts.length() != self.state.partition_count() {
+    raise JobStoreError::AlreadyRunning
+  }
+  let plans = self.work_plans.copy()
+  for partition, cut in cuts {
+    guard plans.get(partition) is Some(plan) &&
+      self.state.partition(partition) is Some(progress) else {
+      raise JobStoreError::PlanMismatch(partition)
+    }
+    if progress.applied_offset() + 1L != cut ||
+      progress.next_offset() != cut ||
+      plan.batches
+      .last()
+      .map(batch => batch.end_offset() + 1L)
+      .unwrap_or(plan.retained_from.unwrap_or(plan.start_offset)) !=
+      cut {
+      raise JobStoreError::PlanMismatch(partition)
+    }
+    plans[partition] = {
+      ..plan,
+      batches: [],
+      deltas: [],
+      retained_from: Some(cut),
+    }
+  }
+  self.checkpoint_plans_and_compact(plans)
 }
 
 ///|
@@ -751,6 +853,22 @@ pub async fn JobStore::start(self : JobStore) -> Unit raise JobStoreError {
   }
   defer self.write_lock.release()
   self.commit(entry)
+}
+
+///|
+/// Persist a Coordinator-authorized placement target before moving leases.
+pub async fn JobStore::allow_worker(
+  self : JobStore,
+  worker_id : String,
+) -> Unit raise JobStoreError {
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  if self.state.snapshot().workers().contains(worker_id) {
+    return
+  }
+  self.commit({ ..empty_job_entry("allow_worker"), worker_id, })
 }
 
 ///|
@@ -899,6 +1017,43 @@ pub async fn JobStore::reassign(
     },
   )
   assignment
+}
+
+///|
+/// Persist one online rebalance transition as an atomic Job command.
+pub async fn JobStore::move_partition(
+  self : JobStore,
+  partition : Int,
+  source_worker_id : String,
+  source_epoch : Int,
+  replacement_worker_id : String,
+) -> @control.JobPartition raise JobStoreError {
+  let entry = JobJournalEntry::{
+    ..empty_job_entry("move"),
+    partition,
+    worker_id: source_worker_id,
+    epoch: source_epoch,
+    replacement_worker_id,
+  }
+  self.write_lock.acquire() catch {
+    error => raise JobStoreError::Io(@debug.to_string(error))
+  }
+  defer self.write_lock.release()
+  let preview = self.preview_state()
+  let result = preview.move_partition(
+    partition, source_worker_id, source_epoch, replacement_worker_id,
+  ) catch {
+    error => raise JobStoreError::Job(error)
+  }
+  self.append_entry(entry)
+  ignore(
+    self.state.move_partition(
+      partition, source_worker_id, source_epoch, replacement_worker_id,
+    ) catch {
+      error => raise JobStoreError::Job(error)
+    },
+  )
+  result
 }
 
 ///|

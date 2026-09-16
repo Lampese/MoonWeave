@@ -47,6 +47,8 @@ pub fn LocalJobHandle::status(self : LocalJobHandle) -> JobRunStatus {
     idempotent_sink_required: self.compiled
     .sink()
     .requires_idempotent_consumer(),
+    paused: false,
+    parallelism: self.compiled.initial_parallelism(),
   }
 }
 

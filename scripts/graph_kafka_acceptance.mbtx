@@ -1,0 +1,781 @@
+///|
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/process",
+  "moonbitlang/async/shell",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/core/encoding/utf8",
+}
+
+///|
+struct Status {
+  job_id : String
+  phase : String
+  accepted_events : Int64
+  failure : String?
+  parallelism : Int
+  paused : Bool
+} derive(FromJson)
+
+///|
+struct Record {
+  task_id : String
+  sequence : Int64
+  output : Json
+} derive(FromJson)
+
+///|
+struct Sum {
+  key : String
+  start_ms : Int64
+  end_ms : Int64
+  total : Int64
+} derive(Eq, FromJson)
+
+///|
+enum Output {
+  WindowedSum(Sum)
+  Custom(Json)
+} derive(FromJson)
+
+///|
+struct Fixture {
+  root : String
+  classpath : String
+  brokers : String
+  data : String
+  control : String
+  coordinator : String
+  worker : String
+  driver : String
+  running : Set[Int]
+}
+
+///|
+async fn wait_port(endpoint : String) -> Unit {
+  @async.with_timeout(60000, () => {
+    for ;; {
+      try @socket.Tcp::connect(@socket.Addr::parse(endpoint)) catch {
+        _ => @async.sleep(50)
+      } noraise {
+        connection => {
+          connection.close()
+          return
+        }
+      }
+    }
+  })
+}
+
+///|
+async fn Fixture::spawn(
+  self : Fixture,
+  binary : String,
+  args : Array[String],
+  name : String,
+) -> Int {
+  let log = @process.redirect_to_file(self.root + "/" + name + ".log")
+  defer log.close()
+  let pid = @process.spawn_orphan(binary, args, stdout=log, stderr=log)
+  self.running.add(pid)
+  pid
+}
+
+///|
+async fn Fixture::kill(self : Fixture, pid : Int) -> Unit {
+  ignore(@process.run("/bin/kill", ["-KILL", pid.to_string()]))
+  ignore(@process.wait_pid(pid))
+  self.running.remove(pid)
+}
+
+///|
+async fn Fixture::start_broker(self : Fixture, round : Int) -> Int {
+  let pid = self.spawn(
+    "java",
+    [
+      "-Xms128m",
+      "-Xmx512m",
+      "-cp",
+      self.classpath,
+      "kafka.Kafka",
+      self.root + "/server.properties",
+    ],
+    "broker-" + round.to_string(),
+  )
+  wait_port(self.brokers)
+  pid
+}
+
+///|
+async fn Fixture::start_coordinator(self : Fixture, round : Int) -> Int {
+  let pid = self.spawn(
+    self.coordinator,
+    [
+      "--cluster",
+      "graph-kafka",
+      "--coordinator",
+      "coordinator",
+      "--bind",
+      self.data,
+      "--advertise",
+      self.data,
+      "--driver-bind",
+      self.control,
+      "--driver-advertise",
+      self.control,
+      "--storage",
+      self.root + "/coordinator",
+      "--workers",
+      "a@boot-a,b@boot-b,c@boot-c,d@boot-d",
+    ],
+    "coordinator-" + round.to_string(),
+  )
+  wait_port(self.control)
+  pid
+}
+
+///|
+async fn Fixture::start_worker(self : Fixture, id : String, round : Int) -> Int {
+  self.spawn(
+    self.worker,
+    [
+      "--cluster",
+      "graph-kafka",
+      "--coordinator",
+      "coordinator",
+      "--coordinator-endpoint",
+      self.data,
+      "--control-endpoint",
+      self.control,
+      "--worker",
+      id,
+      "--incarnation",
+      "boot-" + id,
+      "--storage",
+      self.root + "/worker-" + id,
+      "--job-config",
+      self.root + "/graph.json",
+    ],
+    "worker-" + id + "-" + round.to_string(),
+  )
+}
+
+///|
+async fn Fixture::command(
+  self : Fixture,
+  id : String,
+  command : String,
+  events? : Array[Json],
+  workers? : String,
+  parallelism? : Int,
+  update? : String,
+) -> Status {
+  let args = [
+    "--endpoint",
+    self.control,
+    "--cluster",
+    "graph-kafka",
+    "--coordinator",
+    "coordinator",
+    "--job-config",
+    self.root + "/" + id + ".json",
+    "--command",
+    command,
+    "--format",
+    "json",
+  ]
+  if events is Some(events) {
+    let path = self.root + "/input-" + id + ".json"
+    @fs.write_file(
+      path,
+      @json.to_json(events).stringify(),
+      create_mode=@fs.CreateOrTruncate,
+    )
+    args.push_iter(["--events", path].iter())
+  }
+  if workers is Some(workers) {
+    args.push_iter(["--workers", workers].iter())
+  }
+  if parallelism is Some(value) {
+    args.push_iter(["--parallelism", value.to_string()].iter())
+  }
+  if update is Some(path) {
+    args.push_iter(["--update-job-config", path].iter())
+  }
+  let result = @shell.Cmd(self.driver, args).output(timeout_ms=60000)
+  if result.exit_code() != 0 {
+    fail(result.stderr() + result.stdout())
+  }
+  let status : Status = @json.from_json(@json.parse(result.stdout()))
+  assert_eq(status.job_id, id)
+  if status.phase == "Failed" {
+    fail(status.failure.unwrap_or("job failed"))
+  }
+  status
+}
+
+///|
+fn digest(value : String) -> String {
+  let mut hash = 14695981039346656037UL
+  for byte in @utf8.encode(value) {
+    hash = (hash ^ byte.to_uint64()) * 1099511628211UL
+  }
+  "plan-" + hash.to_string(radix=16)
+}
+
+///|
+fn stage(
+  id : String,
+  source : Json,
+  sink : Json,
+  operations : Array[Json]?,
+  window : Bool?,
+) -> Json {
+  let operator = match operations {
+    Some(ops) => "transform-" + digest(@json.to_json(ops).stringify())
+    None => "keyed-sum"
+  }
+  let definition : Json = {
+    "job_id": id,
+    "operator": { "id": operator, "version": 1 },
+    "partition_count": 4,
+    "parallelism": 2,
+    "workers": ["a", "b"],
+    "routes": [],
+    "partitioning": "ByKey",
+    "source": source,
+    "sink": sink,
+    "watermark_idle_timeout_ms": "300000",
+    "max_state_events": 2048,
+  }
+  guard definition is Object(fields) else { abort("object") }
+  let fields = fields.copy()
+  if operations is Some(ops) {
+    fields["transform"] = @json.to_json(ops)
+  }
+  if window is Some(window) {
+    fields["event_time_config"] = {
+      "window_size_ms": if window {
+        "10"
+      } else {
+        "0"
+      },
+      "allowed_lateness_ms": "2",
+      "join_before_ms": if window {
+        "0"
+      } else {
+        "3"
+      },
+      "join_after_ms": if window {
+        "0"
+      } else {
+        "5"
+      },
+    }
+  }
+  { "id": id, "definition": Json::object(fields) }
+}
+
+///|
+fn kafka_source(brokers : String, topic : String) -> Json {
+  [
+    "Kafka",
+    {
+      "bootstrap_servers": [brokers],
+      "topic": topic,
+      "group_id": "graph-" + topic,
+      "partition": -1,
+      "start_from": "Earliest",
+      "security_protocol": "Plaintext",
+      "max_poll_records": 128,
+    },
+  ]
+}
+
+///|
+fn kafka_sink(brokers : String, topic : String) -> Json {
+  [
+    "Kafka",
+    {
+      "bootstrap_servers": [brokers],
+      "topic": topic,
+      "security_protocol": "Plaintext",
+    },
+  ]
+}
+
+///|
+async fn Fixture::compile(
+  self : Fixture,
+  id : String,
+  definition : Json,
+) -> Unit {
+  let path = self.root + "/definition-" + id + ".json"
+  @fs.write_file(path, definition.stringify())
+  let result = @shell.Cmd(self.driver, [
+    "--command",
+    "compile",
+    "--job-config",
+    path,
+    "--submission-id",
+    "submit-" + id,
+  ]).output(timeout_ms=10000)
+  if result.exit_code() != 0 {
+    fail(result.stderr())
+  }
+  @fs.write_file(self.root + "/" + id + ".json", result.stdout())
+}
+
+///|
+fn event(time : Int64, value : Int64, enabled? : Bool = true) -> Json {
+  {
+    "record": {
+      "id": { "origin": "replaced-by-kafka-offset", "sequence": "0" },
+      "parents": [],
+      "key": "before-rekey",
+      "payload": {
+        "account": "account",
+        "value": value.to_string(),
+        "enabled": enabled,
+      },
+      "event_time": time.to_string(),
+      "input_id": "main",
+    },
+  }
+}
+
+///|
+async fn Fixture::produce(
+  self : Fixture,
+  topic : String,
+  events : Array[Json],
+) -> Unit {
+  let text = events.map(value => value.stringify()).join("\n") + "\n"
+  @shell.Cmd(
+    "java",
+    [
+      "-Xmx128m",
+      "-cp",
+      self.classpath,
+      "org.apache.kafka.tools.ConsoleProducer",
+      "--bootstrap-server",
+      self.brokers,
+      "--topic",
+      topic,
+      "--sync",
+    ],
+    stdin=@shell.Stdin::Text(text),
+  ).run(timeout_ms=60000)
+}
+
+///|
+async fn Fixture::observe(self : Fixture, topic : String) -> Unit {
+  let output = @process.redirect_to_file(self.root + "/" + topic + ".jsonl")
+  let log = @process.redirect_to_file(self.root + "/observe-" + topic + ".log")
+  defer output.close()
+  defer log.close()
+  let pid = @process.spawn_orphan(
+    "java",
+    [
+      "-Xmx128m",
+      "-cp",
+      self.classpath,
+      "org.apache.kafka.tools.consumer.ConsoleConsumer",
+      "--bootstrap-server",
+      self.brokers,
+      "--topic",
+      topic,
+      "--from-beginning",
+      "--group",
+      "oracle-" + topic,
+    ],
+    stdout=output,
+    stderr=log,
+  )
+  self.running.add(pid)
+}
+
+///|
+async fn Fixture::records(self : Fixture, topic : String) -> Array[Record] {
+  let known : Map[(String, Int64), Record] = Map([])
+  for
+    line in @fs.read_file(self.root + "/" + topic + ".jsonl").text().split("\n") {
+    if line.trim().is_empty() {
+      continue
+    }
+    let record : Record = @json.from_json(@json.parse(line))
+    let key = (record.task_id, record.sequence)
+    if known.get(key) is Some(previous) {
+      assert_eq(previous.output, record.output)
+    } else {
+      known[key] = record
+    }
+  }
+  known.values().to_array()
+}
+
+///|
+async fn Fixture::wait_outputs(
+  self : Fixture,
+  windows : Int,
+  joins : Int,
+) -> Unit {
+  @async.with_timeout(45000, () => {
+    while self.records("windows").length() < windows ||
+          self.records("joined").length() < joins {
+      assert_eq(self.command("graph", "status").phase, "Running")
+      @async.sleep(100)
+    }
+  })
+}
+
+///|
+async fn Fixture::verify(
+  self : Fixture,
+  expected_windows : Array[(Int64, Int64)],
+  expected_pairs : Array[(String, String)],
+) -> Unit {
+  let windows = self.records("windows")
+  assert_eq(windows.length(), expected_windows.length())
+  let totals : Array[(Int64, Int64)] = []
+  for record in windows {
+    let output : Output = @json.from_json(record.output)
+    guard output is WindowedSum(sum) else { fail("expected window") }
+    assert_eq(sum.key, "account")
+    assert_eq(sum.end_ms - sum.start_ms, 10L)
+    totals.push((sum.start_ms, sum.total))
+  }
+  totals.sort()
+  let expected_windows = expected_windows.copy()
+  expected_windows.sort()
+  assert_eq(totals, expected_windows)
+  let pairs : Array[(String, String)] = []
+  for record in self.records("joined") {
+    let output : Output = @json.from_json(record.output)
+    guard output is Custom(Object(fields)) else { fail("expected join") }
+    guard fields.get("left") is Some(Object(left)) &&
+      fields.get("right") is Some(Object(right)) else {
+      fail("expected pair")
+    }
+    guard left.get("value") is Some(String(lv)) &&
+      right.get("value") is Some(String(rv)) else {
+      fail("expected values")
+    }
+    pairs.push((lv, rv))
+  }
+  pairs.sort()
+  let expected_pairs = expected_pairs.copy()
+  expected_pairs.sort()
+  assert_eq(pairs, expected_pairs)
+}
+
+///|
+async fn main {
+  let args = @env.args()
+  let kafka = if args.length() > 1 { args[1] } else { "/tmp/kafka_2.13-4.0.0" }
+  let root = @fs.tmpdir(prefix="moonweave-graph-kafka-")
+  println("Graph Kafka evidence: " + root)
+  @shell.Cmd("moon", [
+    "build", "--target", "native", "cmd/coordinator", "cmd/worker", "cmd/driver",
+    "--warn-list", "-a",
+  ]).run(timeout_ms=180000)
+  let ports = []
+  for _ in 0..<4 {
+    ports.push(@socket.TcpServer(@socket.Addr::parse("127.0.0.1:0")))
+  }
+  let endpoints = ports.map(port => "127.0.0.1:" + port.addr.port().to_string())
+  let binaries = "_build/native/debug/build/moonweave/moonweave/cmd/"
+  let f : Fixture = {
+    root,
+    classpath: kafka + "/libs/*",
+    brokers: endpoints[0],
+    data: endpoints[2],
+    control: endpoints[3],
+    coordinator: @fs.realpath(binaries + "coordinator/coordinator.exe"),
+    worker: @fs.realpath(binaries + "worker/worker.exe"),
+    driver: @fs.realpath(binaries + "driver/driver.exe"),
+    running: Set([]),
+  }
+  @fs.write_file(
+    root + "/server.properties",
+    (
+      $|process.roles=broker,controller
+      $|node.id=1
+      $|controller.quorum.voters=1@\{endpoints[1]}
+      $|listeners=PLAINTEXT://\{f.brokers},CONTROLLER://\{endpoints[1]}
+      $|advertised.listeners=PLAINTEXT://\{f.brokers}
+      $|controller.listener.names=CONTROLLER
+      $|listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      $|inter.broker.listener.name=PLAINTEXT
+      $|log.dirs=\{root}/broker-data
+      $|offsets.topic.replication.factor=1
+      $|offsets.topic.num.partitions=1
+      $|transaction.state.log.replication.factor=1
+      $|transaction.state.log.min.isr=1
+      $|group.initial.rebalance.delay.ms=0
+      $|auto.create.topics.enable=false
+      $|num.network.threads=2
+      $|num.io.threads=2
+    ),
+  )
+  @shell.Cmd("java", [
+    "-cp",
+    f.classpath,
+    "kafka.tools.StorageTool",
+    "format",
+    "--standalone",
+    "-t",
+    "MkU3OEVBNTcwNTJENDM2Qk",
+    "-c",
+    root + "/server.properties",
+  ]).run()
+  for port in ports {
+    port.close()
+  }
+  defer @async.protect_from_cancel(() => {
+    for pid in f.running.to_array() {
+      f.kill(pid)
+    }
+  })
+  @async.with_timeout(240000, () => {
+    let broker = f.start_broker(0)
+    for topic in ["left", "right", "windows", "joined"] {
+      @shell.Cmd("java", [
+        "-Xmx128m",
+        "-cp",
+        f.classpath,
+        "org.apache.kafka.tools.TopicCommand",
+        "--bootstrap-server",
+        f.brokers,
+        "--create",
+        "--topic",
+        topic,
+        "--partitions",
+        "1",
+        "--replication-factor",
+        "1",
+      ]).run(timeout_ms=30000)
+    }
+    let left_ops : Array[Json] = [
+      ["KeepEqual", "enabled", true],
+      ["Multiply", "value", "2"],
+      ["KeyBy", "account"],
+    ]
+    let right_ops : Array[Json] = [
+      ["KeepEqual", "enabled", true],
+      ["KeyBy", "account"],
+    ]
+    let graph : Json = {
+      "job_id": "graph",
+      "operator": { "id": "keyed-sum", "version": 1 },
+      "partition_count": 1,
+      "workers": ["a", "b"],
+      "routes": [],
+      "partitioning": "ByKey",
+      "source": "Events",
+      "sink": "Discard",
+      "graph": {
+        "stages": [
+          stage(
+            "left",
+            kafka_source(f.brokers, "left"),
+            "Discard",
+            Some(left_ops),
+            None,
+          ),
+          stage(
+            "right",
+            kafka_source(f.brokers, "right"),
+            "Discard",
+            Some(right_ops),
+            None,
+          ),
+          stage(
+            "join",
+            "Events",
+            kafka_sink(f.brokers, "joined"),
+            None,
+            Some(false),
+          ),
+          stage(
+            "window",
+            "Events",
+            kafka_sink(f.brokers, "windows"),
+            None,
+            Some(true),
+          ),
+        ],
+        "edges": [
+          { "from": "left", "to": "join", "input_id": "left" },
+          { "from": "right", "to": "join", "input_id": "right" },
+          { "from": "left", "to": "window", "input_id": "main" },
+        ],
+      },
+    }
+    f.compile("graph", graph)
+    f.compile("audit", {
+      "job_id": "audit",
+      "operator": { "id": "keyed-sum", "version": 1 },
+      "partition_count": 1,
+      "workers": ["a"],
+      "routes": [],
+      "partitioning": "ByKey",
+      "source": "Events",
+      "sink": ["JsonLines", root + "/audit.jsonl"],
+    })
+    f.observe("windows")
+    f.observe("joined")
+    f.produce("left", [event(1L, 2L), event(4L, 3L)])
+    f.produce("right", [event(3L, 7L), event(8L, 9L)])
+    let coordinator = f.start_coordinator(0)
+    ignore(f.command("graph", "submit"))
+    ignore(f.command("audit", "submit"))
+    let wa = f.start_worker("a", 0)
+    let wb = f.start_worker("b", 0)
+    let audit = f.spawn(
+      f.worker,
+      [
+        "--cluster",
+        "graph-kafka",
+        "--coordinator",
+        "coordinator",
+        "--coordinator-endpoint",
+        f.data,
+        "--worker",
+        "a",
+        "--incarnation",
+        "boot-a",
+        "--storage",
+        root + "/audit-worker",
+        "--job-config",
+        root + "/audit.json",
+      ],
+      "audit-worker",
+    )
+    assert_eq(
+      f.command("audit", "input", events=[event(1L, 11L)]).accepted_events,
+      1L,
+    )
+    f.wait_outputs(0, 3)
+    f.produce("left", [event(22L, 0L, enabled=false)])
+    f.produce("right", [event(22L, 0L, enabled=false)])
+    f.wait_outputs(1, 3)
+    f.verify([(0L, 10L)], [("4", "7"), ("6", "7"), ("6", "9")])
+    println(
+      "PASS: two Kafka sources, map/filter/rekey, branch, interval join and Running window",
+    )
+    let wc = f.start_worker("c", 0)
+    let wd = f.start_worker("d", 0)
+    assert_eq(
+      f.command("graph", "rescale", workers="a,b,c,d", parallelism=4).parallelism,
+      4,
+    )
+    f.produce("left", [event(1L, 999L)])
+    f.kill(broker)
+    @async.sleep(1500)
+    ignore(f.start_broker(1))
+    f.produce("left", [event(31L, 5L)])
+    f.produce("right", [event(33L, 13L)])
+    f.wait_outputs(1, 4)
+    f.produce("left", [event(42L, 0L, enabled=false)])
+    f.produce("right", [event(42L, 0L, enabled=false)])
+    f.wait_outputs(2, 4)
+    f.verify([(0L, 10L), (30L, 10L)], [
+      ("4", "7"),
+      ("6", "7"),
+      ("6", "9"),
+      ("10", "13"),
+    ])
+    println(
+      "PASS: broker restart and late input preserve Running graph results",
+    )
+    assert_true(f.command("graph", "pause").paused)
+    assert_eq(
+      f.command("graph", "rescale", workers="a,b", parallelism=2).parallelism,
+      2,
+    )
+    f.kill(wc)
+    f.kill(wd)
+    let old_submission = @fs.read_file(root + "/graph.json").text()
+    guard graph is Object(definition) &&
+      definition.get("graph") is Some(Object(flow)) &&
+      flow.get("stages") is Some(Array(stages)) else {
+      fail("graph definition")
+    }
+    let updated_stages = stages.map(value => {
+      guard value is Object(stage) &&
+        stage.get("definition") is Some(Object(job)) else {
+        fail("stage definition")
+      }
+      let job = job.copy()
+      job["max_state_events"] = 4096
+      let stage = stage.copy()
+      stage["definition"] = Json::object(job)
+      Json::object(stage)
+    })
+    let flow = flow.copy()
+    flow["stages"] = @json.to_json(updated_stages)
+    let definition = definition.copy()
+    definition["graph"] = Json::object(flow)
+    f.compile("graph", Json::object(definition))
+    let updated_submission = @fs.read_file(root + "/graph.json").text()
+    @fs.write_file(root + "/graph-next.json", updated_submission)
+    @fs.write_file(root + "/graph.json", old_submission)
+    assert_true(
+      f.command("graph", "update", update=root + "/graph-next.json").paused,
+    )
+    @fs.write_file(root + "/graph.json", updated_submission)
+    f.kill(coordinator)
+    f.kill(wa)
+    f.kill(wb)
+    f.kill(audit)
+    ignore(f.start_coordinator(1))
+    ignore(f.start_worker("a", 1))
+    ignore(f.start_worker("b", 1))
+    assert_eq(f.command("graph", "status").phase, "Running")
+    assert_true(f.command("graph", "status").paused)
+    assert_eq(f.command("graph", "status").parallelism, 2)
+    assert_false(f.command("graph", "resume").paused)
+    assert_eq(f.command("audit", "status").accepted_events, 1L)
+    f.produce("left", [event(51L, 7L)])
+    f.produce("right", [event(53L, 17L)])
+    f.wait_outputs(2, 5)
+    assert_eq(f.command("graph", "drain").phase, "Succeeded")
+    @async.with_timeout(15000, () => {
+      while f.records("windows").length() < 3 {
+        @async.sleep(50)
+      }
+    })
+    f.verify([(0L, 10L), (30L, 10L), (50L, 14L)], [
+      ("4", "7"),
+      ("6", "7"),
+      ("6", "9"),
+      ("10", "13"),
+      ("14", "17"),
+    ])
+    @fs.write_file(
+      root + "/result.json",
+      (
+        {
+          "passed": true,
+          "windows": 3,
+          "join_pairs": 5,
+          "input_loss": 0,
+          "output_mismatch": 0,
+          "broker_restart": true,
+          "process_restart": true,
+          "workers": [2, 4, 2],
+          "parallelism": [2, 4, 2],
+          "compatible_update_recovered": true,
+          "migration_transport": "tcp",
+          "window_boundaries_checked": true,
+        } : Json).stringify(),
+    )
+    println(
+      "PASS: independent process graph/Kafka acceptance, loss=0 mismatch=0",
+    )
+  })
+}

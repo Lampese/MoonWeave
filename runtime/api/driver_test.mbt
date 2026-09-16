@@ -107,13 +107,61 @@ async test "driver control rejects a missing authentication token" {
         .compile()
         .submission_with_id("driver-auth-submission")
       try client.submit(submission) catch {
-        ApiError::Cluster(_) => ()
+        ApiError::InvalidDriverCommand(reason) =>
+          assert_true(reason.contains("authentication failed"))
         _ => fail("expected missing Driver token to close the session")
       } noraise {
         _ => fail("expected missing Driver token to close the session")
       }
       client.close()
       ignore(server.wait())
+    }
+  })
+}
+
+///|
+async test "driver initial submit follows a reachable follower to the leader" {
+  let directory = @fs.tmpdir(prefix="moonweave-driver-failover")
+  defer @fs.rmdir(directory, recursive=true)
+  let store = DriverStore::open(directory + "/driver.wal")
+  defer store.close()
+  let config = DriverControlConfig::new(
+    "failover-cluster",
+    "coordinator",
+    NodeEndpoint::new("127.0.0.1", 0),
+  )
+  let follower = DriverControlListener::bind(config)
+  defer follower.close()
+  let leader = DriverControlListener::bind(config)
+  defer leader.close()
+  @async_runtime.with_timeout(10000, () => {
+    @async_runtime.with_task_group <| group => {
+      group.spawn_bg(no_wait=true) <| () => {
+        follower.run(_ => Err("Coordinator is not the network quorum leader"))
+      }
+      group.spawn_bg(no_wait=true) <| () => { leader.run_store(store) }
+      let client = DriverClient::connect(
+        DriverConfig::new(
+          "failover-cluster",
+          "coordinator",
+          "driver",
+          follower.endpoint(),
+        ).with_coordinator_endpoints([follower.endpoint(), leader.endpoint()]),
+      )
+      defer client.close()
+      let submission = JobDefinition::new(
+          "failover-job",
+          OperatorRef::keyed_sum(),
+        )
+        .compile()
+        .submission_with_id("failover-submit")
+      assert_eq(client.submit(submission).phase(), Running)
+      let event = Event::new(@causal.EventId::new("source", 0), [], "key", {
+        "value": "7",
+      })
+      assert_eq(client.input([event]).accepted_events(), 1L)
+      assert_eq(client.input([event]).accepted_events(), 1L)
+      assert_eq(client.status().accepted_events(), 1L)
     }
   })
 }

@@ -21,7 +21,7 @@ pub(all) suberror AggregationError {
 pub(all) struct Contribution {
   key : String
   value : Int64
-} derive(Eq, @debug.Debug)
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 pub fn Contribution::from_json(String, Json) -> Self raise AggregationError
 pub fn Contribution::key(Self) -> String
 pub fn Contribution::new(String, Int64) -> Self raise AggregationError
@@ -35,6 +35,8 @@ pub struct Engine {
 }
 pub fn Engine::apply(Self, @causal.Event[Contribution]) -> Array[KeyedSum] raise AggregationError
 pub fn Engine::apply_json_event(Self, @causal.EventId, ArrayView[@causal.EventId], String, Json) -> Array[KeyedSum] raise AggregationError
+pub fn Engine::causal_state_count(Self) -> Int
+pub fn Engine::compact(Self, @causal.CausalRetirement) -> Unit raise @causal.CausalError
 pub fn Engine::copy(Self) -> Self
 pub fn Engine::event_count(Self) -> Int
 pub fn Engine::events(Self) -> Array[@causal.Event[Contribution]]
@@ -44,8 +46,16 @@ pub fn Engine::output_count(Self) -> Int
 pub fn Engine::outputs(Self) -> Array[KeyedSum]
 pub fn Engine::pending_count(Self) -> Int
 pub fn Engine::pending_events(Self) -> Array[@causal.Event[Contribution]]
+pub fn Engine::restore(EngineSnapshot) -> Self raise AggregationError
+pub fn Engine::snapshot(Self) -> EngineSnapshot
 pub fn Engine::total(Self, String) -> Int64?
 pub fn Engine::totals(Self) -> Array[KeyedSum]
+
+pub(all) struct EngineSnapshot {
+  causal : @causal.CausalLogSnapshot[Contribution]
+  totals : Array[KeyedSum]
+  outputs : Array[KeyedSum]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
 
 pub(all) struct KeyedSum {
   key : String

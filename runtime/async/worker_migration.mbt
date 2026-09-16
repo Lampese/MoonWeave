@@ -256,7 +256,9 @@ pub struct WorkerMigration {
   delta_records : Int
   batches : Array[@protocol.EventBatch]
   deltas : Array[@protocol.DeltaBatch]
+  journal : Array[WorkerWalRecord]?
   outputs : Array[TaskOutputRecord]?
+  output_retention : OutputRetentionMarker?
   digest : String
 } derive(Debug, Eq, ToJson, FromJson)
 
@@ -273,6 +275,13 @@ pub fn WorkerMigration::task_id(self : WorkerMigration) -> String {
 }
 
 ///|
+pub fn WorkerMigration::task_snapshot(
+  self : WorkerMigration,
+) -> @task.TaskSnapshot {
+  self.snapshot
+}
+
+///|
 pub fn WorkerMigration::digest(self : WorkerMigration) -> String {
   self.digest
 }
@@ -282,7 +291,7 @@ pub fn WorkerMigration::persisted_offset(self : WorkerMigration) -> Int64 {
   self.batches
   .last()
   .map(batch => batch.end_offset())
-  .unwrap_or(self.identity.start_offset - 1L)
+  .unwrap_or(self.snapshot.offset())
 }
 
 ///|
@@ -304,10 +313,73 @@ fn WorkerMigration::validate(
     snapshot.epoch() != identity.source_epoch ||
     snapshot.operator_capability() != snapshot.operator().capability() ||
     self.primary_records < 0 ||
-    self.primary_records > self.batches.length() ||
+    self.primary_records >
+    self.journal
+    .map(records => records.length())
+    .unwrap_or(self.batches.length()) ||
     self.delta_records < 0 ||
     self.delta_records > self.deltas.length() {
     raise WorkerMigrationError::CheckpointMismatch
+  }
+  let mut primary_batches = self.primary_records
+  if self.journal is Some(records) &&
+    records.get(0) is Some(WorkerWalRecord::Checkpoint(base)) {
+    self.validate_reclaimed(base, records)
+    return
+  }
+  if self.output_retention is Some(_) {
+    raise WorkerMigrationError::OutputConflict
+  }
+  match self.journal {
+    None => ()
+    Some(records) => {
+      let mut batch_index = 0
+      let mut delta_index = 0
+      let mut watermark = -1L
+      let mut checkpoint_watermark = -1L
+      primary_batches = 0
+      for index, record in records {
+        match record {
+          WorkerWalRecord::Checkpoint(_) | WorkerWalRecord::EmbeddedDelta(_) =>
+            raise WorkerMigrationError::CheckpointMismatch
+          WorkerWalRecord::Batch(batch) => {
+            if self.batches.get(batch_index) != Some(batch) {
+              raise WorkerMigrationError::CheckpointMismatch
+            }
+            batch_index += 1
+            if index < self.primary_records {
+              primary_batches += 1
+            }
+          }
+          WorkerWalRecord::Delta(id) => {
+            if self.deltas.get(delta_index).map(delta => delta.delta_id()) !=
+              Some(id) {
+              raise WorkerMigrationError::CheckpointMismatch
+            }
+            delta_index += 1
+            if index < self.primary_records && delta_index > self.delta_records {
+              raise WorkerMigrationError::CheckpointMismatch
+            }
+          }
+          WorkerWalRecord::Watermark(value) => {
+            if value.partition() != identity.partition ||
+              value.epoch() != identity.source_epoch ||
+              value.timestamp() < 0L ||
+              value.timestamp() < watermark {
+              raise WorkerMigrationError::CheckpointMismatch
+            }
+            watermark = value.timestamp()
+            if index < self.primary_records {
+              checkpoint_watermark = watermark
+            }
+          }
+        }
+      }
+      if batch_index != self.batches.length() ||
+        checkpoint_watermark != snapshot.watermark_requested() {
+        raise WorkerMigrationError::CheckpointMismatch
+      }
+    }
   }
   let mut next = identity.start_offset
   let prefix_events : Map[@causal.EventId, @protocol.EventRecord] = Map([])
@@ -330,16 +402,16 @@ fn WorkerMigration::validate(
       raise WorkerMigrationError::CheckpointMismatch
     }
     next = batch.end_offset() + 1L
-    if index < self.primary_records {
+    if index < primary_batches {
       for event in batch.events() {
         add_event(event)
       }
     }
   }
-  let expected_offset = if self.primary_records == 0 {
+  let expected_offset = if primary_batches == 0 {
     identity.start_offset - 1L
   } else {
-    self.batches[self.primary_records - 1].end_offset()
+    self.batches[primary_batches - 1].end_offset()
   }
   if snapshot.offset() != expected_offset {
     raise WorkerMigrationError::CheckpointMismatch
@@ -365,17 +437,7 @@ fn WorkerMigration::validate(
   if events != snapshot.events().to_owned() {
     raise WorkerMigrationError::CheckpointMismatch
   }
-  let task = @task.Task::new(
-    snapshot.task_id(),
-    snapshot.operator_id(),
-    snapshot.operator(),
-    identity.partition,
-    identity.source_epoch,
-    start_offset=identity.start_offset,
-  ) catch {
-    error => raise WorkerMigrationError::Task(error)
-  }
-  task.restore(snapshot) catch {
+  snapshot.validate_transfer(identity.start_offset) catch {
     error => raise WorkerMigrationError::Task(error)
   }
   if self.outputs is Some(outputs) {
@@ -451,7 +513,8 @@ fn migration_json(encoded : Bytes) -> Json raise WorkerMigrationError {
 /// Capture a stopped Worker's verified state without modifying its files.
 /// All WAL locks are held together, and a live owner returns Busy. A checkpoint
 /// may lag its WAL: the suffix travels with the snapshot and replays at startup.
-/// Completed/compacted output streams are deliberately ineligible for takeover.
+/// A running output stream may carry an acknowledged retention prefix; sealed
+/// terminal output streams remain ineligible for takeover.
 pub async fn WorkerMigration::capture(
   identity : WorkerMigrationIdentity,
   paths : WorkerStoragePaths,
@@ -479,12 +542,28 @@ pub async fn WorkerMigration::capture(
     }
   }
   let replay = migration_replay(active.wal_path)
-  let delta_replay = match active.delta_wal_path {
-    Some(path) => optional_migration_replay(path)
-    None => None
+  let journal = replay
+    .records()
+    .map(encoded => {
+      decode_worker_record(encoded) catch {
+        _ => raise WorkerMigrationError::Malformed
+      }
+    })
+  let base = match journal.get(0) {
+    Some(WorkerWalRecord::Checkpoint(value)) => Some(value)
+    _ => None
   }
-  let saved = Checkpoint::load(active.checkpoint_path) catch {
-    _ => raise WorkerMigrationError::CheckpointMismatch
+  let delta_replay = match (base, active.delta_wal_path) {
+    (Some(_), _) => None
+    (_, Some(path)) => optional_migration_replay(path)
+    (_, None) => None
+  }
+  let saved = match base {
+    Some(value) => Some(value.checkpoint)
+    None =>
+      Checkpoint::load(active.checkpoint_path) catch {
+        _ => raise WorkerMigrationError::CheckpointMismatch
+      }
   }
   guard saved is Some(saved) else {
     raise WorkerMigrationError::MissingCheckpoint
@@ -503,8 +582,12 @@ pub async fn WorkerMigration::capture(
     saved.frontier_digest() != snapshot.frontier_digest() {
     raise WorkerMigrationError::CheckpointMismatch
   }
-  let primary_records = replay.record_count_before(saved.wal_offset()) catch {
-    _ => raise WorkerMigrationError::CheckpointMismatch
+  let primary_records = if base is Some(_) {
+    1
+  } else {
+    replay.record_count_before(saved.wal_offset()) catch {
+      _ => raise WorkerMigrationError::CheckpointMismatch
+    }
   }
   let delta_records = match delta_replay {
     Some(replay) =>
@@ -518,14 +601,12 @@ pub async fn WorkerMigration::capture(
       0
     }
   }
-  let batches = replay
-    .records()
-    .map(encoded => {
-      let raw : @protocol.EventBatch = @json.from_json(migration_json(encoded)) catch {
-        _ => raise WorkerMigrationError::Malformed
-      }
-      raw
-    })
+  let batches : Array[@protocol.EventBatch] = []
+  for record in journal {
+    if record is WorkerWalRecord::Batch(batch) {
+      batches.push(batch)
+    }
+  }
   let deltas = match delta_replay {
     None => []
     Some(replay) =>
@@ -541,6 +622,7 @@ pub async fn WorkerMigration::capture(
         record.delta
       })
   }
+  let mut output_retention : OutputRetentionMarker? = None
   let outputs = match active.output_log_path {
     None => None
     Some(path) =>
@@ -550,13 +632,22 @@ pub async fn WorkerMigration::capture(
           Some(
             replay
             .records()
-            .map(encoded => {
-              let record : TaskOutputRecord = @json.from_json(
-                migration_json(encoded),
-              ) catch {
+            .filter_map(encoded => {
+              let json = migration_json(encoded)
+              let retention_marker = output_retention_marker_from_json(json) catch {
                 _ => raise WorkerMigrationError::OutputConflict
               }
-              record
+              if retention_marker is Some(marker) {
+                if output_retention is Some(_) {
+                  raise WorkerMigrationError::OutputConflict
+                }
+                output_retention = Some(marker)
+                return None
+              }
+              let record : TaskOutputRecord = @json.from_json(json) catch {
+                _ => raise WorkerMigrationError::OutputConflict
+              }
+              Some(record)
             }),
           )
       }
@@ -569,7 +660,9 @@ pub async fn WorkerMigration::capture(
     delta_records,
     batches,
     deltas,
+    journal: Some(journal),
     outputs,
+    output_retention,
     digest: "",
   }
   let bundle = { ..bundle, digest: bundle.migration_digest(), }
@@ -967,7 +1060,32 @@ pub async fn WorkerMigration::install(
     ..delta,
     target_epoch: expected.target_epoch,
   })
-  let primary_payloads = batches.map(batch => @utf8.encode(batch.to_payload()))
+  let primary_payloads = match self.journal {
+    None => batches.map(batch => @utf8.encode(batch.to_payload()))
+    Some(records) =>
+      records.map(record => {
+        let rebound = match record {
+          WorkerWalRecord::Checkpoint(base) =>
+            WorkerWalRecord::Checkpoint(
+              rebound_journal_checkpoint(base, expected.target_epoch),
+            )
+          WorkerWalRecord::EmbeddedDelta(delta) =>
+            WorkerWalRecord::EmbeddedDelta({
+              ..delta,
+              target_epoch: expected.target_epoch,
+            })
+          WorkerWalRecord::Batch(batch) =>
+            WorkerWalRecord::Batch({ ..batch, epoch: expected.target_epoch, })
+          WorkerWalRecord::Watermark(value) =>
+            WorkerWalRecord::Watermark({
+              ..value,
+              epoch: expected.target_epoch,
+            })
+          WorkerWalRecord::Delta(id) => WorkerWalRecord::Delta(id)
+        }
+        encode_worker_record(rebound)
+      })
+  }
   let delta_payloads = deltas.map(delta => {
     @utf8.encode(
       @json.to_json(DeltaWalRecord::{ delta_id: delta.delta_id(), delta, }).stringify(),
@@ -983,20 +1101,24 @@ pub async fn WorkerMigration::install(
     Some(path) => migration_stage_wal(path, delta_payloads, self.delta_records)
   }
   if active.output_log_path is Some(path) && self.outputs is Some(outputs) {
-    ignore(
-      migration_stage_wal(
-        path,
-        outputs.map(record => {
-          @utf8.encode(
-            @json.to_json(TaskOutputRecord::{
-              ..record,
-              epoch: expected.target_epoch,
-            }).stringify(),
-          )
-        }),
-        0,
-      ),
+    let payloads : Array[Bytes] = []
+    if self.output_retention is Some(marker) {
+      payloads.push(
+        @utf8.encode(
+          @json.to_json({ ..marker, epoch: expected.target_epoch, }).stringify(),
+        ),
+      )
+    }
+    payloads.push_iter(
+      outputs
+      .map(record => {
+        @utf8.encode(
+          @json.to_json({ ..record, epoch: expected.target_epoch, }).stringify(),
+        )
+      })
+      .iter(),
     )
+    ignore(migration_stage_wal(path, payloads, 0))
   }
   let snapshot = self.snapshot.rebind(self.task_id(), expected.target_epoch) catch {
     error => raise WorkerMigrationError::Task(error)
@@ -1011,6 +1133,7 @@ pub async fn WorkerMigration::install(
     delta_wal_offset~,
     state_schema=snapshot.state_schema(),
     operator_state=@json.to_json(snapshot),
+    watermark=snapshot.watermark_requested(),
   ) catch {
     _ => raise WorkerMigrationError::CheckpointMismatch
   }

@@ -35,7 +35,9 @@ async test "DriverCoordinator executes a submitted Job with a waiting Worker" {
     let control_endpoint = coordinator.control_endpoint()
     @async_runtime.with_task_group <| group => {
       let coordinator_task = group.spawn(allow_failure=true) <| () => {
-        try coordinator.run() catch {
+        // Keep the control listener alive while querying the terminal status.
+        // The default single-job runner returns as soon as drain completes.
+        try coordinator.run(keep_terminal=true) catch {
           error => Err(@debug.to_string(error))
         } noraise {
           value => Ok(value)
@@ -73,8 +75,17 @@ async test "DriverCoordinator executes a submitted Job with a waiting Worker" {
       )
       assert_eq(client.input([event]).accepted_events(), 1L)
       coordinator.shutdown_gracefully()
-      assert_eq(client.status().phase(), JobRunPhase::Succeeded)
+      let terminal_status = client.status() catch {
+        error => fail(@debug.to_string(error))
+      }
+      guard terminal_status.phase() == JobRunPhase::Succeeded else {
+        fail(
+          "graceful shutdown: " +
+          terminal_status.failure().unwrap_or("missing failure"),
+        )
+      }
       client.close()
+      coordinator.close()
       let execution = coordinator_task.wait()
       let worker = worker_task.wait()
       guard execution is Ok(summary) else {

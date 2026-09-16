@@ -54,6 +54,7 @@ pub fn TaskInput::event(self : TaskInput) -> @protocol.EventRecord {
 /// A newly emitted operator result. Facts and alerts are intentionally separate
 /// so callers cannot confuse a security alert with a graph reachability fact.
 pub(all) enum TaskOutput {
+  WindowedSum(WindowedSum)
   KeyedSum(@aggregation.KeyedSum)
   Reachable(@reachability.Reachable)
   SecurityAlert(@security.SecurityAlert)
@@ -65,6 +66,10 @@ pub(all) enum TaskOutput {
 /// implement the ordering trait required by `Array::sort`.
 pub impl Compare for TaskOutput with fn compare(self, other) {
   match (self, other) {
+    (TaskOutput::WindowedSum(left), TaskOutput::WindowedSum(right)) =>
+      left.compare(right)
+    (TaskOutput::WindowedSum(_), _) => -1
+    (_, TaskOutput::WindowedSum(_)) => 1
     (TaskOutput::KeyedSum(left), TaskOutput::KeyedSum(right)) =>
       Compare::compare(left, right)
     (TaskOutput::Reachable(left), TaskOutput::Reachable(right)) =>
@@ -98,6 +103,16 @@ pub(all) struct TaskProgress {
 pub fn TaskProgress::task_id(self : TaskProgress) -> String {
   self.task_id
 }
+
+///|
+/// Event-time inputs need to retain their transport metadata while the
+/// derived window/join state is compacted.  The causal log stores this payload
+/// so a snapshot can reconstruct the same frontier and pending set.
+struct TaskEventPayload {
+  payload : Json
+  event_time : Int64?
+  input_id : String
+} derive(Debug, Eq, ToJson, FromJson)
 
 ///|
 pub fn TaskProgress::partition(self : TaskProgress) -> Int {
@@ -147,9 +162,20 @@ pub struct Task {
   mut reachability : @reachability.Engine?
   mut security : @security.Engine?
   custom_operator : CustomOperator?
-  mut custom_log : @causal.CausalLog[Json]?
+  mut custom_log : @causal.CausalLog[TaskEventPayload]?
   mut custom_outputs : Array[Json]
   max_state_events : Int
+  mut event_time_config : TaskEventTimeConfig?
+  mut event_time_log : @causal.CausalLog[TaskEventPayload]?
+  mut watermark : Int64
+  mut watermark_requested : Int64
+  mut late_events : Int
+  mut window_buckets : Array[TaskWindowBucket]
+  mut join_left : Array[@protocol.EventRecord]
+  mut join_right : Array[@protocol.EventRecord]
+  mut join_emitted : Set[(@causal.EventId, @causal.EventId)]
+  mut graph_config : TaskGraphConfig?
+  mut graph_log : @causal.CausalLog[TaskEventPayload]?
 }
 
 ///|
@@ -237,6 +263,17 @@ pub fn Task::new(
     custom_log: None,
     custom_outputs: [],
     max_state_events,
+    event_time_config: None,
+    event_time_log: None,
+    watermark: -1L,
+    watermark_requested: -1L,
+    late_events: 0,
+    window_buckets: [],
+    join_left: [],
+    join_right: [],
+    join_emitted: Set([]),
+    graph_config: None,
+    graph_log: None,
   }
 }
 
@@ -297,7 +334,37 @@ pub fn Task::new_custom(
     custom_log: Some(custom_log),
     custom_outputs: [],
     max_state_events,
+    event_time_config: None,
+    event_time_log: None,
+    watermark: -1L,
+    watermark_requested: -1L,
+    late_events: 0,
+    window_buckets: [],
+    join_left: [],
+    join_right: [],
+    join_emitted: Set([]),
+    graph_config: None,
+    graph_log: None,
   }
+}
+
+///|
+/// Enable the live event-time path before a Task is started.
+pub fn Task::with_event_time(
+  self : Task,
+  config : TaskEventTimeConfig,
+) -> Task raise TaskError {
+  if self.phase != TaskPhase::Created {
+    raise TaskError::WrongPhase(expected=TaskPhase::Created, actual=self.phase)
+  }
+  config.validate()
+  if config.window_size_ms() > 0L && self.operator != OperatorKind::KeyedSum {
+    raise TaskError::Custom("event-time windows require keyed-sum")
+  }
+  let log : @causal.CausalLog[TaskEventPayload] = @causal.CausalLog::new() catch {
+    error => raise TaskError::Causal(error)
+  }
+  { ..self, event_time_config: Some(config), event_time_log: Some(log), }
 }
 
 ///|
@@ -321,7 +388,7 @@ pub fn Task::from_assignment(
 
 ///|
 pub fn Task::from_spec(spec : TaskSpec) -> Task raise TaskError {
-  Task::new(
+  let task = Task::new(
     spec.task_id(),
     spec.operator_id(),
     spec.operator(),
@@ -329,6 +396,10 @@ pub fn Task::from_spec(spec : TaskSpec) -> Task raise TaskError {
     spec.epoch(),
     start_offset=spec.start_offset(),
   )
+  match spec.event_time_config() {
+    None => task
+    Some(config) => task.with_event_time(config)
+  }
 }
 
 ///|
@@ -425,23 +496,37 @@ pub fn Task::frontier(self : Task) -> @causal.Frontier {
 
 ///|
 pub fn Task::event_count(self : Task) -> Int {
-  match self.operator {
-    OperatorKind::KeyedSum => self.aggregation.unwrap().event_count()
-    OperatorKind::Reachability => self.reachability.unwrap().event_count()
-    OperatorKind::SecurityChain => self.security.unwrap().event_count()
-    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
-      self.custom_log.unwrap().admitted_count()
+  if self.graph_log is Some(log) {
+    return log.admitted_count()
+  }
+  match self.event_time_log {
+    Some(log) => log.admitted_count()
+    None =>
+      match self.operator {
+        OperatorKind::KeyedSum => self.aggregation.unwrap().event_count()
+        OperatorKind::Reachability => self.reachability.unwrap().event_count()
+        OperatorKind::SecurityChain => self.security.unwrap().event_count()
+        OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+          self.custom_log.unwrap().admitted_count()
+      }
   }
 }
 
 ///|
 pub fn Task::pending_count(self : Task) -> Int {
-  match self.operator {
-    OperatorKind::KeyedSum => self.aggregation.unwrap().pending_count()
-    OperatorKind::Reachability => self.reachability.unwrap().pending_count()
-    OperatorKind::SecurityChain => self.security.unwrap().pending_count()
-    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
-      self.custom_log.unwrap().pending_count()
+  if self.graph_log is Some(log) {
+    return log.pending_count()
+  }
+  match self.event_time_log {
+    Some(log) => log.pending_count()
+    None =>
+      match self.operator {
+        OperatorKind::KeyedSum => self.aggregation.unwrap().pending_count()
+        OperatorKind::Reachability => self.reachability.unwrap().pending_count()
+        OperatorKind::SecurityChain => self.security.unwrap().pending_count()
+        OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+          self.custom_log.unwrap().pending_count()
+      }
   }
 }
 
@@ -455,6 +540,16 @@ pub fn Task::state_event_count(self : Task) -> Int {
 /// pure Task API; production adapters normally supply a finite Job default.
 pub fn Task::max_state_events(self : Task) -> Int {
   self.max_state_events
+}
+
+///|
+pub fn Task::watermark(self : Task) -> Int64 {
+  self.watermark
+}
+
+///|
+pub fn Task::late_events(self : Task) -> Int {
+  self.late_events
 }
 
 ///|
@@ -472,22 +567,48 @@ fn Task::check_state_limit(self : Task) -> Unit raise TaskError {
 /// This is deliberately conservative: rejecting a candidate before commit is
 /// preferable to allowing a production process to grow without a bound.
 pub fn Task::state_memory_count(self : Task) -> Int {
-  match self.operator {
+  let graph_count = self.graph_log.map(log => log.state_count()).unwrap_or(0)
+  if self.event_time_log is Some(log) {
+    return graph_count +
+      log.state_count() +
+      self.window_buckets.length() +
+      self.join_left.length() +
+      self.join_right.length() +
+      self.join_emitted.length()
+  }
+  let base = match self.operator {
     OperatorKind::KeyedSum => {
       let engine = self.aggregation.unwrap()
-      self.state_event_count() + engine.output_count()
+      let keys = engine.totals().length()
+      let retained_values = if keys > engine.output_count() {
+        keys
+      } else {
+        engine.output_count()
+      }
+      engine.causal_state_count() + retained_values
     }
     OperatorKind::Reachability => {
       let engine = self.reachability.unwrap()
-      self.state_event_count() + engine.fact_count()
+      engine.state_count()
     }
     OperatorKind::SecurityChain => {
       let engine = self.security.unwrap()
-      self.state_event_count() + engine.alert_count()
+      engine.state_count()
     }
     OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
-      self.state_event_count() + self.custom_outputs.length()
+      self.custom_log.unwrap().state_count() + self.custom_outputs.length()
   }
+  let event_time_count = match self.event_time_log {
+    None => 0
+    Some(log) => log.state_count()
+  }
+  graph_count +
+  base +
+  event_time_count +
+  self.window_buckets.length() +
+  self.join_left.length() +
+  self.join_right.length() +
+  self.join_emitted.length()
 }
 
 ///|
@@ -535,10 +656,62 @@ fn task_snapshot_event(
   parents : ArrayView[@causal.EventId],
   key : String,
   payload : Json,
+  event_time? : Int64,
+  input_id? : String = "main",
 ) -> @protocol.EventRecord raise TaskError {
-  @protocol.EventRecord::new(id, parents, key, payload) catch {
+  @protocol.EventRecord::new(
+    id,
+    parents,
+    key,
+    payload,
+    event_time?,
+    input_id?=Some(input_id),
+  ) catch {
     error => raise TaskError::Protocol(error)
   }
+}
+
+///|
+fn task_event_payload(record : @protocol.EventRecord) -> TaskEventPayload {
+  {
+    payload: record.payload(),
+    event_time: record.event_time(),
+    input_id: record.input_id(),
+  }
+}
+
+///|
+fn task_event_causal(
+  record : @protocol.EventRecord,
+) -> @causal.Event[TaskEventPayload] raise TaskError {
+  let payload = task_event_payload(record)
+  @causal.Event::new(record.id(), record.parents(), record.key(), payload) catch {
+    error => raise TaskError::Causal(error)
+  }
+}
+
+///|
+fn task_event_record(
+  event : @causal.Event[TaskEventPayload],
+) -> @protocol.EventRecord raise TaskError {
+  @protocol.EventRecord::new(
+    event.id(),
+    event.parents(),
+    event.key(),
+    event.payload().payload,
+    event_time?=event.payload().event_time,
+    input_id?=Some(event.payload().input_id),
+  ) catch {
+    error => raise TaskError::Protocol(error)
+  }
+}
+
+///|
+fn sorted_join_pairs(
+  values : Array[(@causal.EventId, @causal.EventId)],
+) -> Array[(@causal.EventId, @causal.EventId)] {
+  values.sort()
+  values
 }
 
 ///|
@@ -623,25 +796,32 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
         None => raise TaskError::InvalidTransition
       }
       for event in log.events() {
-        events.push(
-          task_snapshot_event(
-            event.id(),
-            event.parents(),
-            event.key(),
-            event.payload(),
-          ),
-        )
+        events.push(task_event_record(event))
       }
       for event in log.pending_events() {
-        events.push(
-          task_snapshot_event(
-            event.id(),
-            event.parents(),
-            event.key(),
-            event.payload(),
-          ),
-        )
+        events.push(task_event_record(event))
       }
+    }
+  }
+  match self.event_time_log {
+    None => ()
+    Some(log) => {
+      events.clear()
+      for event in log.events() {
+        events.push(task_event_record(event))
+      }
+      for event in log.pending_events() {
+        events.push(task_event_record(event))
+      }
+    }
+  }
+  if self.graph_log is Some(log) {
+    events.clear()
+    for event in log.events() {
+      events.push(task_event_record(event))
+    }
+    for event in log.pending_events() {
+      events.push(task_event_record(event))
     }
   }
   events.sort_by((left, right) => Compare::compare(left.id(), right.id()))
@@ -656,6 +836,17 @@ pub fn Task::snapshot(self : Task) -> TaskSnapshot raise TaskError {
     emitted_outputs: self.emitted_outputs,
     events,
     operator_capability: self.operator.capability(),
+    materialized_state: self.materialized_state(),
+    graph_config: self.graph_config,
+    graph_state: self.graph_log.map(log => @json.to_json(log.snapshot())),
+    watermark: Some(self.watermark),
+    watermark_requested: Some(self.watermark_requested),
+    late_events: Some(self.late_events),
+    event_time_config: self.event_time_config,
+    window_buckets: Some(self.window_buckets.copy()),
+    join_left: Some(self.join_left.copy()),
+    join_right: Some(self.join_right.copy()),
+    join_emitted: Some(sorted_join_pairs(self.join_emitted.to_array())),
   }
 }
 
@@ -702,25 +893,78 @@ pub fn Task::restore(
         max_state_events=self.max_state_events,
       )
   }
-  for event in snapshot.events() {
-    let restored_outputs = candidate.apply_input(TaskInput::new(event))
-    ignore(restored_outputs)
+  if snapshot.graph_config != self.graph_config {
+    raise TaskError::OperatorContractMismatch
   }
-  candidate.check_state_limit()
+  candidate.restore_graph_state(snapshot)
+  match snapshot.event_time_config() {
+    None => candidate.restore_materialized_state(snapshot)
+    Some(config) => {
+      config.validate()
+      if self.event_time_config is Some(expected) && expected != config {
+        raise TaskError::OperatorContractMismatch
+      }
+      guard snapshot.materialized_state is Some(state) else {
+        raise TaskError::InvalidTransition
+      }
+      let saved : @causal.CausalLogSnapshot[TaskEventPayload] = @json.from_json(
+        state,
+      ) catch {
+        _ => raise TaskError::InvalidTransition
+      }
+      let log = @causal.CausalLog::restore(saved) catch {
+        error => raise TaskError::Causal(error)
+      }
+      candidate.event_time_config = Some(config)
+      candidate.event_time_log = Some(log)
+      let records = log.events().map(event => task_event_record(event))
+      records.push_iter(
+        log.pending_events().map(event => task_event_record(event)).iter(),
+      )
+      for record in records {
+        guard record.event_time() is Some(timestamp) &&
+          timestamp >= 0L &&
+          timestamp < 9223372036854775807L else {
+          raise TaskError::InvalidTransition
+        }
+        if config.window_size_ms() > 0L {
+          if record.input_id() != "main" {
+            raise TaskError::InvalidTransition
+          }
+          self.operator.validate_payload(record.payload())
+        } else if record.input_id() != "left" && record.input_id() != "right" {
+          raise TaskError::InvalidTransition
+        }
+      }
+    }
+  }
+  if candidate.snapshot().events() != snapshot.events() {
+    raise TaskError::InvalidTransition
+  }
   candidate.refresh_frontier()
   if candidate.frontier.digest() != snapshot.frontier_digest() {
     raise TaskError::InvalidTransition
   }
   candidate.offset = snapshot.offset()
   candidate.emitted_outputs = snapshot.emitted_outputs()
-  self.aggregation = candidate.aggregation
-  self.reachability = candidate.reachability
-  self.security = candidate.security
-  self.custom_log = candidate.custom_log
-  self.custom_outputs = candidate.custom_outputs
-  self.offset = candidate.offset
-  self.frontier = candidate.frontier
-  self.emitted_outputs = candidate.emitted_outputs
+  candidate.watermark = snapshot.watermark()
+  candidate.watermark_requested = snapshot.watermark_requested()
+  if candidate.watermark < -1L ||
+    candidate.watermark_requested < candidate.watermark ||
+    snapshot.late_events() < 0 {
+    raise TaskError::InvalidTransition
+  }
+  candidate.late_events = snapshot.late_events()
+  candidate.window_buckets = snapshot.window_buckets().to_owned()
+  candidate.join_left = snapshot.join_left().to_owned()
+  candidate.join_right = snapshot.join_right().to_owned()
+  candidate.join_emitted = Set(snapshot.join_emitted().to_owned())
+  if candidate.join_emitted.length() != snapshot.join_emitted().length() {
+    raise TaskError::InvalidTransition
+  }
+  candidate.validate_event_time_state()
+  candidate.check_state_limit()
+  self.commit(candidate)
 }
 
 ///|
@@ -774,6 +1018,7 @@ fn Task::validate_next_offset(
 fn Task::apply_input(
   self : Task,
   input : TaskInput,
+  callback_input? : TaskInput,
 ) -> Array[TaskOutput] raise TaskError {
   match self.operator {
     OperatorKind::KeyedSum => {
@@ -838,28 +1083,16 @@ fn Task::apply_input(
       }
       let record = input.event()
       operator.validate_payload(record.payload())
-      let event = @causal.Event::new(
-        record.id(),
-        record.parents(),
-        record.key(),
-        record.payload(),
-      ) catch {
-        error => raise TaskError::Causal(error)
-      }
+      let event = task_event_causal(record)
       let admission = log.submit(event) catch {
         error => raise TaskError::Causal(error)
       }
       let outputs : Array[TaskOutput] = []
       for admitted in admission.admitted() {
-        let admitted_record = @protocol.EventRecord::new(
-          admitted.id(),
-          admitted.parents(),
-          admitted.key(),
-          admitted.payload(),
-        ) catch {
-          error => raise TaskError::Protocol(error)
-        }
-        let emitted = operator.apply(TaskInput::new(admitted_record))
+        let admitted_record = task_event_record(admitted)
+        let emitted = operator.apply(
+          callback_input.unwrap_or(TaskInput::new(admitted_record)),
+        )
         for output in emitted {
           self.custom_outputs.push(output)
           outputs.push(TaskOutput::Custom(output))
@@ -872,12 +1105,20 @@ fn Task::apply_input(
 
 ///|
 fn Task::refresh_frontier(self : Task) -> Unit {
-  self.frontier = match self.operator {
-    OperatorKind::KeyedSum => self.aggregation.unwrap().frontier()
-    OperatorKind::Reachability => self.reachability.unwrap().frontier()
-    OperatorKind::SecurityChain => self.security.unwrap().frontier()
-    OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
-      self.custom_log.unwrap().frontier()
+  if self.graph_log is Some(log) {
+    self.frontier = log.frontier()
+    return
+  }
+  self.frontier = match self.event_time_log {
+    Some(log) => log.frontier()
+    None =>
+      match self.operator {
+        OperatorKind::KeyedSum => self.aggregation.unwrap().frontier()
+        OperatorKind::Reachability => self.reachability.unwrap().frontier()
+        OperatorKind::SecurityChain => self.security.unwrap().frontier()
+        OperatorKind::Custom(_, _, _, _, _, _, _, _, _, _) =>
+          self.custom_log.unwrap().frontier()
+      }
   }
 }
 
@@ -901,6 +1142,17 @@ fn Task::copy(self : Task) -> Task {
     custom_log: self.custom_log.map(log => log.copy()),
     custom_outputs: self.custom_outputs.copy(),
     max_state_events: self.max_state_events,
+    event_time_config: self.event_time_config,
+    event_time_log: self.event_time_log.map(log => log.copy()),
+    watermark: self.watermark,
+    watermark_requested: self.watermark_requested,
+    late_events: self.late_events,
+    window_buckets: self.window_buckets.copy(),
+    join_left: self.join_left.copy(),
+    join_right: self.join_right.copy(),
+    join_emitted: self.join_emitted.copy(),
+    graph_config: self.graph_config,
+    graph_log: self.graph_log.map(log => log.copy()),
   }
 }
 
@@ -911,6 +1163,17 @@ fn Task::commit(self : Task, candidate : Task) -> Unit {
   self.security = candidate.security
   self.custom_log = candidate.custom_log
   self.custom_outputs = candidate.custom_outputs
+  self.watermark = candidate.watermark
+  self.watermark_requested = candidate.watermark_requested
+  self.late_events = candidate.late_events
+  self.window_buckets = candidate.window_buckets
+  self.join_left = candidate.join_left
+  self.join_right = candidate.join_right
+  self.join_emitted = candidate.join_emitted
+  self.event_time_config = candidate.event_time_config
+  self.event_time_log = candidate.event_time_log
+  self.graph_config = candidate.graph_config
+  self.graph_log = candidate.graph_log
   self.offset = candidate.offset
   self.frontier = candidate.frontier
   self.emitted_outputs = candidate.emitted_outputs
@@ -928,7 +1191,7 @@ fn Task::process_unchecked(
     raise TaskError::WrongPhase(expected=TaskPhase::Running, actual=self.phase)
   }
   self.validate_next_offset(offset)
-  let outputs = self.apply_input(input)
+  let outputs = self.dispatch_input(input)
   self.check_state_limit()
   self.advance_offset(offset)
   self.refresh_frontier()
@@ -1026,7 +1289,8 @@ pub fn Task::process_delta(
   let candidate = self.copy()
   let outputs = []
   for event in delta.events() {
-    outputs.push_iter(candidate.apply_input(TaskInput::new(event)).iter())
+    let event_outputs = candidate.dispatch_input(TaskInput::new(event))
+    outputs.push_iter(event_outputs.iter())
   }
   candidate.check_state_limit()
   candidate.refresh_frontier()
@@ -1045,6 +1309,304 @@ pub fn Task::validate_delta(
   let candidate = self.copy()
   ignore(candidate.process_delta(delta))
   candidate.state_memory_count()
+}
+
+///|
+fn Task::buffer_event_time_input(
+  self : Task,
+  input : TaskInput,
+  flush? : Bool = true,
+) -> Array[TaskOutput] raise TaskError {
+  let record = input.event()
+  let config = self.event_time_config.unwrap()
+  let timestamp = record.event_time().unwrap_or(-1L)
+  if timestamp < 0L {
+    raise TaskError::Custom(
+      "event-time operator requires a non-negative timestamp",
+    )
+  }
+  if config.window_size_ms() > 0L {
+    let start = timestamp / config.window_size_ms() * config.window_size_ms()
+    if start > 9223372036854775807L - config.window_size_ms() {
+      raise TaskError::Custom("window end exceeds Int64 timestamp range")
+    }
+  } else if record.input_id() != "left" && record.input_id() != "right" {
+    raise TaskError::Custom("join input must be left or right")
+  }
+  let event = task_event_causal(record)
+  let admission = self.event_time_log.unwrap().submit(event) catch {
+      error => raise TaskError::Causal(error)
+    }
+  for admitted in admission.admitted() {
+    self.buffer_admitted_event_time(task_event_record(admitted))
+  }
+  if flush {
+    self.advance_event_time()
+  } else {
+    []
+  }
+}
+
+///|
+fn Task::buffer_admitted_event_time(
+  self : Task,
+  record : @protocol.EventRecord,
+) -> Unit raise TaskError {
+  let timestamp = match record.event_time() {
+    Some(value) => value
+    None => raise TaskError::Custom("event-time operator requires event_time")
+  }
+  let config = self.event_time_config.unwrap()
+  let window_closed = if config.window_size_ms() > 0L {
+    let start = timestamp / config.window_size_ms() * config.window_size_ms()
+    start + config.window_size_ms() <= self.watermark
+  } else {
+    false
+  }
+  let join_closed = timestamp < self.watermark
+  if window_closed || (config.window_size_ms() == 0L && join_closed) {
+    self.late_events += 1
+    return
+  }
+  if config.window_size_ms() > 0L {
+    if self.operator != OperatorKind::KeyedSum {
+      raise TaskError::Custom("event-time windows require keyed-sum")
+    }
+    let contribution = @aggregation.Contribution::from_json(
+      record.key(),
+      record.payload(),
+    ) catch {
+      error => raise TaskError::Aggregation(error)
+    }
+    let start = timestamp / config.window_size_ms() * config.window_size_ms()
+    if start > 9223372036854775807L - config.window_size_ms() {
+      raise TaskError::Custom("window end exceeds Int64 timestamp range")
+    }
+    let mut found = -1
+    for i in 0..<self.window_buckets.length() {
+      let bucket = self.window_buckets[i]
+      if bucket.key == record.key() && bucket.start_ms == start {
+        found = i
+        break
+      }
+    }
+    let target = if found >= 0 {
+      found
+    } else {
+      self.window_buckets.push({
+        key: record.key(),
+        start_ms: start,
+        total: 0L,
+      })
+      self.window_buckets.length() - 1
+    }
+    let bucket = self.window_buckets[target]
+    let value = contribution.value()
+    if (value > 0L && bucket.total > 9223372036854775807L - value) ||
+      (value < 0L && bucket.total < -9223372036854775808L - value) {
+      raise TaskError::Custom("window total exceeds Int64 range")
+    }
+    self.window_buckets[target] = { ..bucket, total: bucket.total + value, }
+  }
+  if config.window_size_ms() == 0L {
+    if record.input_id() == "left" {
+      self.join_left.push(record)
+    } else if record.input_id() == "right" {
+      self.join_right.push(record)
+    } else {
+      raise TaskError::Custom("join input must be left or right")
+    }
+  }
+}
+
+///|
+fn Task::flush_event_time(
+  self : Task,
+  target : Int64,
+) -> Array[TaskOutput] raise TaskError {
+  let config = match self.event_time_config {
+    None => return []
+    Some(value) => value
+  }
+  let outputs : Array[TaskOutput] = []
+  if config.window_size_ms() > 0L {
+    let ready = self.window_buckets.filter(bucket => {
+      bucket.start_ms + config.window_size_ms() <= target
+    })
+    self.window_buckets = self.window_buckets.filter(bucket => {
+      bucket.start_ms + config.window_size_ms() > target
+    })
+    let ordered = ready
+    ordered.sort_by((left, right) => {
+      if left.start_ms != right.start_ms {
+        left.start_ms.compare(right.start_ms)
+      } else {
+        left.key.compare(right.key)
+      }
+    })
+    for bucket in ordered {
+      outputs.push(
+        TaskOutput::WindowedSum({
+          key: bucket.key,
+          start_ms: bucket.start_ms,
+          end_ms: bucket.start_ms + config.window_size_ms(),
+          total: bucket.total,
+        }),
+      )
+    }
+  }
+  if config.window_size_ms() == 0L {
+    // Match before retiring either side: a watermark may close both records
+    // at once, including the final end-of-input watermark.
+    for left in self.join_left {
+      for right in self.join_right {
+        let lt = left.event_time().unwrap()
+        let rt = right.event_time().unwrap()
+        if left.key() == right.key() &&
+          (
+            (rt >= lt && rt - lt <= config.join_after_ms()) ||
+            (lt > rt && lt - rt <= config.join_before_ms())
+          ) {
+          let pair = (left.id(), right.id())
+          if self.join_emitted.add_and_check(pair) {
+            outputs.push(
+              TaskOutput::Custom(
+                if self.graph_config
+                  .map(config => config.emit_packets)
+                  .unwrap_or(false) {
+                  Json::object({
+                    "left": left.payload(),
+                    "right": right.payload(),
+                    "key": Json::string(left.key()),
+                    "event_time": @json.to_json(if lt > rt { lt } else { rt }),
+                  })
+                } else {
+                  Json::object({
+                    "left": left.payload(),
+                    "right": right.payload(),
+                  })
+                },
+              ),
+            )
+          }
+        }
+      }
+    }
+    let retained_left : Array[@protocol.EventRecord] = []
+    for left in self.join_left {
+      let left_expiry = if left.event_time().unwrap() >
+        9223372036854775807L - config.join_after_ms() {
+        9223372036854775807L
+      } else {
+        left.event_time().unwrap() + config.join_after_ms()
+      }
+      if target != 9223372036854775807L && left_expiry >= target {
+        retained_left.push(left)
+      }
+    }
+    let retained_right : Array[@protocol.EventRecord] = []
+    for right in self.join_right {
+      let right_expiry = if right.event_time().unwrap() >
+        9223372036854775807L - config.join_before_ms() {
+        9223372036854775807L
+      } else {
+        right.event_time().unwrap() + config.join_before_ms()
+      }
+      if target != 9223372036854775807L && right_expiry >= target {
+        retained_right.push(right)
+      }
+    }
+    self.join_left = retained_left
+    self.join_right = retained_right
+    let left_ids = Set(retained_left.map(record => record.id()))
+    let right_ids = Set(retained_right.map(record => record.id()))
+    self.join_emitted = Set(
+      self.join_emitted
+      .to_array()
+      .filter(pair => left_ids.contains(pair.0) && right_ids.contains(pair.1)),
+    )
+  }
+  outputs
+}
+
+///|
+pub fn Task::process_watermark(
+  self : Task,
+  watermark : Int64,
+) -> Array[TaskOutput] raise TaskError {
+  if self.phase != TaskPhase::Running {
+    raise TaskError::WrongPhase(expected=TaskPhase::Running, actual=self.phase)
+  }
+  if watermark < 0L {
+    raise TaskError::InvalidOffset(watermark)
+  }
+  if watermark < self.watermark_requested {
+    raise TaskError::InvalidOffset(watermark)
+  }
+  let candidate = self.copy()
+  candidate.watermark_requested = watermark
+  let outputs = candidate.advance_event_time()
+  candidate.check_state_limit()
+  candidate.emitted_outputs += outputs.length()
+  outputs.sort()
+  self.commit(candidate)
+  outputs
+}
+
+///|
+/// Validate a frontier advance without mutating live state.
+pub fn Task::validate_watermark(
+  self : Task,
+  timestamp : Int64,
+) -> Unit raise TaskError {
+  ignore(self.copy().process_watermark(timestamp))
+}
+
+///|
+/// A pending causal descendant holds the event-time frontier until its parents
+/// arrive. Keep the requested frontier so processing its final parent resumes
+/// window completion without requiring another watermark from the source.
+fn Task::advance_event_time(self : Task) -> Array[TaskOutput] raise TaskError {
+  let watermark = self.watermark_requested
+  if watermark < 0L {
+    return []
+  }
+  let config = self.event_time_config
+  let mut effective = match config {
+    None => watermark
+    Some(value) =>
+      if watermark == 9223372036854775807L {
+        watermark
+      } else if watermark <= value.allowed_lateness_ms() {
+        0L
+      } else {
+        watermark - value.allowed_lateness_ms()
+      }
+  }
+  match self.event_time_log {
+    Some(log) =>
+      for pending in log.pending_events() {
+        let timestamp = pending.payload().event_time.unwrap()
+        if timestamp < effective {
+          effective = timestamp
+        }
+      }
+    None => ()
+  }
+  if self.graph_log is Some(log) {
+    for pending in log.pending_events() {
+      if pending.payload().event_time is Some(timestamp) &&
+        timestamp < effective {
+        effective = timestamp
+      }
+    }
+  }
+  if effective < self.watermark {
+    effective = self.watermark
+  }
+  let outputs = self.flush_event_time(effective)
+  self.watermark = effective
+  outputs
 }
 
 ///|

@@ -19,6 +19,7 @@ pub(all) suberror CausalError {
   IdentityConflict(EventId)
   InvalidPendingLimit(Int)
   PendingLimitExceeded(limit~ : Int)
+  InvalidRetirement(String)
 } derive(Eq, @debug.Debug)
 
 // Types and methods
@@ -31,13 +32,22 @@ pub fn[T] Admission::admitted(Self[T]) -> ArrayView[Event[T]]
 pub fn[T] Admission::missing(Self[T]) -> ArrayView[EventId]
 pub fn[T] Admission::status(Self[T]) -> SubmitStatus
 
+pub(all) struct CausalEventSnapshot[T] {
+  id : EventId
+  parents : Array[EventId]
+  key : String
+  payload : T
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
 pub struct CausalLog[T] {
   admitted : Map[EventId, Event[T]]
   pending : Map[EventId, Event[T]]
   frontier : @set.Set[EventId]
+  mut retired : Array[EventRange]
   maximum_pending : Int
 }
 pub fn[T] CausalLog::admitted_count(Self[T]) -> Int
+pub fn[T] CausalLog::compact(Self[T], CausalRetirement) -> Unit raise CausalError
 pub fn[T] CausalLog::contains(Self[T], EventId) -> Bool
 pub fn[T] CausalLog::copy(Self[T]) -> Self[T]
 pub fn[T] CausalLog::event(Self[T], EventId) -> Event[T]?
@@ -48,8 +58,28 @@ pub fn[T] CausalLog::new(maximum_pending? : Int) -> Self[T] raise CausalError
 pub fn[T] CausalLog::pending_count(Self[T]) -> Int
 pub fn[T] CausalLog::pending_events(Self[T]) -> Array[Event[T]]
 pub fn[T] CausalLog::pending_ids(Self[T]) -> Array[EventId]
+pub fn[T : Eq] CausalLog::restore(CausalLogSnapshot[T]) -> Self[T] raise CausalError
+pub fn[T] CausalLog::retired_ranges(Self[T]) -> ArrayView[EventRange]
+pub fn[T] CausalLog::snapshot(Self[T]) -> CausalLogSnapshot[T]
 pub fn[T] CausalLog::state_count(Self[T]) -> Int
 pub fn[T : Eq] CausalLog::submit(Self[T], Event[T]) -> Admission[T] raise CausalError
+
+pub(all) struct CausalLogSnapshot[T] {
+  admitted : Array[CausalEventSnapshot[T]]
+  pending : Array[CausalEventSnapshot[T]]
+  retired : Array[EventRange]
+  maximum_pending : Int
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+
+pub struct CausalRetirement {
+  checkpoint_id : String
+  ranges : Array[EventRange]
+} derive(Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn CausalRetirement::checkpoint_id(Self) -> String
+pub fn CausalRetirement::excluding(Self, ArrayView[EventId]) -> Self raise CausalError
+pub fn CausalRetirement::from_ids(String, ArrayView[EventId]) -> Self raise CausalError
+pub fn CausalRetirement::new(String, ArrayView[EventRange]) -> Self raise CausalError
+pub fn CausalRetirement::ranges(Self) -> ArrayView[EventRange]
 
 pub struct Event[T] {
   id : EventId
@@ -71,8 +101,20 @@ pub fn EventId::new(String, Int64) -> Self raise CausalError
 pub fn EventId::origin(Self) -> String
 pub fn EventId::sequence(Self) -> Int64
 
+pub struct EventRange {
+  origin : String
+  first : Int64
+  last : Int64
+} derive(Compare, Eq, ToJson, @debug.Debug, @json.FromJson)
+pub fn EventRange::contains(Self, EventId) -> Bool
+pub fn EventRange::first(Self) -> Int64
+pub fn EventRange::last(Self) -> Int64
+pub fn EventRange::new(String, Int64, Int64) -> Self raise CausalError
+pub fn EventRange::origin(Self) -> String
+
 pub struct Frontier {
   ids : ReadOnlyArray[EventId]
+  retired : ReadOnlyArray[EventRange]
 } derive(Eq, @debug.Debug)
 pub fn Frontier::digest(Self) -> String
 pub fn Frontier::empty() -> Self
