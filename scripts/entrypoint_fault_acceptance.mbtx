@@ -45,8 +45,8 @@ fn expect_failure(output : @shell.Output, label : String) -> Unit raise {
 ///|
 async fn main {
   let root = @fs.tmpdir(prefix="moonweave-entrypoint-faults-")
-  let submission = @fs.realpath("cmd/driver_fixture/process-submission.json")
-  let events = @fs.realpath("cmd/driver_fixture/process-events.json")
+  let submission = @fs.realpath("testdata/driver_fixture/process-submission.json")
+  let events = @fs.realpath("testdata/driver_fixture/process-events.json")
   let coordinator = @fs.realpath(
     "_build/native/debug/build/moonweave/moonweave/cmd/coordinator/coordinator.exe",
   )

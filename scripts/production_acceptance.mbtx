@@ -133,7 +133,7 @@ async fn main {
   let performance = @fs.realpath(
     "_build/native/debug/build/moonweave/moonweave/cmd/performance_fixture/performance_fixture.exe",
   )
-  let submission = @fs.realpath("cmd/driver_fixture/process-submission.json")
+  let submission = @fs.realpath("testdata/driver_fixture/process-submission.json")
   let coordinator_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
   let coordinator_port = coordinator_listener.addr.port()
   let driver_listener = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))

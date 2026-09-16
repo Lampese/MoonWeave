@@ -1,8 +1,0 @@
-import {
-  "moonweave/moonweave/runtime/api" @flow,
-  "moonbitlang/core/debug",
-}
-
-pkgtype(kind: "executable")
-
-supported_targets = "+native"
