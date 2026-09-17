@@ -13,11 +13,9 @@ name = "moonweave/moonweave"
 
 version = "0.1.0"
 
-readme = "README.mbt.md"
+readme = "README.md"
 
 repository = ""
-
-license = "Apache-2.0"
 
 keywords = [
   "distributed-systems",

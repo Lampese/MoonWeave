@@ -6,6 +6,7 @@ target
 .repos/
 .moonagent/
 
-# Keep all Markdown documentation local.
+# Keep Markdown documentation local except for the project README.
 *.[mM][dD]
+!/README.md
 docs/
